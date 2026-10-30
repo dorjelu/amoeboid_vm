@@ -4,7 +4,7 @@
 :icons: font
 :source-highlighter: rouge
 
-Status: accepted, 2026-10-29. This is the design of record for the Rust implementation of amoeboid; later records in this directory amend it, they do not restate it.
+Status: accepted, 2026-10-29; amended by 0002. This is the design of record for the Rust implementation of amoeboid; later records in this directory amend it, they do not restate it.
 
 Scope: the process model, the message protocol, ownership, persistence, formats and the build order. Operator-facing behaviour stays in `README.adoc`; the invariants that must survive any change are restated at the end.
 

@@ -1,0 +1,255 @@
+= Decision 0002: actors, event-sourced persistence and supervision
+:toc: left
+:toclevels: 3
+:icons: font
+:source-highlighter: rouge
+
+Status: accepted, 2026-10-30. Amends 0001. Where the two disagree, this record wins; sections of 0001 not named here stand.
+
+Scope: how components are swapped, how actors talk, how they persist and recover, how VMs outlive the runtime, the wire protocol and transport, the actor framework, and what is removed from the salvaged tree.
+
+== Context
+
+Review of 0001 found four tensions:
+
+* It returned effects as data from a pure fold, yet injected components as `Arc<dyn Fs>`-style trait objects. The salvaged ports return `impl Future` and cannot be trait objects without a rewrite.
+* Its recovery was a per-step journal (intent, witness, outcome) with an audit and a remedy table, a code path that runs only after crashes.
+* `AttachOrOwn` made the first CLI invocation the runtime, so `start --detach` ended the runtime when the command exited.
+* Actor reset was treated as a fault. The operator kills the daemon by accident often enough (experience with the Python launcher) that reset and daemon death must be ordinary, cheap events that never take running VMs with them.
+
+== Decision
+
+* Components are swapped by swapping the **actor** that handles a message enum, not by trait objects. An actor's implementation details are private to it.
+* All messaging between actors is **tell**. No actor awaits a reply from another.
+* **Actor reset is a guarantee** the design relies on. Every actor recovers from its own persisted events.
+* Persistence follows Akka's `EventSourcedBehavior`: **one event stream per persistent actor**, a command handler and an event handler, events persisted before their side effects, recovery by replay followed by a reconcile against the world.
+* The **journal is an actor** that owns the single SQLite connection. Persistent actors stash commands while a persist or a replay is in flight.
+* **VMs outlive the runtime.** A restarted runtime adopts them by process identity.
+* The runtime is started by **systemd user socket activation**; `daemon.lock` remains the one-runtime rule for every start path.
+* Frames are **per direction and per domain**; a protocol version mismatch is a hard refusal. Transport is replaceable.
+* Framework: **ractor** with **ractor-supervisor** for OTP restart strategies.
+
+== Components are actors
+
+A backend is any actor that handles a given message enum. The VM actor holds an `ActorRef` to its hypervisor and never knows which implementation it is:
+
+[source]
+----
+Vm ──HypervisorCmd──▶ ActorRef<HypervisorCmd>
+   ◀─HypervisorEvt──   ├─ LocalQemu   (qemu + virtiofsd, pidfd watchers)
+                       ├─ Scripted    (tests: replies from a script)
+                       └─ Remote…     (future: another hypervisor, own transport)
+----
+
+Commands state *what*, not *how*: `Boot { spec }`, `Share { tag, host_dir, readonly }`, never `Spawn { argv }`. `plan::qemu_args`, `plan::runner_argv` and virtiofsd socket naming belong to `LocalQemu` and are not visible outside it. Test doubles are actors speaking the same enum, not trait fakes.
+
+Consequence for the salvaged tree: `ports/` and `testing/fakes` are deleted. Adapters stay as free functions called by the actors that own them, and are tested for real on temporary directories.
+
+== Messaging
+
+Tell only. A request that expects an answer carries a correlation id and the requester's reference; the answer is another tell.
+
+* Cross-type replies use ractor's `DerivedActorRef`. Its conversion back (`TryFrom`) runs when a send fails and panics if it fails, so the receiving enum has **exactly one wrapper variant per derived type**, which makes the conversion total.
+* Timeouts are messages: `send_after(d, Timeout(corr))`. A missing reply is a state transition, not a hung future.
+* A peer that dies does not answer. Supervision events (`ActorTerminated`, `ActorFailed`) are turned into `Lost(corr)` for every conversation pending with it.
+* Calls follow the tree downward only in the sense of who spawns whom; no actor waits on any other, so there is no deadlock to design around.
+* Domain errors are messages. A ractor handler never returns `Err` for them, because `Err` terminates the actor.
+
+== Supervision tree
+
+[source]
+----
+Root (registry, routing)                         ractor-supervisor
+├─ Journal            single SQLite connection; persistent actors' only path to disk
+├─ Listener           socket accept loop
+│   └─ Session × client     decodes ClientFrame, encodes ServerFrame
+└─ Vm × name          persistent; spawns children only it can reach
+    ├─ Builder        nix build
+    ├─ Hypervisor     backend actor (LocalQemu | Scripted | …), persistent
+    │   └─ Watcher × process   pidfd → ProcExited
+    ├─ Share × dN     persistent; owns one virtiofsd
+    └─ Guest          readiness over ssh, host key, guest delivery
+----
+
+Strategies come from `ractor-supervisor`: OneForOne, OneForAll, RestForOne; Permanent, Transient, Temporary; `max_restarts` within `max_window`, with `reset_after` and backoff. Exceeding the limit fails the supervisor itself to its parent, as an OTP supervisor does. The concrete strategy per level is decided with slice 1.
+
+`ractor-supervisor` is 0.2.0 and has one maintainer. It is built only on ractor's public lifecycle events, so it can be pinned, vendored or replaced without touching any actor.
+
+== Persistence
+
+=== Persistent actors
+
+Each persistent actor supplies two pure functions, as in `EventSourcedBehavior`:
+
+[source,rust]
+----
+fn on_command(state: &State, cmd: Cmd) -> Effect<Event, Out>   // events to persist, messages to send after
+fn on_event(state: State, event: &Event) -> State             // used live and during replay
+----
+
+A generic persistent behaviour, written once over ractor, runs them:
+
+[source]
+----
+Recovering ── Replay{id} ──▶ Journal
+   │  stash every command
+   ◀── Replayed{events} ──  fold on_event, then reconcile against the world (below)
+Ready
+   │  on_command → Effect{events, outs}
+   │  events empty: send outs, stay Ready
+   ├── Persist{batch, id, seq, events} ──▶ Journal
+Persisting{batch, events, outs, stash}
+   │  stash every command
+   ◀── Persisted{batch} ──  fold on_event, send outs, drain stash one at a time
+   ◀── PersistFailed{batch, reason} ── stop; the supervisor restarts the actor, replay rebuilds from what is durable
+   ◀── Timeout(batch) ──   same as PersistFailed
+----
+
+Replay runs only `on_event`, so it never repeats a side effect. Outgoing messages leave only after their events are durable.
+
+=== Streams and identity
+
+Persistence ids are derived from the parent's state, so a parent recreates its children under the same ids after a restart:
+
+----
+vm/work                  Vm
+vm/work/7/hv             Hypervisor, generation 7
+vm/work/7/share/d0       Share d0, generation 7
+----
+
+[source,sql]
+----
+CREATE TABLE events (
+  pid     TEXT NOT NULL,      -- persistence id
+  seq     INTEGER NOT NULL,   -- 1, 2, ... per stream
+  payload TEXT NOT NULL,      -- versioned JSON event
+  at      INTEGER NOT NULL,   -- stamped by the journal
+  PRIMARY KEY (pid, seq)
+) STRICT;
+----
+
+An append writes the batch at `last_seq + 1 ..`; a primary-key conflict means another incarnation wrote to the stream, and the writer is stale (`PersistFailed { reason: Conflict }`). This is the writer fence: a writer appends only to a stream at the position it holds.
+
+0001's `vms`, `steps`, `snapshots` and `intake` tables are replaced. Snapshots are deferred: streams are short and are trimmed when a generation ends. Client idempotency is the client-minted `op_id`, recorded in the events that carry it.
+
+=== Generation rules
+
+* **Writer:** a writer appends only at its own stream position, and only within the generation in its persistence id.
+* **Reports upward:** messages between actors are unordered. A parent accepts a child's status only if its generation (or per-child sequence) is strictly newer than the last one it accepted, so a late `Running` cannot overwrite a newer `Lost`. This is the rule omicron uses for instance runtime state (`state_generation < new`).
+* Every message into a VM actor carries its generation; older ones are dropped by the command handler.
+
+=== Recovery is replay, then reconcile
+
+Replay restores what the actor believed. Reconcile checks it against the world and records the result as events before the actor accepts commands:
+
+[source]
+----
+share/d0  replay → Spawned{pid 812, starttime X, scope amoeboid-vm-work}
+          pidfd_open(812) + starttime == X + in scope → persist Adopted → tell parent ChildReady
+          otherwise                                    → persist Lost   → respawn or report
+share/d1  replay → Spawning{nonce N} without Spawned   (crash between spawn and append)
+          search the VM's scope for nonce N → found: persist Spawned{identity}; not found: respawn
+----
+
+Spawns are recorded as `Spawning { nonce }` before and `Spawned { identity }` after. The nonce is visible on the process (argv or environment), and the VM's systemd scope bounds the search, so a crash between spawn and append never leaves an unowned process.
+
+Nothing is killed during recovery unless its identity is verified and it is broken. Liveness comes from the OS; the journal holds claims (0001 invariant 5 stands).
+
+== VMs outlive the runtime
+
+[cols="1,2"]
+|===
+|What would tie a VM to the runtime |Rule
+|The runtime's cgroup (systemd stops the unit's whole group) |each VM's qemu and virtiofsd run in a transient scope `amoeboid-vm-NAME` (`systemd-run --user --scope`)
+|Inherited fds (lock, socket, terminal) |every fd the runtime opens is `O_CLOEXEC`; console output goes to a log file
+|Session and process group |`setsid` on spawn
+|`wait()` works only for children |after adoption, exits are watched through a pidfd; the exit status of an adopted process is not available, and `Stopped` allows for that
+|===
+
+The runtime's unit has `Restart=on-failure`. An accidental kill costs a few seconds of progress events: the new runtime takes the lock, replays, verifies identities and adopts.
+
+== Runtime start and ownership
+
+The runtime is started by systemd socket activation (`amoeboid.socket`, `amoeboid.service`). A host service that embeds the library may ask to own the runtime. 0001's `AttachOrOwn` CLI policy is withdrawn: the CLI only attaches.
+
+`daemon.lock` stays, because it is the one rule every start path obeys (systemd, a manual `amoeboid daemon`, an embedding service):
+
+* `flock(LOCK_EX | LOCK_NB)` on an open file. The kernel releases it when the last fd to that open file closes, including on `SIGKILL`; it cannot go stale.
+* The file is never deleted. Deleting a held lock file lets a second process create a new file and lock that one.
+* Opened `O_CLOEXEC`, so qemu never inherits it and keeps the lock past the runtime's death. Opened `O_NOFOLLOW`, so it cannot be redirected through a symlink.
+* Contents (pid, starttime, boot id, version) are diagnostics only.
+
+Order on start: take the lock, unlink the stale socket, bind (or receive the activated socket), hold incoming frames until recovery completes. A client never sees `RuntimeUnreachable` during a normal start.
+
+== Protocol
+
+Frames are separate enums per direction, so a client cannot construct a server frame:
+
+[source,rust]
+----
+enum ClientFrame { Hello { .. }, Request { op_id, body }, Cancel { op_id }, Subscribe { op_id, from } }
+enum ServerFrame { Welcome { .. }, Reply { op_id, result }, Event { op_id, seq, event }, Refused { .. } }
+----
+
+* Request bodies, replies and events are further split per domain (VM lifecycle, configuration, runtime).
+* `op_id` is minted by the client (UUIDv7) and is the idempotency key; a retry returns the original reply.
+* The protocol version must match exactly; a mismatch is a typed refusal naming `amoeboid daemon restart`. The CLI and runtime ship in one binary; upgrades go through restart and adoption.
+* Unknown variants are refused. Refined types decode through `#[serde(try_from = "Raw…")]`, so no frame bypasses refinement.
+* Framing: 4-byte big-endian length prefix, JSON payload, 1 MiB maximum.
+* The socket is same-uid only (`SO_PEERCRED`, `0700` directory).
+
+=== Transport is replaceable
+
+A transport only turns bytes into frames; Root and VM actors never see it. A new transport is a new Session kind:
+
+[cols="1,1,1"]
+|===
+|Frame |Unix socket |HTTP
+|`Hello`/`Welcome` |first frames on the connection |version header on every request; mismatch is 409
+|`Request` |frame |`POST /ops`
+|`Cancel` |frame |`DELETE /ops/{id}`
+|`Subscribe { from }` |frame, then `Event` frames |`GET /ops/{id}/events?from=N` as server-sent events
+|===
+
+Requirements that keep this cheap: no per-connection state beyond the version check, client-minted `op_id`, and peer authentication through `SO_PEERCRED` on the Unix socket (HTTP over TCP would need tokens or mTLS). gRPC is not used for client to runtime: its generated types are not the ADTs, it is built for independent version evolution, and it is request/response. It is a candidate for a remote hypervisor backend, where it stays inside that backend's actor.
+
+== Console
+
+Unchanged from 0001: no pty relay; the operator uses ssh. README must describe this in the same change that removes the foreground console.
+
+== Salvage changes
+
+Step 0, before slice 1, is one deletion commit, after which the tree builds and its tests pass:
+
+* `ops/` (observe/decide/execute), `ports/`, `testing/fakes`, `ports/vm_lock.rs`, `adapters/lock.rs` (its `O_CLOEXEC`/`O_NOFOLLOW` open is carried into the daemon lock), `domain/observed.rs`.
+* The lock handoff in `adapters/procs.rs` (`LockHandoff`, `HeldLock`).
+* `kdl/` and the KDL parts of `config/`, except one migrator for old `run_config.kdl` files.
+* `plans/designs/rust-port.adoc`, which describes the replaced process model.
+
+Kept: `domain`, `refined`, `rails`, `layout`, `plan`, `console`, `contract`, and the adapters as free functions.
+
+== Lints
+
+Kept: `unwrap_used`, `expect_used`, `panic`, `unreachable`, `todo`, `unimplemented`, `wildcard_enum_match_arm`, `exit`, `dbg_macro`, `print_stdout`, `print_stderr`, `unsafe_code = "forbid"` (0001 invariant 9 rests on them).
+
+Dropped: `arithmetic_side_effects`, `indexing_slicing`, `as_conversions`. They forced checked arithmetic, `.get()` and `try_from` at every site regardless of risk. Overflow and out-of-range values are prevented where they matter by refined types (ports, sequence numbers, generations with checked `next()`), not by a crate-wide ban on `+`, indexing and casts.
+
+== Corrections to 0001
+
+Moot now that `steps` is replaced, recorded so they are not reintroduced: the step insert omitted the `NOT NULL` `op` column; the claim was an `UPDATE` with no row for a first start; the outcome write was unfenced. Still applicable: `uuid` and timestamps are supplied by the journal or the message, never computed inside an event handler; maps in persisted state are `BTreeMap`; `Refused` applies to client commands only, while observations in an unexpected state are dropped by generation.
+
+== Invariants added
+
+. Every actor recovers from its own events; reset is never a reason to touch a running VM.
+. No actor awaits another actor. Replies, timeouts and peer death are messages.
+. Side effects of a command are sent only after its events are durable.
+. Recovery kills nothing whose identity is unverified.
+. VM processes are never descendants of the runtime's cgroup or session, and inherit none of its fds.
+
+== Open questions
+
+* Supervision strategy and restart intensity per level of the tree.
+* Whether a ractor stop or kill interrupts a running handler (not found in the docs, 2026-10-30). The journal design does not depend on it.
+* `daemon restart` policy with VMs running (with adoption it can simply restart).
+* Stream trimming: at generation end, or kept for history.
+* Snapshot cadence, if streams turn out not to be short.
