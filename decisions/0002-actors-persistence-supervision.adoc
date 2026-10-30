@@ -181,6 +181,29 @@ The runtime is started by systemd socket activation (`amoeboid.socket`, `amoeboi
 
 Order on start: take the lock, unlink the stale socket, bind (or receive the activated socket), hold incoming frames until recovery completes. A client never sees `RuntimeUnreachable` during a normal start.
 
+=== Crates and hosting
+
+[cols="1,2"]
+|===
+|Crate |Contents
+|`amoeboid` (library) |the whole control plane: actors, journal, protocol frames, adapters, and the runtime itself. Embeddable: a consumer can own a runtime in-process or attach to one as a client.
+|`amoeboid-daemon` (binary) |hosts a runtime; nothing else
+|`amoeboid` CLI (binary) |client only; never hosts a runtime
+|===
+
+How a runtime is hosted is a value, not a code path per binary:
+
+[source,rust]
+----
+enum Hosting {
+    SystemdUser { listener: ActivatedSocket },   // first: socket activation, Restart=on-failure
+    InProcess   { socket: SocketPath },          // the embedding process binds the socket and owns restarts; tests use it
+    // later: other supervisors
+}
+----
+
+Every variant takes `daemon.lock` and runs the same recovery; they differ only in where the listening socket comes from and who restarts the process. Adding a host is adding a variant and its match arms.
+
 == Protocol
 
 Frames are separate enums per direction, so a client cannot construct a server frame:
@@ -215,7 +238,7 @@ Requirements that keep this cheap: no per-connection state beyond the version ch
 
 == Console
 
-Unchanged from 0001: no pty relay; the operator uses ssh. README must describe this in the same change that removes the foreground console.
+No foreground mode. The CLI never attaches a terminal to a VM: `start` returns once the VM is ready and logs the ssh command to reach it. There is no pty relay (0001). README must describe this in the same change that removes the foreground console.
 
 == Salvage changes
 
