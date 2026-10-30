@@ -219,14 +219,13 @@ Unchanged from 0001: no pty relay; the operator uses ssh. README must describe t
 
 == Salvage changes
 
-Step 0, before slice 1, is one deletion commit, after which the tree builds and its tests pass:
+The earlier Rust workspace (crates, workspace manifest and lockfile, lint and format config, `deny.toml`, and its design `plans/designs/rust-port.adoc`) is moved unchanged to `rust_attempt_archived/`, where it still builds and passes its tests on its own. A new workspace starts at the repository root. Modules are carried over from the archive one at a time, when a slice needs them; the archive is deleted once nothing more is wanted from it.
 
-* `ops/` (observe/decide/execute), `ports/`, `testing/fakes`, `ports/vm_lock.rs`, `adapters/lock.rs` (its `O_CLOEXEC`/`O_NOFOLLOW` open is carried into the daemon lock), `domain/observed.rs`.
-* The lock handoff in `adapters/procs.rs` (`LockHandoff`, `HeldLock`).
-* `kdl/` and the KDL parts of `config/`, except one migrator for old `run_config.kdl` files.
-* `plans/designs/rust-port.adoc`, which describes the replaced process model.
+The adapters are coupled to the old `ports/` traits (their error and data types live there) and `adapters/procs.rs` to the per-VM lock handoff, so in-place deletion was not mechanical; copying forward lets each module be cut loose deliberately.
 
-Kept: `domain`, `refined`, `rails`, `layout`, `plan`, `console`, `contract`, and the adapters as free functions.
+Carried forward when needed: `domain`, `refined`, `rails`, `layout`, `plan`, `console`, `contract`, and the adapters, as inherent or free functions with their types moved out of `ports/`. The flock open in `adapters/lock.rs` (`O_CREAT|O_NOFOLLOW|O_CLOEXEC`) is reused for `daemon.lock`.
+
+Not carried forward: `ops/` (observe/decide/execute), `ports/` traits, `testing/fakes` and the interpreter sweeps, the per-VM lock and its handoff (`VmLock`, `HeldLock`, `LockHandoff`), `kdl/` and the KDL parts of `config/` (except one migrator for old `run_config.kdl` files, slice 6). `domain/observed.rs` is reviewed when the message boundary is built: several domain types (`mount`, `shares`, `guest_home`, `nix_source`) are refined through it today.
 
 == Lints
 
