@@ -5,7 +5,7 @@ Written 2026-10-30 at the end of a long session, to resume the Rust port the nex
 
 == Where things stand
 
-Branch `rust-conversion-double-split`. Latest commits (newest first):
+Branch `rust-revisited`. Latest commits (newest first; see `git log` for those after 2026-10-30):
 
 ----
 9b780ee Hold requests until the registry is loaded; survive closed pipes
@@ -60,10 +60,9 @@ Key module map (`crates/amoeboid/src`): `protocol/` (frames, codec), `journal/` 
 
 == Leftover work (in suggested order)
 
-. *Runtime data location.* `daemon.lock` and `journal.sqlite` currently share `$XDG_DATA_HOME/amoeboid` with VM data (and with the Python launcher's VM directories). The operator wants them separate (TODO comment in `runtime/paths.rs`, open question in 0002). Decide the location (e.g. `$XDG_STATE_HOME/amoeboid` for lock and journal) before running `daemon install` for real.
-. *Run `amoeboid daemon install` for real.* Not done: it writes `~/.config/systemd/user/amoeboid.{socket,service}` and enables the socket, and the runtime would then use the real data directory. Ask the operator first. Unit facts: `ListenStream=%t/amoeboid/runtime.sock`, `SocketMode=0600`, `DirectoryMode=0700`, `Restart=on-failure`, `KillMode=process`, `Environment="PATH=…"` captured at install (the user manager's PATH is often minimal; the daemon needs nix, ssh-keygen, systemd-run). ExecStart is `amoeboid-daemon` next to the `amoeboid` binary.
-. *Quarantine* (decided: option A). Twin becomes `Unrecoverable` → reports `VmReport::Unrecoverable` → Root appends `Quarantined{reason}` to stream `quarantine/<name>` at position 1 (conflict = already recorded) via plain `JournalMessage::Persist` (Root is not a persistent actor) and receives replies through `RootMessage::Journal`. At start Root also lists `quarantine/*` and does not spawn those twins; `status` should show them as quarantined (add a `VmCondition::Quarantined{reason}`). Currently Root only logs `VM quarantined`.
-. *`amoeboid vacuum_vm NAME`* (name chosen by the operator, with underscore). Reaps the VM's verified processes (stop first), removes its runtime directory and state directory, retires its streams (`vm/<name>`, `quarantine/<name>`; needs a journal delete operation). Works on quarantined VMs too.
+Done 2026-10-31 (decision 0003 records each): daemon units installed for real (binaries in `~/.cargo/bin` via `cargo install --locked --path crates/amoeboid-cli` and `crates/amoeboid-daemon`; reinstall and `systemctl --user restart amoeboid.service` after changes), journal tombstones (`Retire`, schema 2), quarantine, `amoeboid vacuum_vm NAME`; all checked against a real VM. Real-VM checks now need the installed socket stopped (`systemctl --user stop amoeboid.socket amoeboid.service`; `systemd-run --user` needs the real `XDG_RUNTIME_DIR`, which fixes the socket path), and started again after.
+
+. *Runtime data location.* Decided: `$XDG_STATE_HOME/amoeboid` for `daemon.lock` and `journal.sqlite` (0003). Deferred by the operator; the TODO in `runtime/paths.rs` stays. Moving it later must carry the existing journal along.
 . *VM-level supervision.* `ractor-supervisor` 0.2.0 is a dependency (with `default-features = false`, because its default enables ractor's async-trait feature and breaks native `async fn` actors) but unused. Root's twins should go under a `DynamicSupervisor` with real strategies; a twin's child (Builder/GuestVm/LocalQemu) that ends currently becomes an observation (`ChildEnded`) but is never respawned, so the twin is stuck until the runtime restarts. 0002 lists "strategy and intensity for the VM level and below" as open.
 . *CLI surface (slice 7).* clap adds `-h`/`-V` short flags by default; the rule is long options only (disable them). Add `amoeboid ssh [--name] [-- command]` built from `plan::argv::ssh` (the only ssh argv builder; pinned host key, forwarding off). `start` boot timeout is fixed at 120 s (`BOOT_TIMEOUT_SECONDS` in `runtime/root.rs`); consider a flag or config. `start` prints "this builds it first; it can take a while" even when cached.
 . *Config file and presets (slice 6).* `run_config.toml` replacing KDL (one-time migrator from the old `run_config.kdl`, then delete the KDL code), presets (`--base-nix-config` currently takes a directory only; Python also accepted preset names under `~/.config/amoeboid/nix_presets`), home files copied into the guest (Python `home_files`), linger. Not started.
