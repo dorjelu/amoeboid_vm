@@ -79,7 +79,7 @@ Shares belong to the Hypervisor, not to the Vm: the Vm asks for `Boot { spec }`,
 
 The Vm knows clients only by `OperationId`. Root keeps an in-memory table of which session waits on which operation and routes the Vm's `OperationDone { operation, result }` to it; a client reference never enters persisted state. If the runtime restarts mid-operation the waiting connection ends with it; `Subscribe { operation, from }` is how a client re-attaches.
 
-Every process a VM runs is spawned inside a transient user scope (`systemd-run --user --scope --unit=amoeboid-vm-NAME`), with a per-spawn nonce in its environment, so a spawn whose `Spawned` event was lost is found by searching the scope.
+Every process a VM runs is spawned in its own transient user scope, `systemd-run --user --scope --slice=amoeboid.slice --unit=amoeboid-NAME-ROLE --collect` (a scope holds exactly one spawn, so qemu and each virtiofsd get one each). The unit name is fixed per VM and role, so a second instance of the same process fails at `systemd-run`: the kernel and service manager arbitrate, no lock is involved. Each spawn carries a nonce in its environment (`AMOEBOID_NONCE`), so a spawn whose `Spawned` observation was lost is found by scanning the user's processes for it. Process identity is process id, start time (clock ticks since boot) and boot id; the executable is not part of it, because the runner script execs qemu.
 
 Strategies come from `ractor-supervisor`: OneForOne, OneForAll, RestForOne; Permanent, Transient, Temporary; `max_restarts` within `max_window`, with `reset_after` and backoff. Exceeding the limit fails the supervisor itself to its parent, as an OTP supervisor does. The concrete strategy per level is decided with slice 1.
 
@@ -178,14 +178,14 @@ Replay restores what the actor believed. Reconcile checks it against the world a
 
 [source]
 ----
-share/d0  replay → Spawned{process 812, start time X, scope amoeboid-vm-work}
-          pidfd_open(812) + starttime == X + in scope → persist Adopted → tell parent ChildReady
-          otherwise                                    → persist Lost   → respawn or report
-share/d1  replay → Spawning{nonce N} without Spawned   (crash between spawn and append)
-          search the VM's scope for nonce N → found: persist Spawned{identity}; not found: respawn
+vm/work replay → d0: Spawned{process 812, start time X}   d1: Spawning{nonce N} without Spawned
+        spawn Hypervisor with adopt { d0: 812/X, d1: nonce N }
+Hypervisor  d0: pidfd_open(812) + start time == X → Adopted{d0}     else Lost{d0}
+            d1: scan processes for AMOEBOID_NONCE=N → found: Spawned{d1, identity}   not found: Lost{d1}
+vm/work persists each observation, then decides (keep, respawn, or report)
 ----
 
-Spawns are recorded as `Spawning { nonce }` before and `Spawned { identity }` after. The nonce is visible on the process (argv or environment), and the VM's systemd scope bounds the search, so a crash between spawn and append never leaves an unowned process.
+Spawns are recorded by the twin as `Spawning { nonce }` before the process exists and `Spawned { identity }` after, so a crash between the two never leaves an unowned process: the nonce finds it.
 
 Nothing is killed during recovery unless its identity is verified and it is broken. Liveness comes from the OS; the journal holds claims (0001 invariant 5 stands).
 
@@ -194,7 +194,7 @@ Nothing is killed during recovery unless its identity is verified and it is brok
 [cols="1,2"]
 |===
 |What would tie a VM to the runtime |Rule
-|The runtime's cgroup (systemd stops the unit's whole group) |each VM's qemu and virtiofsd run in a transient scope `amoeboid-vm-NAME` (`systemd-run --user --scope`)
+|The runtime's cgroup (systemd stops the unit's whole group) |each VM process runs in its own transient scope `amoeboid-NAME-ROLE` under `amoeboid.slice` (`systemd-run --user --scope`)
 |Inherited fds (lock, socket, terminal) |every fd the runtime opens is `O_CLOEXEC`; console output goes to a log file
 |Session and process group |`setsid` on spawn
 |`wait()` works only for children |after adoption, exits are watched through a pidfd; the exit status of an adopted process is not available, and `Stopped` allows for that
