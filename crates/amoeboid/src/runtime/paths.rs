@@ -199,6 +199,12 @@ impl VmPaths {
         self.state.join("build.log")
     }
 
+    /// virtiofsd output, appended by every instance.
+    #[must_use]
+    pub fn helper_log(&self) -> AbsolutePath {
+        self.state.join("virtiofsd.log")
+    }
+
     #[must_use]
     pub fn console_log(&self) -> AbsolutePath {
         self.state.join("console.log")

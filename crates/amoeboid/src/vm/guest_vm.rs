@@ -267,29 +267,6 @@ mod tests {
     use crate::runtime::paths::RuntimePaths;
     use crate::vm::{Account, NixConfig, bundled};
 
-    /// Receives observations in a channel.
-    struct Twin;
-    impl Actor for Twin {
-        type Msg = GuestVmObservation;
-        type State = tokio::sync::mpsc::UnboundedSender<GuestVmObservation>;
-        type Arguments = tokio::sync::mpsc::UnboundedSender<GuestVmObservation>;
-        fn pre_start(
-            &self,
-            _: ActorRef<GuestVmObservation>,
-            sender: Self::Arguments,
-        ) -> impl Future<Output = Result<Self::State, ActorProcessingErr>> + Send {
-            std::future::ready(Ok(sender))
-        }
-        fn handle(
-            &self,
-            _: ActorRef<GuestVmObservation>,
-            message: GuestVmObservation,
-            sender: &mut Self::State,
-        ) -> impl Future<Output = Result<(), ActorProcessingErr>> + Send {
-            std::future::ready(sender.send(message).map_err(Into::into))
-        }
-    }
-
     struct Fixture {
         _temporary: tempfile::TempDir,
         vm: VmPaths,
@@ -305,8 +282,7 @@ mod tests {
         // What the Builder leaves behind.
         files::replace_directory(&vm.nix_config(), &bundled::config()).unwrap();
         files::write_atomically(&vm.host_module(), b"# host\n", 0o644).unwrap();
-        let (sender, observations) = tokio::sync::mpsc::unbounded_channel();
-        let (twin, _) = Actor::spawn(None, Twin, sender).await.unwrap();
+        let (twin, observations) = crate::testing::probe::<GuestVmObservation>().await;
         let (guest_vm, _) = Actor::spawn(None, GuestVm, twin.get_derived())
             .await
             .unwrap();

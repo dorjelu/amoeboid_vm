@@ -6,6 +6,7 @@ pub mod builder;
 pub mod bundled;
 pub mod guest_vm;
 pub mod hypervisor;
+pub mod local_qemu;
 pub mod twin;
 
 use serde::{Deserialize, Serialize};

@@ -244,34 +244,51 @@ pub fn adopt(identity: &ProcessIdentity) -> Result<Option<Watched>, ProcessError
     Ok(pidfd(identity)?.map(Watched::Adopted))
 }
 
-/// Resolves when the process exits.
-pub async fn exited(watched: Watched) -> Exit {
+/// Set to stop waiting on adopted processes (runtime shutdown); they keep running.
+pub type Cancel = std::sync::Arc<std::sync::atomic::AtomicBool>;
+
+/// How often a wait on an adopted process checks `cancel`.
+const CANCEL_CHECK: rustix::event::Timespec = rustix::event::Timespec {
+    tv_sec: 1,
+    tv_nsec: 0,
+};
+
+/// Resolves when the process exits; `None` when `cancel` was set first (only checked for
+/// adopted processes, whose wait holds a blocking thread; a child's wait just ends with its
+/// task).
+pub async fn exited(watched: Watched, cancel: Cancel) -> Option<Exit> {
     match watched {
-        Watched::Child(mut child) => match child.wait().await {
+        Watched::Child(mut child) => Some(match child.wait().await {
             Ok(status) => status
                 .code()
                 .map(Exit::Code)
                 .or_else(|| status.signal().map(Exit::Signal))
                 .unwrap_or(Exit::Unknown),
             Err(_) => Exit::Unknown,
-        },
+        }),
         Watched::Adopted(descriptor) => {
-            // A pidfd turns readable when its process exits. Registering it with the reactor
-            // needs `unsafe`, so it is polled on a blocking thread instead.
-            let _ = tokio::task::spawn_blocking(move || {
-                let mut watch = [rustix::event::PollFd::new(
-                    &descriptor,
-                    rustix::event::PollFlags::IN,
-                )];
+            // A pidfd turns readable when its process exits. Registering it with tokio's
+            // reactor needs `unsafe`, so it is polled on a blocking thread, waking every
+            // second to see whether the runtime is shutting down.
+            tokio::task::spawn_blocking(move || {
                 loop {
-                    match rustix::event::poll(&mut watch, None) {
-                        Err(rustix::io::Errno::INTR) => {}
-                        Ok(_) | Err(_) => return,
+                    let mut watch = [rustix::event::PollFd::new(
+                        &descriptor,
+                        rustix::event::PollFlags::IN,
+                    )];
+                    match rustix::event::poll(&mut watch, Some(&CANCEL_CHECK)) {
+                        Ok(0) | Err(rustix::io::Errno::INTR) => {
+                            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                                return None;
+                            }
+                        }
+                        Ok(_) | Err(_) => return Some(Exit::Unknown),
                     }
                 }
             })
-            .await;
-            Exit::Unknown
+            .await
+            .ok()
+            .flatten()
         }
     }
 }
@@ -382,7 +399,9 @@ pub async fn run(
         directory: directory.clone(),
         output: output.clone(),
     })?;
-    Ok(exited(Watched::Child(spawned.child)).await)
+    Ok(exited(Watched::Child(spawned.child), Cancel::default())
+        .await
+        .unwrap_or(Exit::Unknown))
 }
 
 /// The process carrying `nonce` in its environment, among those this user may inspect. Children
@@ -497,11 +516,11 @@ mod tests {
         assert_eq!(signal(&identity, Signal::Kill).unwrap(), Signalled::Sent);
         let exit = tokio::time::timeout(
             Duration::from_secs(5),
-            exited(Watched::Child(spawned.child)),
+            exited(Watched::Child(spawned.child), Cancel::default()),
         )
         .await
         .unwrap();
-        assert_eq!(exit, Exit::Signal(9));
+        assert_eq!(exit, Some(Exit::Signal(9)));
         assert_eq!(liveness(&identity).unwrap(), Liveness::Gone);
     }
 
@@ -515,7 +534,7 @@ mod tests {
         assert_eq!(signal(&impostor, Signal::Kill).unwrap(), Signalled::Gone);
         assert_eq!(liveness(&spawned.identity).unwrap(), Liveness::Alive);
         signal(&spawned.identity, Signal::Kill).unwrap();
-        exited(Watched::Child(spawned.child)).await;
+        exited(Watched::Child(spawned.child), Cancel::default()).await;
     }
 
     #[tokio::test]
@@ -523,11 +542,11 @@ mod tests {
         let spawned = sleeper(&fresh_nonce(), Containment::Direct);
         let watched = adopt(&spawned.identity).unwrap().unwrap();
         signal(&spawned.identity, Signal::Terminate).unwrap();
-        let exit = tokio::time::timeout(Duration::from_secs(5), exited(watched))
+        let exit = tokio::time::timeout(Duration::from_secs(5), exited(watched, Cancel::default()))
             .await
             .unwrap();
-        assert_eq!(exit, Exit::Unknown);
-        exited(Watched::Child(spawned.child)).await;
+        assert_eq!(exit, Some(Exit::Unknown));
+        exited(Watched::Child(spawned.child), Cancel::default()).await;
     }
 
     #[tokio::test]
@@ -553,7 +572,24 @@ mod tests {
             .and_then(Pid::from_raw)
             .unwrap();
         rustix::process::kill_process_group(group, KernelSignal::KILL).unwrap();
-        exited(Watched::Child(parent.child)).await;
+        exited(Watched::Child(parent.child), Cancel::default()).await;
+    }
+
+    #[tokio::test]
+    async fn waiting_on_an_adopted_process_ends_when_cancelled_and_leaves_it_running() {
+        let spawned = sleeper(&fresh_nonce(), Containment::Direct);
+        let watched = adopt(&spawned.identity).unwrap().unwrap();
+        let cancel = Cancel::default();
+        let wait = tokio::spawn(exited(watched, cancel.clone()));
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        let result = tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result, None);
+        assert_eq!(liveness(&spawned.identity).unwrap(), Liveness::Alive);
+        signal(&spawned.identity, Signal::Kill).unwrap();
+        exited(Watched::Child(spawned.child), Cancel::default()).await;
     }
 
     #[tokio::test]
@@ -566,7 +602,7 @@ mod tests {
         );
         assert_eq!(find_by_nonce(&fresh_nonce()).unwrap(), None);
         signal(&spawned.identity, Signal::Kill).unwrap();
-        exited(Watched::Child(spawned.child)).await;
+        exited(Watched::Child(spawned.child), Cancel::default()).await;
     }
 
     /// Needs a systemd user session; runs only with `AMOEBOID_TEST_SYSTEMD=1`.
@@ -599,12 +635,12 @@ mod tests {
         let second = sleeper(&fresh_nonce(), Containment::Scope(scope));
         let exit = tokio::time::timeout(
             Duration::from_secs(10),
-            exited(Watched::Child(second.child)),
+            exited(Watched::Child(second.child), Cancel::default()),
         )
         .await
         .unwrap();
-        assert!(matches!(exit, Exit::Code(code) if code != 0));
+        assert!(matches!(exit, Some(Exit::Code(code)) if code != 0));
         signal(&first.identity, Signal::Kill).unwrap();
-        exited(Watched::Child(first.child)).await;
+        exited(Watched::Child(first.child), Cancel::default()).await;
     }
 }

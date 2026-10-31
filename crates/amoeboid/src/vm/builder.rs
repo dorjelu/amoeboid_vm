@@ -245,29 +245,6 @@ mod tests {
         assert_eq!(config_step(&from, false), ConfigStep::Install(source));
     }
 
-    /// Receives observations in a channel.
-    struct Twin;
-    impl Actor for Twin {
-        type Msg = BuilderObservation;
-        type State = tokio::sync::mpsc::UnboundedSender<BuilderObservation>;
-        type Arguments = tokio::sync::mpsc::UnboundedSender<BuilderObservation>;
-        fn pre_start(
-            &self,
-            _: ActorRef<BuilderObservation>,
-            sender: Self::Arguments,
-        ) -> impl Future<Output = Result<Self::State, ActorProcessingErr>> + Send {
-            std::future::ready(Ok(sender))
-        }
-        fn handle(
-            &self,
-            _: ActorRef<BuilderObservation>,
-            message: BuilderObservation,
-            sender: &mut Self::State,
-        ) -> impl Future<Output = Result<(), ActorProcessingErr>> + Send {
-            std::future::ready(sender.send(message).map_err(Into::into))
-        }
-    }
-
     struct Fixture {
         _temporary: tempfile::TempDir,
         vm: VmPaths,
@@ -280,8 +257,7 @@ mod tests {
         let root = AbsolutePath::parse(temporary.path().to_path_buf()).unwrap();
         let paths = RuntimePaths::under(root.join("data"), root.join("run")).unwrap();
         let vm = paths.vm(&VmName::parse("work".into()).unwrap()).unwrap();
-        let (sender, observations) = tokio::sync::mpsc::unbounded_channel();
-        let (twin, _) = Actor::spawn(None, Twin, sender).await.unwrap();
+        let (twin, observations) = crate::testing::probe::<BuilderObservation>().await;
         let (builder, _) = Actor::spawn(
             None,
             Builder,

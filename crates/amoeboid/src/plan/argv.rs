@@ -125,6 +125,13 @@ pub fn virtiofsd(
     Argv(argv)
 }
 
+/// The VM runner from the build output; it reads `amoeboid-qemu-args` from its working
+/// directory (the VM's runtime directory) and execs qemu.
+#[must_use]
+pub fn runner(runner: &AbsolutePath) -> Argv {
+    Argv(vec![runner.as_os_str().into()])
+}
+
 #[must_use]
 pub fn ssh_keygen(vm: &VmName, key_file: &AbsolutePath) -> Argv {
     Argv(vec![

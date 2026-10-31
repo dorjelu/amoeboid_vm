@@ -168,6 +168,7 @@ pub struct VmPeers {
     pub vm: VmPaths,
     pub builder: ActorRef<BuilderCommand>,
     pub guest_vm: ActorRef<GuestVmCommand>,
-    pub hypervisor: ActorRef<HypervisorCommand>,
+    /// Whichever backend runs this VM: anything that accepts `HypervisorCommand`.
+    pub hypervisor: DerivedActorRef<HypervisorCommand>,
     pub root: DerivedActorRef<VmReport>,
 }
