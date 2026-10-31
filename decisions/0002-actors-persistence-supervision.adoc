@@ -63,13 +63,21 @@ Root (registry, routing)                         ractor-supervisor
 ├─ Journal            single SQLite connection; persistent actors' only path to disk
 ├─ Listener           socket accept loop
 │   └─ Session × client     decodes ClientFrame, encodes ServerFrame
-└─ Vm × name          persistent; spawns children only it can reach
-    ├─ Builder        nix build
-    ├─ Hypervisor     backend actor (LocalQemu | Scripted | …), persistent
-    │   └─ Watcher × process   pidfd → ProcExited
-    ├─ Share × dN     persistent; owns one virtiofsd
-    └─ Guest          readiness over ssh, host key, guest delivery
+└─ Vm × name          persistent; the VM's digital twin; spawns children only it can reach
+    ├─ Builder        nix build; idempotent, not persistent
+    ├─ Guest          host key, guest state files, sshd readiness probe; not persistent
+    └─ Hypervisor     backend actor (LocalQemu | Scripted | …), persistent
+        ├─ Share × dN         persistent; owns one virtiofsd (LocalQemu only)
+        └─ Watcher × process  pidfd → ProcExited
 ----
+
+The Vm actor is the VM's digital twin: everything that belongs to that VM is owned by it or by its subtree, and nothing outside the subtree touches it. That covers its processes and their systemd scope, its runtime and guest directories, its host key, ssh port, console log, build output and per-VM Nix config. Questions about a VM (status, how to reach it) are answered by its twin; `amoeboid vacuum_vm NAME` is the twin removing everything it owns.
+
+Shares belong to the Hypervisor, not to the Vm: the Vm asks for `Boot { spec }`, where `spec` lists shares by what they are (host directory, read-only or not), and LocalQemu realises them as virtiofsd children. A remote hypervisor would realise them its own way.
+
+The Vm knows clients only by `OpId`. Root keeps an in-memory table of which session waits on which operation and routes the Vm's `OpDone { op, result }` to it; a client reference never enters persisted state. If the runtime restarts mid-operation the waiting connection ends with it; `Subscribe { op, from }` is how a client re-attaches.
+
+Every process a VM runs is spawned inside a transient user scope (`systemd-run --user --scope --unit=amoeboid-vm-NAME`), with a per-spawn nonce in its environment, so a spawn whose `Spawned` event was lost is found by searching the scope.
 
 Strategies come from `ractor-supervisor`: OneForOne, OneForAll, RestForOne; Permanent, Transient, Temporary; `max_restarts` within `max_window`, with `reset_after` and backoff. Exceeding the limit fails the supervisor itself to its parent, as an OTP supervisor does. The concrete strategy per level is decided with slice 1.
 
