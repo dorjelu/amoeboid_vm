@@ -363,7 +363,9 @@ async fn handle(myself: &ActorRef<RootMessage>, message: RootMessage, state: &mu
             JournalReply::Replayed { .. }
             | JournalReply::ReplayFailed { .. }
             | JournalReply::Persisted { .. }
-            | JournalReply::PersistFailed { .. },
+            | JournalReply::PersistFailed { .. }
+            | JournalReply::Retired { .. }
+            | JournalReply::RetireFailed { .. },
         ) => tracing::debug!("journal reply Root didn't ask for; ignored"),
     }
 }

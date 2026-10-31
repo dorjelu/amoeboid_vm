@@ -67,7 +67,7 @@ async fn appended_events_replay_in_order_with_positions_from_one() {
             .await
             .unwrap();
         assert_eq!(last, sequence(3));
-        let replayed = store.replay(&id("vm/a")).await.unwrap();
+        let replayed = store.replay(&id("vm/a")).await.unwrap().events;
         let sequences: Vec<u64> = replayed.iter().map(|event| event.sequence.get()).collect();
         let bodies: Vec<&str> = replayed
             .iter()
@@ -82,7 +82,7 @@ async fn appended_events_replay_in_order_with_positions_from_one() {
 #[tokio::test]
 async fn an_unknown_stream_replays_empty() {
     each_store(async |mut store, _| {
-        assert_eq!(store.replay(&id("vm/none")).await.unwrap(), vec![]);
+        assert_eq!(store.replay(&id("vm/none")).await.unwrap(), Replay::empty());
     })
     .await;
 }
@@ -101,7 +101,7 @@ async fn appending_at_a_taken_position_is_a_conflict_and_writes_nothing() {
             stale,
             Err(PersistFailure::Conflict { first: 1, next: 2 })
         ));
-        assert_eq!(store.replay(&id("vm/a")).await.unwrap().len(), 1);
+        assert_eq!(store.replay(&id("vm/a")).await.unwrap().events.len(), 1);
     })
     .await;
 }
@@ -131,8 +131,8 @@ async fn streams_are_independent() {
             .append(&id("vm/b"), Sequence::FIRST, payloads(&["b"]))
             .await
             .unwrap();
-        assert_eq!(store.replay(&id("vm/a")).await.unwrap().len(), 1);
-        assert_eq!(store.replay(&id("vm/b")).await.unwrap().len(), 1);
+        assert_eq!(store.replay(&id("vm/a")).await.unwrap().events.len(), 1);
+        assert_eq!(store.replay(&id("vm/b")).await.unwrap().events.len(), 1);
     })
     .await;
 }
@@ -166,7 +166,7 @@ async fn sqlite_events_survive_reopening() {
     let mut reopened = Store::open(Persistence::Sqlite, &fixture.paths)
         .await
         .unwrap();
-    assert_eq!(reopened.replay(&id("vm/a")).await.unwrap().len(), 1);
+    assert_eq!(reopened.replay(&id("vm/a")).await.unwrap().events.len(), 1);
 }
 
 #[tokio::test]
@@ -275,6 +275,117 @@ async fn the_journal_actor_answers_persist_and_replay_through_derived_refs() {
         .unwrap();
     assert!(matches!(
         receiver.recv().await,
-        Some(JournalReply::Replayed { events, .. }) if events.len() == 1
+        Some(JournalReply::Replayed { replay, .. }) if replay.events.len() == 1
     ));
+}
+
+#[tokio::test]
+async fn a_retired_stream_replays_empty_keeps_its_position_and_is_not_listed() {
+    each_store(async |mut store, _| {
+        store
+            .append(&id("vm/a"), Sequence::FIRST, payloads(&["x", "y"]))
+            .await
+            .unwrap();
+        store.retire(&id("vm/a")).await.unwrap();
+        assert_eq!(
+            store.replay(&id("vm/a")).await.unwrap(),
+            Replay {
+                events: vec![],
+                last: Some(sequence(2))
+            }
+        );
+        assert_eq!(store.streams(&id("vm")).await.unwrap(), vec![]);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_retired_stream_continues_after_its_tombstone_and_lists_again() {
+    each_store(async |mut store, _| {
+        store
+            .append(&id("vm/a"), Sequence::FIRST, payloads(&["old"]))
+            .await
+            .unwrap();
+        store.retire(&id("vm/a")).await.unwrap();
+        let reused = store
+            .append(&id("vm/a"), Sequence::FIRST, payloads(&["new"]))
+            .await;
+        assert!(matches!(
+            reused,
+            Err(PersistFailure::Conflict { first: 1, next: 2 })
+        ));
+        store
+            .append(&id("vm/a"), sequence(2), payloads(&["new"]))
+            .await
+            .unwrap();
+        let replay = store.replay(&id("vm/a")).await.unwrap();
+        let live: Vec<(u64, &str)> = replay
+            .events
+            .iter()
+            .map(|event| (event.sequence.get(), event.payload.as_str()))
+            .collect();
+        assert_eq!(live, [(2, r#""new""#)]);
+        assert_eq!(replay.last, Some(sequence(2)));
+        assert_eq!(store.streams(&id("vm")).await.unwrap(), vec![id("vm/a")]);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn retiring_twice_or_an_empty_stream_changes_nothing() {
+    each_store(async |mut store, _| {
+        store.retire(&id("vm/none")).await.unwrap();
+        assert_eq!(store.replay(&id("vm/none")).await.unwrap(), Replay::empty());
+        store
+            .append(&id("vm/a"), Sequence::FIRST, payloads(&["x"]))
+            .await
+            .unwrap();
+        store.retire(&id("vm/a")).await.unwrap();
+        store.retire(&id("vm/a")).await.unwrap();
+        assert_eq!(
+            store.replay(&id("vm/a")).await.unwrap().last,
+            Some(sequence(1))
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn retiring_leaves_other_streams_live() {
+    each_store(async |mut store, _| {
+        for stream in ["vm/a", "vm/b"] {
+            store
+                .append(&id(stream), Sequence::FIRST, payloads(&["x"]))
+                .await
+                .unwrap();
+        }
+        store.retire(&id("vm/a")).await.unwrap();
+        assert_eq!(store.streams(&id("vm")).await.unwrap(), vec![id("vm/b")]);
+        assert_eq!(store.replay(&id("vm/b")).await.unwrap().events.len(), 1);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_version_1_journal_is_migrated_and_keeps_its_events() {
+    let fixture = fixture();
+    let path = fixture.paths.journal();
+    {
+        let connection = tokio_rusqlite::rusqlite::Connection::open(path.as_path()).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE events (persistence_id TEXT NOT NULL, sequence INTEGER NOT NULL, \
+                 payload TEXT NOT NULL, at INTEGER NOT NULL, \
+                 PRIMARY KEY (persistence_id, sequence)) STRICT; \
+                 INSERT INTO events VALUES ('vm/a', 1, '\"x\"', 0); \
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+    }
+    let mut store = Store::open(Persistence::Sqlite, &fixture.paths)
+        .await
+        .unwrap();
+    assert_eq!(store.replay(&id("vm/a")).await.unwrap().events.len(), 1);
+    store.retire(&id("vm/a")).await.unwrap();
+    assert_eq!(store.streams(&id("vm")).await.unwrap(), vec![]);
 }

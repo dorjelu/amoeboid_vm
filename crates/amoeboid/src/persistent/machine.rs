@@ -6,7 +6,9 @@ use std::collections::VecDeque;
 use serde::{Deserialize, Serialize};
 
 use super::{Behaviour, Effect, Unrecoverable};
-use crate::journal::{BatchId, EventPayload, PersistFailure, Sequence, StoreError, StoredEvent};
+use crate::journal::{
+    BatchId, EventPayload, PersistFailure, Replay, Sequence, StoreError, StoredEvent,
+};
 use crate::nonempty::NonEmpty;
 
 /// ```text
@@ -45,7 +47,7 @@ pub enum Resume<B: Behaviour> {
 pub enum Input<B: Behaviour> {
     Command(B::Command),
     Observation(B::Observation),
-    Replayed(Vec<StoredEvent>),
+    Replayed(Replay),
     ReplayFailed(StoreError),
     Persisted {
         batch: BatchId,
@@ -200,7 +202,7 @@ fn recovering<B: Behaviour>(
             stash.push_back(command);
             parts.with(Mode::Recovering { stash })
         }
-        Input::Replayed(events) => match decode::<B>(&events) {
+        Input::Replayed(replay) => match decode::<B>(&replay.events) {
             Err(reason) => {
                 out.push(Action::Entered(ModeName::Unrecoverable));
                 out.push(Action::Send(B::on_unrecoverable(&reason)));
@@ -215,7 +217,8 @@ fn recovering<B: Behaviour>(
             Ok(decoded) => {
                 let parts = Parts {
                     state: decoded.iter().fold(parts.state, B::on_event),
-                    last: events.last().map(|event| event.sequence),
+                    // Past a tombstone the stream continues after its retired events.
+                    last: replay.last,
                     next_batch: parts.next_batch,
                 };
                 out.push(Action::Entered(ModeName::Reconciling));

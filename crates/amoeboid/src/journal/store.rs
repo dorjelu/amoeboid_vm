@@ -8,27 +8,61 @@ use rustix::fs::{Mode, OFlags};
 use tokio_rusqlite::rusqlite::{self, ErrorCode, TransactionBehavior, params};
 
 use super::{
-    EventPayload, PersistFailure, Persistence, PersistenceId, Sequence, StoreError, StoredEvent,
+    EventPayload, PersistFailure, Persistence, PersistenceId, Replay, Sequence, StoreError,
+    StoredEvent,
 };
 use crate::nonempty::NonEmpty;
 use crate::runtime::paths::RuntimePaths;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
-const SCHEMA: &str = "
+/// Version 1: event streams.
+const SCHEMA_1: &str = "
 CREATE TABLE events (
-  persistence_id     TEXT NOT NULL,
+  persistence_id TEXT NOT NULL,
   sequence       INTEGER NOT NULL,
-  payload TEXT NOT NULL,
-  at      INTEGER NOT NULL,
+  payload        TEXT NOT NULL,
+  at             INTEGER NOT NULL,
   PRIMARY KEY (persistence_id, sequence)
 ) STRICT;
 PRAGMA user_version = 1;
 ";
 
+/// Version 2: tombstones. Events at or below `through` are retired: kept, never replayed; a
+/// stream with no event above its tombstone is not listed.
+const SCHEMA_2: &str = "
+CREATE TABLE tombstones (
+  persistence_id TEXT PRIMARY KEY,
+  through        INTEGER NOT NULL,
+  at             INTEGER NOT NULL
+) STRICT;
+PRAGMA user_version = 2;
+";
+
 pub(super) enum Store {
     Sqlite(tokio_rusqlite::Connection),
-    Memory(BTreeMap<PersistenceId, Vec<EventPayload>>),
+    Memory(BTreeMap<PersistenceId, MemoryStream>),
+}
+
+/// One stream in memory: every event ever appended, and how many of them are retired.
+#[derive(Default)]
+pub(super) struct MemoryStream {
+    events: Vec<EventPayload>,
+    through: usize,
+}
+
+impl MemoryStream {
+    fn live(&self) -> bool {
+        self.events.len() > self.through
+    }
+}
+
+fn now_milliseconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+        })
 }
 
 impl StoreError {
@@ -62,23 +96,28 @@ impl Store {
         }
     }
 
-    pub(super) async fn replay(
-        &mut self,
-        id: &PersistenceId,
-    ) -> Result<Vec<StoredEvent>, StoreError> {
+    /// The stream's events after its tombstone, and its last position (retired events
+    /// included).
+    pub(super) async fn replay(&mut self, id: &PersistenceId) -> Result<Replay, StoreError> {
         match self {
-            Self::Memory(streams) => Ok(streams
-                .get(id)
-                .map(|events| {
+            Self::Memory(streams) => Ok(streams.get(id).map_or_else(Replay::empty, |stream| {
+                let positions: Vec<Sequence> =
                     std::iter::successors(Some(Sequence::FIRST), |sequence| sequence.next())
-                        .zip(events)
+                        .take(stream.events.len())
+                        .collect();
+                Replay {
+                    events: positions
+                        .iter()
+                        .zip(&stream.events)
+                        .skip(stream.through)
                         .map(|(sequence, payload)| StoredEvent {
-                            sequence,
+                            sequence: *sequence,
                             payload: payload.clone(),
                         })
-                        .collect()
-                })
-                .unwrap_or_default()),
+                        .collect(),
+                    last: positions.last().copied(),
+                }
+            })),
             Self::Sqlite(connection) => {
                 let persistence_id = id.as_str().to_owned();
                 connection
@@ -96,18 +135,21 @@ impl Store {
     ) -> Result<Vec<PersistenceId>, StoreError> {
         match self {
             Self::Memory(streams) => Ok(streams
-                .keys()
-                .filter(|id| id.below(under).is_some())
-                .cloned()
+                .iter()
+                .filter(|(id, stream)| id.below(under).is_some() && stream.live())
+                .map(|(id, _)| id.clone())
                 .collect()),
             Self::Sqlite(connection) => {
                 let prefix = format!("{}/", under.as_str());
                 let names = connection
                     .call(move |connection| {
                         let mut statement = connection.prepare_cached(
-                            "SELECT DISTINCT persistence_id FROM events \
-                             WHERE substr(persistence_id, 1, length(?1)) = ?1 \
-                             ORDER BY persistence_id",
+                            "SELECT events.persistence_id FROM events \
+                             LEFT JOIN tombstones USING (persistence_id) \
+                             WHERE substr(events.persistence_id, 1, length(?1)) = ?1 \
+                             GROUP BY events.persistence_id \
+                             HAVING max(events.sequence) > coalesce(max(tombstones.through), 0) \
+                             ORDER BY events.persistence_id",
                         )?;
                         let rows = statement.query_map([prefix], |row| row.get::<_, String>(0))?;
                         rows.collect::<rusqlite::Result<Vec<String>>>()
@@ -130,7 +172,7 @@ impl Store {
     ) -> Result<Sequence, PersistFailure> {
         match self {
             Self::Memory(streams) => {
-                let stream = streams.entry(id.clone()).or_default();
+                let stream = &mut streams.entry(id.clone()).or_default().events;
                 let next = u64::try_from(stream.len())
                     .unwrap_or(u64::MAX)
                     .saturating_add(1);
@@ -165,6 +207,41 @@ impl Store {
     }
 }
 
+impl Store {
+    /// Retires every event the stream holds now: a tombstone at its last position. Later
+    /// appends continue after it and are live. Retiring an empty or retired stream changes
+    /// nothing.
+    pub(super) async fn retire(&mut self, id: &PersistenceId) -> Result<(), StoreError> {
+        match self {
+            Self::Memory(streams) => {
+                if let Some(stream) = streams.get_mut(id) {
+                    stream.through = stream.events.len();
+                }
+                Ok(())
+            }
+            Self::Sqlite(connection) => {
+                let persistence_id = id.as_str().to_owned();
+                let at = now_milliseconds();
+                connection
+                    .call(move |connection| {
+                        connection
+                            .prepare_cached(
+                                "INSERT INTO tombstones (persistence_id, through, at) \
+                                 SELECT persistence_id, max(sequence), ?2 FROM events \
+                                 WHERE persistence_id = ?1 GROUP BY persistence_id \
+                                 ON CONFLICT (persistence_id) \
+                                 DO UPDATE SET through = excluded.through, at = excluded.at",
+                            )?
+                            .execute(params![persistence_id, at])
+                    })
+                    .await
+                    .map(|_| ())
+                    .map_err(StoreError::of)
+            }
+        }
+    }
+}
+
 fn last_of(first: Sequence, events: &NonEmpty<EventPayload>) -> Result<Sequence, PersistFailure> {
     events
         .iter()
@@ -181,7 +258,8 @@ fn migrate(connection: &mut rusqlite::Connection) -> rusqlite::Result<()> {
     connection.busy_timeout(std::time::Duration::from_secs(5))?;
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match version {
-        0 => connection.execute_batch(SCHEMA),
+        0 => connection.execute_batch(&format!("BEGIN; {SCHEMA_1} {SCHEMA_2} COMMIT;")),
+        1 => connection.execute_batch(&format!("BEGIN; {SCHEMA_2} COMMIT;")),
         SCHEMA_VERSION => Ok(()),
         other => Err(rusqlite::Error::InvalidParameterName(format!(
             "journal schema version {other} is newer than this binary's {SCHEMA_VERSION}"
@@ -192,22 +270,48 @@ fn migrate(connection: &mut rusqlite::Connection) -> rusqlite::Result<()> {
 fn replay_rows(
     connection: &mut rusqlite::Connection,
     persistence_id: &str,
-) -> Result<Vec<StoredEvent>, StoreError> {
+) -> Result<Replay, StoreError> {
+    let (through, last): (i64, Option<i64>) = connection
+        .query_row(
+            "SELECT \
+               coalesce((SELECT through FROM tombstones WHERE persistence_id = ?1), 0), \
+               (SELECT max(sequence) FROM events WHERE persistence_id = ?1)",
+            [persistence_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(StoreError::of)?;
+    let position = |value: i64| {
+        u64::try_from(value)
+            .ok()
+            .and_then(std::num::NonZeroU64::new)
+            .map(Sequence)
+            .ok_or_else(|| {
+                StoreError(format!(
+                    "stream {persistence_id} has an invalid position {value}"
+                ))
+            })
+    };
+    let last = last.map(position).transpose()?;
     let mut statement = connection
         .prepare_cached(
-            "SELECT sequence, payload FROM events WHERE persistence_id = ? ORDER BY sequence",
+            "SELECT sequence, payload FROM events WHERE persistence_id = ? AND sequence > ? \
+             ORDER BY sequence",
         )
         .map_err(StoreError::of)?;
     let rows = statement
-        .query_map([persistence_id], |row| {
+        .query_map(params![persistence_id, through], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })
         .map_err(StoreError::of)?;
     let mut events = Vec::new();
-    let mut expected = Some(Sequence::FIRST);
+    let mut expected = Sequence::after(if through == 0 {
+        None
+    } else {
+        Some(position(through)?)
+    });
     for row in rows {
         let (sequence, payload) = row.map_err(StoreError::of)?;
-        // Positions are contiguous from 1; anything else is a corrupt stream.
+        // Positions are contiguous after the tombstone; anything else is a corrupt stream.
         let sequence = expected
             .filter(|expected| u64::try_from(sequence).ok() == Some(expected.get()))
             .ok_or_else(|| {
@@ -221,7 +325,7 @@ fn replay_rows(
         });
         expected = sequence.next();
     }
-    Ok(events)
+    Ok(Replay { events, last })
 }
 
 fn append_rows(
@@ -245,11 +349,7 @@ fn append_rows(
     if first != next {
         return Err(PersistFailure::Conflict { first, next });
     }
-    let at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| {
-            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
-        });
+    let at = now_milliseconds();
     {
         let mut insert = transaction
             .prepare_cached(

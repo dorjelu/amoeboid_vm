@@ -268,14 +268,17 @@ fn run<B: Behaviour>(
         PersistentMessage::Observation(observation) => Input::Observation(observation),
         PersistentMessage::PersistTimeout(batch) => Input::PersistTimeout(batch),
         PersistentMessage::Journal(reply) => match reply {
-            JournalReply::Replayed { events, .. } => Input::Replayed(events),
+            JournalReply::Replayed { replay, .. } => Input::Replayed(replay),
             JournalReply::ReplayFailed { reason, .. } => Input::ReplayFailed(reason),
             JournalReply::Persisted { batch, last } => Input::Persisted { batch, last },
             JournalReply::PersistFailed { batch, reason } => Input::PersistFailed { batch, reason },
-            JournalReply::Streams { .. } | JournalReply::StreamsFailed { .. } => {
+            JournalReply::Streams { .. }
+            | JournalReply::StreamsFailed { .. }
+            | JournalReply::Retired { .. }
+            | JournalReply::RetireFailed { .. } => {
                 tracing::debug!(
                     id = state.id.as_str(),
-                    "stream listing not asked for; ignored"
+                    "journal reply not asked for; ignored"
                 );
                 return Ok(());
             }

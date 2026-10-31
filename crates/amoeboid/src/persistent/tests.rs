@@ -9,7 +9,7 @@ use super::machine::{Action, Core, Fatal, Input, Mode, ModeName, step};
 use super::*;
 use crate::domain::path::AbsolutePath;
 use crate::journal::{
-    EventPayload, Journal, JournalArgs, PersistFailure, Persistence, StoredEvent,
+    EventPayload, Journal, JournalArgs, PersistFailure, Persistence, Replay, StoredEvent,
 };
 use crate::runtime::paths::RuntimePaths;
 
@@ -188,7 +188,7 @@ fn ready_with(events: Vec<StoredEvent>) -> Core<Manual> {
     let (core, actions) = run(
         Core::recovering(),
         vec![
-            Input::Replayed(events),
+            Input::Replayed(Replay::of(events)),
             Input::Observation(CounterObservation::Open),
         ],
     );
@@ -208,10 +208,10 @@ fn ready_with(events: Vec<StoredEvent>) -> Core<Manual> {
 fn replay_folds_events_into_state_and_tracks_the_last_position() {
     let (core, _) = step(
         Core::<Manual>::recovering(),
-        Input::Replayed(vec![
+        Input::Replayed(Replay::of(vec![
             stored(1, r#"{"version":1,"event":{"Added":2}}"#),
             stored(2, r#"{"version":1,"event":{"Added":3}}"#),
-        ]),
+        ])),
     );
     assert_eq!(core.state.total, 5);
     assert_eq!(core.last, Some(sequence(2)));
@@ -224,7 +224,10 @@ fn commands_wait_until_reconciled_then_run_in_arrival_order() {
         Core::recovering(),
         vec![
             Input::Command(CounterCommand::Read),
-            Input::Replayed(vec![stored(1, r#"{"version":1,"event":{"Added":4}}"#)]),
+            Input::Replayed(Replay::of(vec![stored(
+                1,
+                r#"{"version":1,"event":{"Added":4}}"#,
+            )])),
             Input::Command(CounterCommand::Read),
         ],
     );
@@ -245,6 +248,25 @@ fn commands_wait_until_reconciled_then_run_in_arrival_order() {
     );
     assert_eq!(sent(&actions), [Out::Total(4), Out::Total(4)]);
     assert!(matches!(core.mode, Mode::Ready));
+}
+
+#[test]
+fn past_a_tombstone_the_next_persist_goes_after_the_retired_events() {
+    let (_, actions) = run(
+        Core::<Manual>::recovering(),
+        vec![
+            Input::Replayed(Replay {
+                events: vec![],
+                last: Some(sequence(5)),
+            }),
+            Input::Observation(CounterObservation::Open),
+        ],
+    );
+    assert!(
+        actions
+            .iter()
+            .any(|action| matches!(action, Action::Persist { first, .. } if *first == sequence(6)))
+    );
 }
 
 #[test]
@@ -359,7 +381,7 @@ fn an_undecodable_or_unknown_version_stream_is_quarantined_not_stopped() {
             vec![
                 Input::Command(CounterCommand::Read),
                 Input::Command(CounterCommand::Add(1)),
-                Input::Replayed(vec![stored(1, json)]),
+                Input::Replayed(Replay::of(vec![stored(1, json)])),
                 Input::Command(CounterCommand::Read),
             ],
         );

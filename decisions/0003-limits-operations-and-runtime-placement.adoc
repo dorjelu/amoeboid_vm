@@ -54,7 +54,23 @@ Status is collected tell-only: Root asks every twin and gathers answers for 5 s.
 
 `amoeboid vacuum_vm NAME` removes everything a VM owns: it stops the VM (reaping its verified processes), removes its runtime directory and state directory, and retires its streams (`vm/<name>`, `quarantine/<name>`). It works on quarantined VMs, which have no twin to stop them.
 
-A stream is retired by a **tombstone**, not deleted: the journal records that the stream ended, and a retired stream is neither replayed nor listed in the registry. The history stays in the journal. The tombstone's exact shape, and how a name is reused after its stream is retired, are settled with the implementation and recorded here.
+A stream is retired by a **tombstone**, not deleted: the journal records that the stream ended, and a retired stream is neither replayed nor listed in the registry. The history stays in the journal.
+
+=== Tombstones
+
+[source,sql]
+----
+CREATE TABLE tombstones (
+  persistence_id TEXT PRIMARY KEY,
+  through        INTEGER NOT NULL,   -- events at or below are retired
+  at             INTEGER NOT NULL
+) STRICT;                            -- journal schema version 2; version 1 migrates in place
+----
+
+* `JournalMessage::Retire { id }` sets `through` to the stream's last position (answered `Retired` or `RetireFailed`). Retiring an empty or already retired stream changes nothing.
+* A replay returns `Replay { events, last }`: the events above `through`, and the stream's last position with retired events included. A persistent actor appends after `last`, as an Akka persistent actor continues after its highest sequence number once its messages are deleted.
+* A stream is listed only while it has an event above its tombstone.
+* A name is reused by continuing its stream: a new twin for a vacuumed name replays nothing, so it is a fresh VM (`Created` with a new incarnation), and its events follow the tombstone. The writer fence is unchanged: an append must start at `last + 1`.
 
 == Supervision
 
@@ -98,5 +114,4 @@ The CLI remainders (long options only, `amoeboid ssh`, a boot timeout option) an
 
 == Open questions
 
-* The tombstone's shape and name reuse after `vacuum_vm`.
 * Supervision strategy and restart intensity for the VM level and below (from 0002).

@@ -111,6 +111,33 @@ pub struct StoredEvent {
     pub payload: EventPayload,
 }
 
+/// What a replay finds: the stream's live events (those after its tombstone, if any) and its
+/// last position, retired events included, so the writer appends after it (≈ Akka's highest
+/// sequence number surviving `deleteMessages`).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Replay {
+    pub events: Vec<StoredEvent>,
+    pub last: Option<Sequence>,
+}
+
+impl Replay {
+    /// A stream with no events at all.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            events: Vec::new(),
+            last: None,
+        }
+    }
+
+    /// A stream never retired: `last` is the last event's position.
+    #[must_use]
+    pub fn of(events: Vec<StoredEvent>) -> Self {
+        let last = events.last().map(|event| event.sequence);
+        Self { events, last }
+    }
+}
+
 /// Correlates a `Persist` with its reply; unique per persistent-actor incarnation.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct BatchId(u64);
@@ -143,13 +170,19 @@ pub enum JournalMessage {
         events: NonEmpty<EventPayload>,
         reply_to: DerivedActorRef<JournalReply>,
     },
+    /// Writes a tombstone at the stream's last position: its events stay in the journal but
+    /// are no longer replayed or listed. Appends continue after it.
+    Retire {
+        id: PersistenceId,
+        reply_to: DerivedActorRef<JournalReply>,
+    },
 }
 
 #[derive(Debug)]
 pub enum JournalReply {
     Replayed {
         id: PersistenceId,
-        events: Vec<StoredEvent>,
+        replay: Replay,
     },
     ReplayFailed {
         id: PersistenceId,
@@ -169,6 +202,13 @@ pub enum JournalReply {
     },
     StreamsFailed {
         under: PersistenceId,
+        reason: StoreError,
+    },
+    Retired {
+        id: PersistenceId,
+    },
+    RetireFailed {
+        id: PersistenceId,
         reason: StoreError,
     },
 }
@@ -232,7 +272,7 @@ impl Actor for Journal {
         let (reply, reply_to) = match message {
             JournalMessage::Replay { id, reply_to } => {
                 let reply = match state.store.replay(&id).await {
-                    Ok(events) => JournalReply::Replayed { id, events },
+                    Ok(replay) => JournalReply::Replayed { id, replay },
                     Err(reason) => JournalReply::ReplayFailed { id, reason },
                 };
                 (reply, reply_to)
@@ -241,6 +281,13 @@ impl Actor for Journal {
                 let reply = match state.store.streams(&under).await {
                     Ok(ids) => JournalReply::Streams { under, ids },
                     Err(reason) => JournalReply::StreamsFailed { under, reason },
+                };
+                (reply, reply_to)
+            }
+            JournalMessage::Retire { id, reply_to } => {
+                let reply = match state.store.retire(&id).await {
+                    Ok(()) => JournalReply::Retired { id },
+                    Err(reason) => JournalReply::RetireFailed { id, reason },
                 };
                 (reply, reply_to)
             }

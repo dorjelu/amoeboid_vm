@@ -259,12 +259,15 @@ async fn a_new_runtime_starts_every_known_twin_which_recovers_on_its_own() {
             reply_to: reader.get_derived(),
         })
         .unwrap();
-    let crate::journal::JournalReply::Replayed { events, .. } =
+    let crate::journal::JournalReply::Replayed { replay, .. } =
         crate::testing::next(&mut replies).await
     else {
         return assert_eq!("a replay", "something else");
     };
-    let last = events.last().map(|event| event.payload.as_str().to_owned());
+    let last = replay
+        .events
+        .last()
+        .map(|event| event.payload.as_str().to_owned());
     assert!(
         last.as_deref()
             .is_some_and(|payload| payload.contains("vm.restarted_while_starting")),
