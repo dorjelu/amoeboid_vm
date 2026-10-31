@@ -64,12 +64,14 @@ Root (registry, routing)                         ractor-supervisor
 ├─ Listener           socket accept loop
 │   └─ Session × client     decodes ClientFrame, encodes ServerFrame
 └─ Vm × name          persistent; the VM's digital twin; spawns children only it can reach
-    ├─ Builder        nix build; idempotent, not persistent
-    ├─ Guest          host key, guest state files, sshd readiness probe; not persistent
-    └─ Hypervisor     backend actor (LocalQemu | Scripted | …), persistent
-        ├─ Share × dN         persistent; owns one virtiofsd (LocalQemu only)
-        └─ Watcher × process  pidfd → ProcExited
+    ├─ Builder        nix build
+    ├─ Guest          host key, guest state files, sshd readiness probe
+    └─ Hypervisor     backend actor (LocalQemu | Scripted | …)
+        ├─ Share × dN         owns one virtiofsd (LocalQemu only)
+        └─ Watcher × process  pidfd → ProcessExited
 ----
+
+Only the Vm is persistent; its children report to it as observations.
 
 The Vm actor is the VM's digital twin: everything that belongs to that VM is owned by it or by its subtree, and nothing outside the subtree touches it. That covers its processes and their systemd scope, its runtime and guest directories, its host key, ssh port, console log, build output and per-VM Nix config. Questions about a VM (status, how to reach it) are answered by its twin; `amoeboid vacuum_vm NAME` is the twin removing everything it owns.
 
@@ -142,12 +144,11 @@ For a VM, the unrecoverable actor is the VM actor itself (or one of its children
 
 === Streams and identity
 
-Persistence ids are derived from the parent's state, so a parent recreates its children under the same ids after a restart:
+Within a VM subtree only the twin persists. Its children (Hypervisor, Share, Builder, Guest, Watcher) keep no streams: whatever they learn reaches the Vm as an observation, and the Vm persists it in its own stream, so one stream is the complete history of a VM. On recovery the Vm replays, then spawns its children with what they must adopt (`adopt: qemu 812, shares: [d0: 901]`); they check each identity against the world and report `Adopted` or `Lost`, which the Vm persists before deciding. Outside VM subtrees, Root has its own stream (registry, quarantine records).
 
 ----
-vm/work                  Vm
-vm/work/7/hv             Hypervisor, generation 7
-vm/work/7/share/d0       Share d0, generation 7
+vm/work      the twin's stream: the VM's whole history
+runtime      Root's stream
 ----
 
 [source,sql]
@@ -281,15 +282,24 @@ The earlier Rust workspace (crates, workspace manifest and lockfile, lint and fo
 
 The adapters are coupled to the old `ports/` traits (their error and data types live there) and `adapters/procs.rs` to the per-VM lock handoff, so in-place deletion was not mechanical; copying forward lets each module be cut loose deliberately.
 
-Carried forward when needed: `domain`, `refined`, `rails`, `layout`, `plan`, `console`, `contract`, and the adapters, as inherent or free functions with their types moved out of `ports/`. The flock open in `adapters/lock.rs` (`O_CREAT|O_NOFOLLOW|O_CLOEXEC`) is reused for `daemon.lock`.
+The domain types and `plan` are rewritten, not copied: the archive is the reference and its goldens (`ssh_argv.json`, `nix_build_argv.json`, `shares.json`, `mount_order.json`, …) are the oracle for byte-exact output. Refinement uses plain newtypes with private fields and a validating constructor (`VmName::parse`, `#[serde(try_from = "String")]`), not the archive's generic `Refined<T, Marker>`. Adapters are carried forward as free functions, with their types moved out of `ports/`; the flock open in `adapters/lock.rs` is already reused for `daemon.lock`.
 
-Not carried forward: `ops/` (observe/decide/execute), `ports/` traits, `testing/fakes` and the interpreter sweeps, the per-VM lock and its handoff (`VmLock`, `HeldLock`, `LockHandoff`), `kdl/` and the KDL parts of `config/` (except one migrator for old `run_config.kdl` files, slice 6). `domain/observed.rs` is reviewed when the message boundary is built: several domain types (`mount`, `shares`, `guest_home`, `nix_source`) are refined through it today.
+Not carried forward: `ops/` (observe/decide/execute), `ports/` traits, `testing/fakes` and the interpreter sweeps, the per-VM lock and its handoff (`VmLock`, `HeldLock`, `LockHandoff`), `refined.rs`, `kdl/` and the KDL parts of `config/` (except one migrator for old `run_config.kdl` files, slice 6).
 
-== Lints
+=== Diagnostics
 
-Kept: `unwrap_used`, `expect_used`, `panic`, `unreachable`, `todo`, `unimplemented`, `wildcard_enum_match_arm`, `exit`, `dbg_macro`, `print_stdout`, `print_stderr`, `unsafe_code = "forbid"` (0001 invariant 9 rests on them).
+Every operator-facing error implements one trait:
 
-Dropped: `arithmetic_side_effects`, `indexing_slicing`, `as_conversions`. They forced checked arithmetic, `.get()` and `try_from` at every site regardless of risk. Overflow and out-of-range values are prevented where they matter by refined types (ports, sequence numbers, generations with checked `next()`), not by a crate-wide ban on `+`, indexing and casts.
+[source,rust]
+----
+trait Diagnostic {
+    fn code(&self) -> &'static str;   // stable dotted id, unique across the library: "runtime.lock.held"
+    fn message(&self) -> String;       // lowercase, no trailing period, action + object
+    fn hint(&self) -> Option<String>;  // imperative remedy
+}
+----
+
+Each error enum implements it with an exhaustive `match`, so a new variant does not compile without its code and hint. A catalogue test collects every code and fails on duplicates. Errors that cross the socket travel as data (`code`, `message`, `hint`) and render the same on the client.
 
 == Corrections to 0001
 
