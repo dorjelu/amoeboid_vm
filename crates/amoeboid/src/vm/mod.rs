@@ -3,6 +3,7 @@
 //! the generation it belongs to; the twin drops observations from older generations.
 
 pub mod builder;
+pub mod bundled;
 pub mod guest_vm;
 pub mod hypervisor;
 pub mod twin;
@@ -36,8 +37,8 @@ pub struct Account {
 /// Where the VM's NixOS configuration comes from on this start.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum NixConfig {
-    /// Keep the VM's own copy (it must exist).
-    Keep,
+    /// The VM's own copy; a VM without one gets the bundled configuration.
+    Existing,
     /// Create the VM's copy from this directory, or replace it (rebase).
     From(AbsolutePath),
 }

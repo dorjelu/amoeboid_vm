@@ -2,11 +2,12 @@
 //! never checks again.
 
 pub mod account;
-pub mod guest_path;
 pub mod host_key;
 pub mod lifecycle;
 pub mod path;
 pub mod port;
 pub mod process;
+pub mod relative_path;
 pub mod share;
+pub mod tree;
 pub mod vm_name;

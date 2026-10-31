@@ -10,8 +10,8 @@ use std::os::fd::OwnedFd;
 use rustix::fs::{AtFlags, Mode, OFlags, ResolveFlags};
 use rustix::io::Errno;
 
-use crate::domain::guest_path::GuestRelative;
 use crate::domain::path::AbsolutePath;
+use crate::domain::relative_path::RelativePath;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GuestError {
@@ -77,7 +77,7 @@ impl GuestTree {
         Ok(current)
     }
 
-    fn failed(path: &GuestRelative) -> impl Fn(std::io::Error) -> GuestError + '_ {
+    fn failed(path: &RelativePath) -> impl Fn(std::io::Error) -> GuestError + '_ {
         move |source| GuestError::Write {
             path: path.as_str().to_owned(),
             source,
@@ -89,7 +89,7 @@ impl GuestTree {
     /// # Errors
     ///
     /// `Write`, including when a component is a symlink.
-    pub fn ensure_directory(&self, path: &GuestRelative) -> Result<(), GuestError> {
+    pub fn ensure_directory(&self, path: &RelativePath) -> Result<(), GuestError> {
         let (parents, name) = path.split();
         let mut segments = parents;
         segments.push(name);
@@ -106,7 +106,7 @@ impl GuestTree {
     /// `Write`, including when a parent component is a symlink or the target is a directory.
     pub fn replace_file(
         &self,
-        path: &GuestRelative,
+        path: &RelativePath,
         bytes: &[u8],
         mode: u32,
     ) -> Result<(), GuestError> {
@@ -146,7 +146,7 @@ impl GuestTree {
     /// # Errors
     ///
     /// `Write`.
-    pub fn remove_file(&self, path: &GuestRelative) -> Result<(), GuestError> {
+    pub fn remove_file(&self, path: &RelativePath) -> Result<(), GuestError> {
         let (parents, name) = path.split();
         let result = self
             .directory(&parents)
@@ -194,8 +194,8 @@ mod tests {
         (temporary, root, tree)
     }
 
-    fn relative(path: &str) -> GuestRelative {
-        GuestRelative::parse(path).unwrap()
+    fn relative(path: &str) -> RelativePath {
+        RelativePath::parse(path).unwrap()
     }
 
     #[test]

@@ -167,7 +167,7 @@ mod tests {
     fn adapters() -> Vec<Box<dyn Diagnostic>> {
         vec![
             Box::new(crate::domain::process::BootId::parse("x".into()).unwrap_err()),
-            Box::new(crate::domain::guest_path::GuestRelative::parse("..").unwrap_err()),
+            Box::new(crate::domain::relative_path::RelativePath::parse("..").unwrap_err()),
             Box::new(crate::adapters::files::FileError::Write {
                 path: "/f".into(),
                 source: io(),
@@ -215,6 +215,7 @@ mod tests {
                 crate::adapters::process::Exit::Code(1),
             )),
             Box::new(crate::adapters::ssh::SshError::Port(io())),
+            Box::new(crate::vm::builder::BuilderError::MissingFlake { path: "/p".into() }),
             Box::new(crate::adapters::nix::NixError::Failed {
                 exit: crate::adapters::process::Exit::Code(1),
                 tail: "x".into(),

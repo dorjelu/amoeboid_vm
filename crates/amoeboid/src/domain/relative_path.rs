@@ -1,19 +1,19 @@
-//! Paths inside the guest-writable directory, relative to its root.
+//! Relative paths inside a directory tree: the guest directory, a Nix config tree.
 
 /// `/`-separated, non-empty segments, none `.` or `..`, no NUL. Resolving it can never leave
-/// the guest directory by name; symlinks are refused by the writer (`adapters::guest`).
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub struct GuestRelative(String);
+/// its root by name; symlinks are refused by the writers (`adapters::guest`, `adapters::files`).
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct RelativePath(String);
 
 #[derive(Clone, PartialEq, Eq, Debug, thiserror::Error)]
-#[error("{0:?} is not a relative path inside the guest directory")]
-pub struct BadGuestRelative(String);
+#[error("{0:?} is not a plain relative path")]
+pub struct BadRelativePath(String);
 
-impl GuestRelative {
+impl RelativePath {
     /// # Errors
     ///
     /// Empty, absolute, an empty, `.` or `..` segment, or a NUL byte.
-    pub fn parse(path: &str) -> Result<Self, BadGuestRelative> {
+    pub fn parse(path: &str) -> Result<Self, BadRelativePath> {
         let valid = !path.contains('\0')
             && path
                 .split('/')
@@ -21,8 +21,14 @@ impl GuestRelative {
         if valid {
             Ok(Self(path.to_owned()))
         } else {
-            Err(BadGuestRelative(path.to_owned()))
+            Err(BadRelativePath(path.to_owned()))
         }
+    }
+
+    /// `self` followed by `other`.
+    #[must_use]
+    pub fn join(&self, other: &Self) -> Self {
+        Self(format!("{}/{}", self.0, other.0))
     }
 
     /// Parent segments (possibly none) and the final name.
@@ -39,9 +45,9 @@ impl GuestRelative {
     }
 }
 
-impl crate::diagnostic::Diagnostic for BadGuestRelative {
+impl crate::diagnostic::Diagnostic for BadRelativePath {
     fn code(&self) -> &'static str {
-        "guest_path.invalid"
+        "relative_path.invalid"
     }
     fn hint(&self) -> Option<String> {
         None
@@ -55,10 +61,10 @@ mod tests {
     #[test]
     fn only_plain_relative_paths_are_accepted() {
         for good in ["hostname", "home/.config/app", "a/b/c"] {
-            assert!(GuestRelative::parse(good).is_ok(), "{good}");
+            assert!(RelativePath::parse(good).is_ok(), "{good}");
         }
         for bad in ["", "/etc", "a//b", "a/../b", "./a", "a/", "a\0b"] {
-            assert!(GuestRelative::parse(bad).is_err(), "{bad:?}");
+            assert!(RelativePath::parse(bad).is_err(), "{bad:?}");
         }
     }
 }

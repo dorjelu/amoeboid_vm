@@ -51,6 +51,30 @@ impl AbsolutePath {
         Self(PathBuf::from(path))
     }
 
+    /// The path's last segment as text (lossy for non-UTF-8); empty for `/`.
+    #[must_use]
+    pub(crate) fn file_name(&self) -> String {
+        self.0
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    /// `name` next to this path, in the same directory.
+    #[must_use]
+    pub(crate) fn sibling(&self, name: &str) -> Self {
+        match self.0.parent() {
+            Some(parent) => Self(parent.join(name)),
+            None => self.join(name),
+        }
+    }
+
+    /// The containing directory; `None` for `/`.
+    #[must_use]
+    pub fn parent(&self) -> Option<Self> {
+        self.0.parent().map(|parent| Self(parent.to_path_buf()))
+    }
+
     /// Whether `self` is `other` or lies inside it, component by component.
     #[must_use]
     pub fn is_within(&self, other: &Self) -> bool {
