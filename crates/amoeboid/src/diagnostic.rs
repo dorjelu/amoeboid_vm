@@ -105,6 +105,17 @@ mod tests {
                 crate::journal::tests_support::store_error("x"),
             ))),
             Box::new(Fatal::PersistTimeout),
+            Box::new(crate::config::ConfigErrors {
+                file: crate::config::ConfigFile::Run,
+                problems: crate::nonempty::NonEmpty::new(
+                    crate::config::ConfigProblem {
+                        key: "guest.user".into(),
+                        message: "x".into(),
+                    },
+                    Vec::new(),
+                ),
+            }),
+            Box::new(crate::config::run::PresetName::parse("a b".into()).unwrap_err()),
             Box::new(Fatal::Encode("x".into())),
             Box::new(Fatal::SeqOverflow),
             Box::new(Fatal::ChildEnded {

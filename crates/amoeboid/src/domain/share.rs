@@ -81,6 +81,17 @@ impl HostDirectory {
     }
 }
 
+/// Splits a share as the operator writes it, `PATH[:rw|:ro]`: a trailing `:rw` or `:ro` is the
+/// mode, anything else is part of the path (default read-write).
+#[must_use]
+pub fn split_mode(spec: &str) -> (&str, Mode) {
+    match spec.rsplit_once(':') {
+        Some((path, "rw")) => (path, Mode::ReadWrite),
+        Some((path, "ro")) => (path, Mode::ReadOnly),
+        Some(_) | None => (spec, Mode::ReadWrite),
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShareRequest {

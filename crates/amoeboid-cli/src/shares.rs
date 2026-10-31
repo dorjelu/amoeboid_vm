@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use amoeboid::diagnostic::Report;
 use amoeboid::domain::path::AbsolutePath;
-use amoeboid::domain::share::{HostDirectory, Mode, ShareRequest};
+use amoeboid::domain::share::{HostDirectory, ShareRequest, split_mode};
 
 pub const HELP: &str = "PATH[:rw|:ro], e.g. ~/dev/app or ~/dev/libs:ro (default rw)";
 
@@ -30,11 +30,7 @@ pub fn parse(
     working_directory: &Path,
     home: Option<&Path>,
 ) -> Result<ShareRequest, Report> {
-    let (raw, mode) = match spec.rsplit_once(':') {
-        Some((head, "rw")) => (head, Mode::ReadWrite),
-        Some((head, "ro")) => (head, Mode::ReadOnly),
-        Some(_) | None => (spec, Mode::ReadWrite),
-    };
+    let (raw, mode) = split_mode(spec);
     if raw.is_empty() {
         return Err(failure(
             "cli.share.empty",
@@ -92,6 +88,7 @@ pub fn config_directory(raw: &str, working_directory: &Path) -> Result<AbsoluteP
 #[cfg(test)]
 mod tests {
     use super::*;
+    use amoeboid::domain::share::Mode;
 
     #[test]
     fn modes_home_and_relative_paths_resolve() {

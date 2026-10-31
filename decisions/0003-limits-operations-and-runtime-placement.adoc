@@ -184,7 +184,26 @@ A `Clock` of our own for timers was rejected: every timer runs on tokio's, which
 
 == Configuration
 
-The operator configuration is `run_config.toml` (0001, formats). Presets, home files copied into the guest and linger come with it (slice 6).
+Two TOML files in `$XDG_CONFIG_HOME/amoeboid` (0001's `run_config.toml`, plus one for the runtime). No KDL migrator: the Python launcher's `run_config.kdl` is converted by hand once.
+
+[cols="1,2,2"]
+|===
+| |`run_config.toml` |`daemon_config.toml`
+|Read |by Root at every `start`: a change applies to the next one; tests just write the file |once, when the runtime starts
+|Holds |`guest.user` (optional name override), `guest.home_files`, `new_vm.base_nix_config` (preset name or directory), `new_vm.default_shares`, `ssh.port`, `timeouts.boot_seconds`, `timeouts.powerdown_seconds` |`linger`, `journal.path`, `restart.*` (budget, window, backoff), `timeouts.status_seconds`, `timeouts.persist_seconds`
+|Bad file |the request fails with every problem listed |the runtime refuses to start with every problem listed
+|Absent |defaults |defaults
+|===
+
+* Each file is a bijection with its value: `decode(encode(config)) == config`, and `encode` writes canonical text (every key, explicit share modes); property tests check both. amoeboid writes a file only to create it (`amoeboid config init`, `amoeboid daemon install`).
+* Paths are written in terms of the host user's home: `~/…` decodes against it and `encode` writes any path under it back as `~/…`, so no file carries a machine-specific path. Otherwise absolute; a file has no working directory, so relative paths are refused.
+* `base_nix_config` is a preset name (`[A-Za-z0-9._-]{1,64}`, a directory under `presets/`) or, when it holds a `/` or starts with `~`, a directory. `presets/default` is seeded from the bundled config when first needed.
+* Shares use the command line's syntax, `PATH[:rw|:ro]` (parsed by the library for both).
+* `uid` and `gid` are gone: the guest account's ids are the runtime's own (virtiofsd maps guest to host 1:1). Python used them only to change the numbers inside the guest.
+* The request carries intent, not resolved values: `Start { shares: Option<…>, nix_config: Option<NixConfigSource> }`. Without shares an existing VM reuses its last ones and a new VM gets `default_shares`; without a config an existing VM keeps its own and a new one gets `base_nix_config`.
+* Journal location, first that is given: the builder (`Persistence::Sqlite(JournalLocation::At(path))`), `amoeboid-daemon --journal PATH`, `daemon_config.toml` `journal.path`, then the runtime's default. It stays outside every VM's directory.
+* Linger: with `linger = true` (the default) `amoeboid-daemon` checks linger at start and enables it if off; it never disables it. A failure is logged and the runtime starts anyway.
+* Durations split by source: status and persist timeouts and the restart policy from the daemon file; boot timeout and powerdown grace from the run file, recorded in the VM's spec at start (a stop uses the grace of the start it stops); terminate grace, socket wait and vacuum graces only from the builder (`ProcessTiming`).
 
 == Order of the remaining work
 
