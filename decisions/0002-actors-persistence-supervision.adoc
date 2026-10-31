@@ -251,7 +251,7 @@ enum ServerFrame { HandshakeAccepted { .. }, HandshakeRejected { .. }, Reply { o
 Variants are added with the slice that handles them.
 
 * Request bodies, replies and events are further split per domain (VM lifecycle, configuration, runtime).
-* `operation` (an `OperationId`) is minted by the client (UUIDv7) and is the idempotency key; a retry returns the original reply.
+* `operation` (an `OperationId`) is minted by the client (a ULID) and is the idempotency key; a retry returns the original reply.
 * The protocol version must match exactly; a mismatch is answered with `HandshakeRejected` naming `amoeboid daemon restart`. The CLI and runtime ship in one binary; upgrades go through restart and adoption.
 * Unknown variants are refused. Refined types decode through `#[serde(try_from = "Raw…")]`, so no frame bypasses refinement.
 * Framing: 4-byte big-endian length prefix, JSON payload, 1 MiB maximum.
@@ -303,7 +303,7 @@ Each error enum implements it with an exhaustive `match`, so a new variant does 
 
 == Corrections to 0001
 
-Moot now that `steps` is replaced, recorded so they are not reintroduced: the step insert omitted the `NOT NULL` `op` column; the claim was an `UPDATE` with no row for a first start; the outcome write was unfenced. Still applicable: `uuid` and timestamps are supplied by the journal or the message, never computed inside an event handler; maps in persisted state are `BTreeMap`; `Refused` applies to client commands only, while observations in an unexpected state are dropped by generation.
+Moot now that `steps` is replaced, recorded so they are not reintroduced: the step insert omitted the `NOT NULL` `op` column; the claim was an `UPDATE` with no row for a first start; the outcome write was unfenced. Still applicable: identifiers and timestamps are supplied by the journal or the message, never computed inside an event handler; maps in persisted state are `BTreeMap`; `Refused` applies to client commands only, while observations in an unexpected state are dropped by generation.
 
 == Invariants added
 

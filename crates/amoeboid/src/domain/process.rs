@@ -79,19 +79,19 @@ pub struct ProcessIdentity {
     pub boot: BootId,
 }
 
-/// Marks one spawn: set as `AMOEBOID_NONCE` in the process environment and persisted by the
+/// Marks one spawn (a ULID): set as `AMOEBOID_NONCE` in the process environment and persisted by the
 /// twin before the spawn, so a process whose identity was never recorded can still be found.
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct Nonce(uuid::Uuid);
+pub struct Nonce(ulid::Ulid);
 
 impl Nonce {
     #[must_use]
     pub fn mint() -> Self {
-        Self(uuid::Uuid::now_v7())
+        Self(ulid::Ulid::generate())
     }
 
-    /// The environment entry, `AMOEBOID_NONCE=<uuid>`.
+    /// The environment entry, `AMOEBOID_NONCE=<ulid>`.
     #[must_use]
     pub fn environment_entry(&self) -> String {
         format!("{}={}", Self::VARIABLE, self.0)

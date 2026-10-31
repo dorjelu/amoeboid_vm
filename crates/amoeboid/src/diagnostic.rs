@@ -49,8 +49,8 @@ mod tests {
     use crate::domain::vm_name::VmNameError;
     use crate::journal::{PersistFailure, PersistenceId};
     use crate::persistent::Unrecoverable;
+    use crate::protocol::Refusal;
     use crate::protocol::codec::FrameError;
-    use crate::protocol::{NotVersion7, Refusal};
     use crate::runtime::StartError;
     use crate::runtime::lock::LockError;
     use crate::runtime::paths::LocationError;
@@ -71,7 +71,6 @@ mod tests {
     fn protocol_journal_runtime_client() -> Vec<Box<dyn Diagnostic>> {
         let sequence = crate::journal::Sequence::FIRST;
         vec![
-            Box::new(NotVersion7),
             Box::new(FrameError::TooLarge { length: 1 }),
             Box::new(FrameError::Decode(json_error())),
             Box::new(FrameError::Encode(json_error())),

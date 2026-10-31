@@ -37,7 +37,7 @@ pub fn write_atomically(path: &AbsolutePath, bytes: &[u8], mode: u32) -> Result<
         path: path.display().to_string(),
         source,
     };
-    let temporary = path.with_suffix(&format!(".tmp-{}", uuid::Uuid::now_v7().simple()));
+    let temporary = path.with_suffix(&format!(".tmp-{}", ulid::Ulid::generate()));
     let descriptor = rustix::fs::open(
         temporary.as_path(),
         OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,

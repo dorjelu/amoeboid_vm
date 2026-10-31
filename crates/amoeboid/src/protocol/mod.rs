@@ -4,7 +4,7 @@
 pub mod codec;
 
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
+use ulid::Ulid;
 
 /// Exact-match protocol version; any difference is refused.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -21,53 +21,35 @@ impl std::fmt::Display for ProtocolVersion {
     }
 }
 
-/// Client-minted operation id, `UUIDv7`; the idempotency key of a request.
+/// Client-minted operation id, a ULID; the idempotency key of a request.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
-#[serde(try_from = "Uuid", into = "Uuid")]
-pub struct OperationId(Uuid);
+#[serde(transparent)]
+pub struct OperationId(Ulid);
 
-/// Runtime instance id, `UUIDv7`, minted once per runtime start.
+/// Runtime instance id, a ULID minted once per runtime start.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
-#[serde(try_from = "Uuid", into = "Uuid")]
-pub struct RuntimeId(Uuid);
+#[serde(transparent)]
+pub struct RuntimeId(Ulid);
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, thiserror::Error)]
-#[error("expected a version 7 uuid")]
-pub struct NotVersion7;
-
-macro_rules! uuid_v7 {
-    ($t:ident) => {
-        impl $t {
+/// ULIDs on the wire are their 26-character Crockford base32 text, checked on decode.
+macro_rules! ulid_identifier {
+    ($type:ident) => {
+        impl $type {
             /// A fresh id from the current time.
             #[must_use]
             pub fn mint() -> Self {
-                Self(Uuid::now_v7())
+                Self(Ulid::generate())
             }
         }
-        impl TryFrom<Uuid> for $t {
-            type Error = NotVersion7;
-            fn try_from(id: Uuid) -> Result<Self, NotVersion7> {
-                if id.get_version() == Some(uuid::Version::SortRand) {
-                    Ok(Self(id))
-                } else {
-                    Err(NotVersion7)
-                }
-            }
-        }
-        impl From<$t> for Uuid {
-            fn from(id: $t) -> Uuid {
-                id.0
-            }
-        }
-        impl std::fmt::Display for $t {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                self.0.fmt(f)
+        impl std::fmt::Display for $type {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fmt(formatter)
             }
         }
     };
 }
-uuid_v7!(OperationId);
-uuid_v7!(RuntimeId);
+ulid_identifier!(OperationId);
+ulid_identifier!(RuntimeId);
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(
@@ -163,15 +145,6 @@ pub enum Refusal {
 
 #[cfg(test)]
 mod tests;
-
-impl crate::diagnostic::Diagnostic for NotVersion7 {
-    fn code(&self) -> &'static str {
-        "protocol.identifier.not_version_7"
-    }
-    fn hint(&self) -> Option<String> {
-        None
-    }
-}
 
 impl crate::diagnostic::Diagnostic for Refusal {
     fn code(&self) -> &'static str {

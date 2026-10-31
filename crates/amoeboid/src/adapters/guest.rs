@@ -115,7 +115,7 @@ impl GuestTree {
         let parent = self
             .directory(&parents)
             .map_err(|error| failed(error.into()))?;
-        let temporary = format!(".{name}.tmp-{}", uuid::Uuid::now_v7().simple());
+        let temporary = format!(".{name}.tmp-{}", ulid::Ulid::generate());
         let descriptor = rustix::fs::openat(
             &parent,
             temporary.as_str(),

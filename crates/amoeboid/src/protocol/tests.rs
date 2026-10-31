@@ -5,14 +5,8 @@ use super::codec::{self, FrameError, MAX_FRAME};
 use super::*;
 
 fn operations() -> impl Strategy<Value = OperationId> {
-    any::<u128>().prop_map(|bits| {
-        let id = uuid::Builder::from_random_bytes(bits.to_le_bytes()).into_uuid();
-        // Re-stamp as v7: only the version and variant bits differ.
-        let mut bytes = *id.as_bytes();
-        bytes[6] = (bytes[6] & 0x0f) | 0x70;
-        bytes[8] = (bytes[8] & 0x3f) | 0x80;
-        OperationId::try_from(Uuid::from_bytes(bytes)).unwrap()
-    })
+    (0_u64..(1 << 48), any::<u128>())
+        .prop_map(|(time, random)| OperationId(ulid::Ulid::from_parts(time, random)))
 }
 
 fn client_frames() -> impl Strategy<Value = ClientFrame> {
@@ -38,7 +32,7 @@ fn server_frames() -> impl Strategy<Value = ServerFrame> {
         (any::<u32>(), operations()).prop_map(|(version, operation)| {
             ServerFrame::HandshakeAccepted {
                 protocol: ProtocolVersion(version),
-                runtime: RuntimeId(Uuid::from(operation)),
+                runtime: RuntimeId(operation.0),
             }
         }),
         (any::<u32>(), any::<u32>()).prop_map(|(runtime, client)| ServerFrame::HandshakeRejected {
@@ -144,7 +138,7 @@ fn an_unknown_field_is_refused() {
 }
 
 #[test]
-fn an_op_id_that_is_not_v7_is_refused() {
+fn a_malformed_operation_id_is_refused() {
     let v4 = "8c5b6f0e-2f5a-4b8e-9c3d-1a2b3c4d5e6f";
     let result = decode::<ClientFrame>(&json!({"type": "request", "body": {"operation": v4,
         "body": {"domain": "runtime", "request": "ping"}}}));
