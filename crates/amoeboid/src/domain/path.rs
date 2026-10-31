@@ -43,6 +43,14 @@ impl AbsolutePath {
         Self(self.0.join(segment))
     }
 
+    /// The same path with `suffix` appended to its last segment (`a/b` + `.tmp` = `a/b.tmp`).
+    #[must_use]
+    pub(crate) fn with_suffix(&self, suffix: &str) -> Self {
+        let mut path = self.0.clone().into_os_string();
+        path.push(suffix);
+        Self(PathBuf::from(path))
+    }
+
     /// Whether `self` is `other` or lies inside it, component by component.
     #[must_use]
     pub fn is_within(&self, other: &Self) -> bool {

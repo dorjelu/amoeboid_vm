@@ -2,6 +2,7 @@
 //! never checks again.
 
 pub mod account;
+pub mod guest_path;
 pub mod host_key;
 pub mod path;
 pub mod port;

@@ -41,6 +41,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::adapters::process::ProcessError;
     use crate::client::ClientError;
     use crate::domain::account::AccountError;
     use crate::domain::host_key::HostPublicKeyError;
@@ -58,12 +59,16 @@ mod tests {
         std::io::Error::from(std::io::ErrorKind::PermissionDenied)
     }
 
+    fn process() -> crate::domain::process::ProcessId {
+        crate::domain::process::ProcessId::new(std::num::NonZeroU32::MIN)
+    }
+
     fn json_error() -> serde_json::Error {
         serde_json::from_str::<u8>("x").unwrap_err()
     }
 
     /// One instance of every variant of every library diagnostic.
-    fn catalogue() -> Vec<Box<dyn Diagnostic>> {
+    fn protocol_journal_runtime_client() -> Vec<Box<dyn Diagnostic>> {
         let sequence = crate::journal::Sequence::FIRST;
         vec![
             Box::new(NotVersion7),
@@ -121,6 +126,11 @@ mod tests {
             Box::new(ClientError::Refused(Refusal::MalformedFrame)),
             Box::new(ClientError::Frame(FrameError::Io(io()))),
             Box::new(ClientError::Closed),
+        ]
+    }
+
+    fn domain() -> Vec<Box<dyn Diagnostic>> {
+        vec![
             Box::new(LocationError::Path(
                 crate::domain::path::PathError::NotNormal("/a/..".into()),
             )),
@@ -153,6 +163,63 @@ mod tests {
             ))),
             Box::new(HostPublicKeyError),
         ]
+    }
+
+    fn adapters() -> Vec<Box<dyn Diagnostic>> {
+        vec![
+            Box::new(crate::domain::process::BootId::parse("x".into()).unwrap_err()),
+            Box::new(crate::domain::guest_path::GuestRelative::parse("..").unwrap_err()),
+            Box::new(crate::adapters::files::FileError::Write {
+                path: "/f".into(),
+                source: io(),
+            }),
+            Box::new(crate::adapters::files::FileError::Directory {
+                path: "/f".into(),
+                source: io(),
+            }),
+            Box::new(crate::adapters::files::FileError::Read {
+                path: "/f".into(),
+                source: io(),
+            }),
+            Box::new(crate::adapters::guest::GuestError::Root {
+                path: "/g".into(),
+                source: io(),
+            }),
+            Box::new(crate::adapters::guest::GuestError::Write {
+                path: "x".into(),
+                source: io(),
+            }),
+            Box::new(ProcessError::BootId(io())),
+            Box::new(ProcessError::Read {
+                process: process(),
+                file: "stat",
+                source: io(),
+            }),
+            Box::new(ProcessError::Parse {
+                process: process(),
+                file: "stat",
+            }),
+            Box::new(ProcessError::Spawn {
+                program: "qemu".into(),
+                source: io(),
+            }),
+            Box::new(ProcessError::Output {
+                path: "/l".into(),
+                source: io(),
+            }),
+            Box::new(ProcessError::Signal {
+                process: process(),
+                source: io(),
+            }),
+            Box::new(ProcessError::List(io())),
+        ]
+    }
+
+    fn catalogue() -> Vec<Box<dyn Diagnostic>> {
+        [protocol_journal_runtime_client(), domain(), adapters()]
+            .into_iter()
+            .flatten()
+            .collect()
     }
 
     #[test]
