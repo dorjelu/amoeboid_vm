@@ -1,0 +1,102 @@
+= Decision 0003: limits, VM operations and runtime placement
+:toc: left
+:toclevels: 3
+:icons: font
+:source-highlighter: rouge
+
+Status: accepted, 2026-10-31. Amends 0002. Where the two disagree, this record wins; sections of 0001 and 0002 not named here stand.
+
+Scope: decisions settled while building slices 1–3 that 0002 does not record, and the operator's decisions on the work left after them.
+
+== Context
+
+Slices 1–3 (runtime skeleton, local start, stop and status) were built and checked against a real VM. Several rules were settled in conversation along the way and live only in code and in `HANDOFF.adoc`. This record makes them the design of record, together with the decisions taken on the remaining work.
+
+== Limits on values
+
+[cols="1,2,2"]
+|===
+|Value |Rule |Why
+|VM name |`[A-Za-z0-9][A-Za-z0-9-]{0,39}`, case-sensitive |40 characters leaves room for the VM's sockets under the 108-byte `sun_path`; the name appears in unit names, paths and the persistence id
+|Persistence id |may contain uppercase |follows from case-sensitive VM names
+|Share path |UTF-8, no control characters |shares are written into the guest's tab-separated `mounts` table
+|Shares per VM |at most 24 |each share is a virtio-fs PCI device; the slot count bounds it
+|Identifiers |ULID (incarnation, operation) |operator preference over UUIDv7; sortable by creation time
+|===
+
+== VM operations
+
+=== Status
+
+Status is collected tell-only: Root asks every twin and gathers answers for 5 s. A twin that has not answered by then shows as `Unknown`; a late answer is dropped. A quarantined VM has no twin and shows as `Quarantined { reason }` (a `VmCondition` variant), taken from its `quarantine/<name>` stream.
+
+=== Stop
+
+* `Stop` on a `Starting` VM cancels the start; the operation that started it ends with `vm.stopped_while_starting`.
+* `Stop` on a `Failed` VM takes down the leftovers its failed start recorded.
+* LocalQemu stops a machine in three steps: QMP `system_powerdown`, then `SIGTERM` after 30 s, then `SIGKILL` after 10 s more. Each signal goes only to a process whose identity is verified.
+
+=== Start
+
+* The boot timeout is fixed at 120 s.
+* The Builder runs before GuestVm (0002); a `nix build` still running when the runtime stops is left to finish. It is idempotent, and the next start uses its result.
+* The guest `term` file is always removed: no terminal is attached to a VM (0002, console).
+
+=== Quarantine
+
+0002's quarantine is implemented as follows:
+
+* A twin that becomes `Unrecoverable` reports `VmReport::Unrecoverable { reason }` to Root.
+* Root is not a persistent actor. It appends `Quarantined { reason }` to `quarantine/<name>` at sequence 1 through a plain `JournalMessage::Persist`, and the journal's answer reaches it as `RootMessage::Journal`. A conflict at sequence 1 means the VM is already quarantined and is not an error.
+* At start Root lists `quarantine/*` as well as `vm/*` and spawns no twin for a quarantined name.
+
+=== Vacuum
+
+`amoeboid vacuum_vm NAME` removes everything a VM owns: it stops the VM (reaping its verified processes), removes its runtime directory and state directory, and retires its streams (`vm/<name>`, `quarantine/<name>`). It works on quarantined VMs, which have no twin to stop them.
+
+A stream is retired by a **tombstone**, not deleted: the journal records that the stream ended, and a retired stream is neither replayed nor listed in the registry. The history stays in the journal. The tombstone's exact shape, and how a name is reused after its stream is retired, are settled with the implementation and recorded here.
+
+== Supervision
+
+`ractor-supervisor` is a dependency with `default-features = false`: its default features turn on ractor's `async-trait` feature, which breaks actors written with native `async fn`. Root's twins go under a `DynamicSupervisor`. A twin's child (Builder, GuestVm, Hypervisor) that ends is respawned under a supervisor strategy rather than only reported as `ChildEnded`. The strategy and intensity per level stay open (0002).
+
+== Runtime placement
+
+=== The runtime's own files
+
+`daemon.lock` and `journal.sqlite` move to `$XDG_STATE_HOME/amoeboid`, apart from VM data in `$XDG_DATA_HOME/amoeboid`. This answers 0002's open question. The move is not implemented yet; until then both stay in `$XDG_DATA_HOME/amoeboid`, marked by a TODO in `runtime/paths.rs`.
+
+=== systemd units
+
+`amoeboid daemon install` writes `~/.config/systemd/user/amoeboid.socket` and `amoeboid.service` and enables the socket:
+
+[cols="1,2"]
+|===
+|Setting |Reason
+|`ListenStream=%t/amoeboid/runtime.sock`, `SocketMode=0600`, `DirectoryMode=0700` |same-user socket (0002, protocol)
+|`Restart=on-failure` |a dead runtime comes back and adopts its VMs
+|`KillMode=process` |VM processes already run in their own scopes; this spares them a second time
+|`Environment="PATH=…"` captured at install |the user manager's `PATH` is often minimal; the runtime needs `nix`, `ssh-keygen` and `systemd-run`
+|`ExecStart=` the `amoeboid-daemon` next to the `amoeboid` binary that ran `install` |the CLI and the runtime ship together and must match in protocol version
+|===
+
+== Configuration
+
+The operator configuration is `run_config.toml` (0001, formats). Presets, home files copied into the guest and linger come with it (slice 6).
+
+== Order of the remaining work
+
+. Install the daemon units for real.
+. Quarantine.
+. `vacuum_vm` and the journal tombstone.
+. Supervision at the VM level and below.
+. Configuration and presets.
+. Protocol: `Cancel`, `Subscribe`, progress events.
+. Automated end-to-end VM test.
+
+The CLI remainders (long options only, `amoeboid ssh`, a boot timeout option) and housekeeping (documentation for the Rust runtime, removing the archive) come later and are not ordered here.
+
+== Open questions
+
+* The tombstone's shape and name reuse after `vacuum_vm`.
+* Supervision strategy and restart intensity for the VM level and below (from 0002).

@@ -4,7 +4,7 @@
 :icons: font
 :source-highlighter: rouge
 
-Status: accepted, 2026-10-30. Amends 0001. Where the two disagree, this record wins; sections of 0001 not named here stand.
+Status: accepted, 2026-10-30. Amends 0001; amended by 0003. Where the two disagree, this record wins; sections of 0001 not named here stand.
 
 Scope: how components are swapped, how actors talk, how they persist and recover, how VMs outlive the runtime, the wire protocol and transport, the actor framework, and what is removed from the salvaged tree.
 
