@@ -10,9 +10,9 @@ const MAX_SOCKET_PATH: usize = 107;
 
 /// Absolute, with no `.` or `..` components.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct AbsDir(PathBuf);
+pub struct AbsoluteDirectory(PathBuf);
 
-impl AbsDir {
+impl AbsoluteDirectory {
     /// # Errors
     ///
     /// `NotAbsolute`, `NotNormal`.
@@ -45,8 +45,8 @@ pub enum PathError {
     NotAbsolute(PathBuf),
     #[error("{} contains . or .. components", .0.display())]
     NotNormal(PathBuf),
-    #[error("{0} is not set")]
-    MissingEnv(&'static str),
+    #[error("environment variable {0} is not set")]
+    MissingEnvironment(&'static str),
     #[error("socket path {} is longer than {MAX_SOCKET_PATH} bytes", .0.display())]
     SocketTooLong(PathBuf),
 }
@@ -57,8 +57,8 @@ pub enum PathError {
 /// holds the socket.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct RuntimePaths {
-    data: AbsDir,
-    run: AbsDir,
+    data: AbsoluteDirectory,
+    run: AbsoluteDirectory,
     socket: PathBuf,
 }
 
@@ -66,7 +66,7 @@ impl RuntimePaths {
     /// # Errors
     ///
     /// `SocketTooLong`.
-    pub fn under(data: AbsDir, run: AbsDir) -> Result<Self, PathError> {
+    pub fn under(data: AbsoluteDirectory, run: AbsoluteDirectory) -> Result<Self, PathError> {
         let socket = run.join("runtime.sock");
         if socket.as_os_str().len() > MAX_SOCKET_PATH {
             return Err(PathError::SocketTooLong(socket));
@@ -85,25 +85,30 @@ impl RuntimePaths {
     ) -> Result<Self, PathError> {
         let data = match environment("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
             Some(xdg) => PathBuf::from(xdg).join("amoeboid"),
-            None => PathBuf::from(environment("HOME").ok_or(PathError::MissingEnv("HOME"))?)
-                .join(".local/share/amoeboid"),
+            None => {
+                PathBuf::from(environment("HOME").ok_or(PathError::MissingEnvironment("HOME"))?)
+                    .join(".local/share/amoeboid")
+            }
         };
         let run = PathBuf::from(
             environment("XDG_RUNTIME_DIR")
                 .filter(|v| !v.is_empty())
-                .ok_or(PathError::MissingEnv("XDG_RUNTIME_DIR"))?,
+                .ok_or(PathError::MissingEnvironment("XDG_RUNTIME_DIR"))?,
         )
         .join("amoeboid");
-        Self::under(AbsDir::parse(data)?, AbsDir::parse(run)?)
+        Self::under(
+            AbsoluteDirectory::parse(data)?,
+            AbsoluteDirectory::parse(run)?,
+        )
     }
 
     #[must_use]
-    pub fn data(&self) -> &AbsDir {
+    pub fn data(&self) -> &AbsoluteDirectory {
         &self.data
     }
 
     #[must_use]
-    pub fn run(&self) -> &AbsDir {
+    pub fn run(&self) -> &AbsoluteDirectory {
         &self.run
     }
 
@@ -120,6 +125,27 @@ impl RuntimePaths {
     #[must_use]
     pub fn socket(&self) -> &Path {
         &self.socket
+    }
+}
+
+impl crate::diagnostic::Diagnostic for PathError {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::NotAbsolute(_) => "runtime.path.not_absolute",
+            Self::NotNormal(_) => "runtime.path.not_normal",
+            Self::MissingEnvironment(_) => "runtime.path.missing_environment",
+            Self::SocketTooLong(_) => "runtime.path.socket_too_long",
+        }
+    }
+    fn hint(&self) -> Option<String> {
+        match self {
+            Self::MissingEnvironment("XDG_RUNTIME_DIR") => {
+                Some("run inside a systemd user session, which sets XDG_RUNTIME_DIR".into())
+            }
+            Self::MissingEnvironment(variable) => Some(format!("set {variable}")),
+            Self::SocketTooLong(_) => Some("use a shorter XDG_RUNTIME_DIR".into()),
+            Self::NotAbsolute(_) | Self::NotNormal(_) => None,
+        }
     }
 }
 
@@ -168,18 +194,18 @@ mod tests {
         let result = RuntimePaths::from_env(environment(&[("HOME", "/home/u")]));
         assert!(matches!(
             result,
-            Err(PathError::MissingEnv("XDG_RUNTIME_DIR"))
+            Err(PathError::MissingEnvironment("XDG_RUNTIME_DIR"))
         ));
     }
 
     #[test]
     fn relative_and_dotted_paths_are_refused() {
         assert!(matches!(
-            AbsDir::parse("rel/dir".into()),
+            AbsoluteDirectory::parse("rel/dir".into()),
             Err(PathError::NotAbsolute(_))
         ));
         assert!(matches!(
-            AbsDir::parse("/a/../b".into()),
+            AbsoluteDirectory::parse("/a/../b".into()),
             Err(PathError::NotNormal(_))
         ));
     }
@@ -188,8 +214,8 @@ mod tests {
     fn a_socket_path_beyond_sun_path_is_refused() {
         let long = format!("/{}", "r".repeat(MAX_SOCKET_PATH));
         let result = RuntimePaths::under(
-            AbsDir::parse("/d".into()).unwrap(),
-            AbsDir::parse(long.into()).unwrap(),
+            AbsoluteDirectory::parse("/d".into()).unwrap(),
+            AbsoluteDirectory::parse(long.into()).unwrap(),
         );
         assert!(matches!(result, Err(PathError::SocketTooLong(_))));
     }

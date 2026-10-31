@@ -32,13 +32,25 @@ pub enum ClientError {
     Unexpected(Box<ServerFrame>),
 }
 
-impl ClientError {
-    /// An imperative remedy, when there is one.
-    #[must_use]
-    pub fn hint(&self) -> Option<&'static str> {
+impl crate::diagnostic::Diagnostic for ClientError {
+    fn code(&self) -> &'static str {
         match self {
-            Self::Unreachable { .. } => Some("start it: systemctl --user start amoeboid.socket"),
-            Self::Rejected { .. } => Some("restart it: amoeboid daemon restart"),
+            Self::Unreachable { .. } => "client.unreachable",
+            Self::Rejected { .. } => "client.rejected",
+            Self::Refused(_) => "client.refused",
+            Self::Frame(_) => "client.frame",
+            Self::Closed => "client.closed",
+            Self::Unexpected(_) => "client.unexpected",
+        }
+    }
+    fn hint(&self) -> Option<String> {
+        match self {
+            Self::Unreachable { .. } => {
+                Some("start it: systemctl --user start amoeboid.socket".into())
+            }
+            Self::Rejected { .. } => {
+                Some("restart it: systemctl --user restart amoeboid.service".into())
+            }
             Self::Refused(_) | Self::Frame(_) | Self::Closed | Self::Unexpected(_) => None,
         }
     }

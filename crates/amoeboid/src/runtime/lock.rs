@@ -81,6 +81,21 @@ fn read_record(file: &mut File) -> Option<LockRecord> {
     serde_json::from_slice(&bytes).ok()
 }
 
+impl crate::diagnostic::Diagnostic for LockError {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::Open(_) => "runtime.lock.open",
+            Self::Lock(_) => "runtime.lock.lock",
+            Self::Record(_) => "runtime.lock.record",
+        }
+    }
+    fn hint(&self) -> Option<String> {
+        match self {
+            Self::Open(_) | Self::Lock(_) | Self::Record(_) => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -91,7 +106,7 @@ mod tests {
     use std::process::Command;
 
     use super::*;
-    use crate::runtime::paths::AbsDir;
+    use crate::runtime::paths::AbsoluteDirectory;
 
     /// Held by every test here. A fork in a parallel test copies all open fds until its child
     /// execs (`O_CLOEXEC` acts at exec, not fork), briefly keeping a dropped lock alive.
@@ -103,7 +118,7 @@ mod tests {
     }
 
     fn paths(temporary: &tempfile::TempDir) -> RuntimePaths {
-        let directory = AbsDir::parse(temporary.path().to_path_buf()).unwrap();
+        let directory = AbsoluteDirectory::parse(temporary.path().to_path_buf()).unwrap();
         RuntimePaths::under(directory.clone(), directory).unwrap()
     }
 

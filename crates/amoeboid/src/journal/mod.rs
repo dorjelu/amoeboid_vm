@@ -229,6 +229,29 @@ impl Actor for Journal {
     }
 }
 
+impl crate::diagnostic::Diagnostic for BadPersistenceId {
+    fn code(&self) -> &'static str {
+        "journal.persistence_id.invalid"
+    }
+    fn hint(&self) -> Option<String> {
+        None
+    }
+}
+
+impl crate::diagnostic::Diagnostic for PersistFailure {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::Conflict { .. } => "journal.persist.conflict",
+            Self::Store(_) => "journal.persist.store",
+        }
+    }
+    fn hint(&self) -> Option<String> {
+        match self {
+            Self::Conflict { .. } | Self::Store(_) => None,
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests_support {
     pub(crate) fn store_error(message: &str) -> super::StoreError {

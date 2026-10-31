@@ -33,7 +33,7 @@ pub struct RuntimeId(Uuid);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, thiserror::Error)]
 #[error("expected a version 7 uuid")]
-pub struct NotV7;
+pub struct NotVersion7;
 
 macro_rules! uuid_v7 {
     ($t:ident) => {
@@ -45,12 +45,12 @@ macro_rules! uuid_v7 {
             }
         }
         impl TryFrom<Uuid> for $t {
-            type Error = NotV7;
-            fn try_from(id: Uuid) -> Result<Self, NotV7> {
+            type Error = NotVersion7;
+            fn try_from(id: Uuid) -> Result<Self, NotVersion7> {
                 if id.get_version() == Some(uuid::Version::SortRand) {
                     Ok(Self(id))
                 } else {
-                    Err(NotV7)
+                    Err(NotVersion7)
                 }
             }
         }
@@ -163,3 +163,32 @@ pub enum Refusal {
 
 #[cfg(test)]
 mod tests;
+
+impl crate::diagnostic::Diagnostic for NotVersion7 {
+    fn code(&self) -> &'static str {
+        "protocol.identifier.not_version_7"
+    }
+    fn hint(&self) -> Option<String> {
+        None
+    }
+}
+
+impl crate::diagnostic::Diagnostic for Refusal {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::HandshakeRequired => "protocol.refusal.handshake_required",
+            Self::HandshakeRepeated => "protocol.refusal.handshake_repeated",
+            Self::MalformedFrame => "protocol.refusal.malformed_frame",
+            Self::FrameTooLarge { .. } => "protocol.refusal.frame_too_large",
+        }
+    }
+    fn hint(&self) -> Option<String> {
+        match self {
+            // A client built from the same tree never sends these; another client is wrong.
+            Self::HandshakeRequired
+            | Self::HandshakeRepeated
+            | Self::MalformedFrame
+            | Self::FrameTooLarge { .. } => None,
+        }
+    }
+}

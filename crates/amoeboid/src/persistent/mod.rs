@@ -250,3 +250,19 @@ fn run<B: Behaviour>(
     }
     Ok(())
 }
+
+impl crate::diagnostic::Diagnostic for Unrecoverable {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::UndecodableEvent { .. } => "persistent.unrecoverable.undecodable_event",
+            Self::UnknownEventVersion { .. } => "persistent.unrecoverable.unknown_event_version",
+        }
+    }
+    fn hint(&self) -> Option<String> {
+        match self {
+            Self::UndecodableEvent { .. } | Self::UnknownEventVersion { .. } => {
+                Some("the stream is kept for inspection; amoeboid vacuum_vm NAME removes it".into())
+            }
+        }
+    }
+}

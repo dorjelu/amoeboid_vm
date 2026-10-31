@@ -1,6 +1,7 @@
 //! Control plane for amoeboid microVMs: runtime, journal, persistent actors, protocol.
 
 pub mod client;
+pub mod diagnostic;
 pub mod journal;
 pub mod nonempty;
 pub mod persistent;

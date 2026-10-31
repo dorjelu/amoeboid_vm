@@ -87,3 +87,19 @@ where
     writer.write_all(&bytes).await.map_err(FrameError::Io)?;
     writer.flush().await.map_err(FrameError::Io)
 }
+
+impl crate::diagnostic::Diagnostic for FrameError {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::TooLarge { .. } => "protocol.frame.too_large",
+            Self::Decode(_) => "protocol.frame.decode",
+            Self::Encode(_) => "protocol.frame.encode",
+            Self::Io(_) => "protocol.frame.io",
+        }
+    }
+    fn hint(&self) -> Option<String> {
+        match self {
+            Self::TooLarge { .. } | Self::Decode(_) | Self::Encode(_) | Self::Io(_) => None,
+        }
+    }
+}

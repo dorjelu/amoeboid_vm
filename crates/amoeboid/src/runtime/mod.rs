@@ -66,7 +66,7 @@ pub enum StartError {
     #[error("a runtime is already running{}", holder.as_ref().map_or(String::new(), |holder| format!(" (process {}, version {})", holder.process_id, holder.version)))]
     AlreadyRunning { holder: Option<LockRecord> },
     #[error("can't create {directory}: {source}")]
-    Dir {
+    Directory {
         directory: String,
         source: std::io::Error,
     },
@@ -79,6 +79,27 @@ pub enum StartError {
     },
     #[error("can't start the root actor: {0}")]
     Spawn(String),
+}
+
+impl crate::diagnostic::Diagnostic for StartError {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::AlreadyRunning { .. } => "runtime.start.already_running",
+            Self::Directory { .. } => "runtime.start.directory",
+            Self::Lock(inner) => inner.code(),
+            Self::Listen { .. } => "runtime.start.listen",
+            Self::Spawn(_) => "runtime.start.spawn",
+        }
+    }
+    fn hint(&self) -> Option<String> {
+        match self {
+            Self::AlreadyRunning { .. } => Some(
+                "use the running one, or stop it: systemctl --user stop amoeboid.service".into(),
+            ),
+            Self::Lock(inner) => inner.hint(),
+            Self::Directory { .. } | Self::Listen { .. } | Self::Spawn(_) => None,
+        }
+    }
 }
 
 /// A running runtime. Dropping it does not stop it; call [`Runtime::stop`].
@@ -107,7 +128,7 @@ impl Runtime {
                 .recursive(true)
                 .mode(0o700)
                 .create(directory.as_path())
-                .map_err(|source| StartError::Dir {
+                .map_err(|source| StartError::Directory {
                     directory: directory.as_path().display().to_string(),
                     source,
                 })?;

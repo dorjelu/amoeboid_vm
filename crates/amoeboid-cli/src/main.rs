@@ -5,6 +5,7 @@ mod render;
 use std::process::ExitCode;
 
 use amoeboid::client::{Client, ClientError};
+use amoeboid::diagnostic::Diagnostic;
 use amoeboid::protocol::{ReplyBody, RequestBody, RuntimeReply, RuntimeRequest};
 use amoeboid::runtime::paths::RuntimePaths;
 use clap::{Parser, Subcommand};
@@ -43,11 +44,17 @@ enum CliError {
     Client(#[from] ClientError),
 }
 
-impl CliError {
-    fn hint(&self) -> Option<&'static str> {
+impl Diagnostic for CliError {
+    fn code(&self) -> &'static str {
         match self {
-            Self::Paths(_) => None,
-            Self::Client(error) => error.hint(),
+            Self::Paths(inner) => inner.code(),
+            Self::Client(inner) => inner.code(),
+        }
+    }
+    fn hint(&self) -> Option<String> {
+        match self {
+            Self::Paths(inner) => inner.hint(),
+            Self::Client(inner) => inner.hint(),
         }
     }
 }

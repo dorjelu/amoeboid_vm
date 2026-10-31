@@ -10,7 +10,7 @@ use super::*;
 use crate::client::{Client, ClientError};
 use crate::protocol::codec;
 use crate::protocol::{Refusal, ReplyBody, RequestBody, RuntimeReply, RuntimeRequest, ServerFrame};
-use paths::AbsDir;
+use paths::AbsoluteDirectory;
 
 struct Fixture {
     _temporary: tempfile::TempDir,
@@ -19,8 +19,8 @@ struct Fixture {
 
 fn fixture() -> Fixture {
     let temporary = tempfile::tempdir().unwrap();
-    let data = AbsDir::parse(temporary.path().join("data")).unwrap();
-    let run = AbsDir::parse(temporary.path().join("run")).unwrap();
+    let data = AbsoluteDirectory::parse(temporary.path().join("data")).unwrap();
+    let run = AbsoluteDirectory::parse(temporary.path().join("run")).unwrap();
     let paths = RuntimePaths::under(data, run).unwrap();
     Fixture {
         _temporary: temporary,
@@ -168,7 +168,7 @@ async fn connecting_without_a_runtime_is_unreachable_with_a_hint() {
     let fixture = fixture();
     let result = Client::connect(&fixture.paths).await;
     assert!(
-        matches!(result, Err(ref error @ ClientError::Unreachable { .. }) if error.hint().is_some())
+        matches!(result, Err(ref error @ ClientError::Unreachable { .. }) if crate::diagnostic::Diagnostic::hint(error).is_some())
     );
 }
 

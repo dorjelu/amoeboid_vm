@@ -9,7 +9,7 @@ use std::os::unix::fs::PermissionsExt as _;
 
 use super::store::Store;
 use super::*;
-use crate::runtime::paths::AbsDir;
+use crate::runtime::paths::AbsoluteDirectory;
 
 fn id(s: &str) -> PersistenceId {
     PersistenceId::parse(s.to_owned()).unwrap()
@@ -36,7 +36,7 @@ struct Fixture {
 
 fn fixture() -> Fixture {
     let temporary = tempfile::tempdir().unwrap();
-    let directory = AbsDir::parse(temporary.path().to_path_buf()).unwrap();
+    let directory = AbsoluteDirectory::parse(temporary.path().to_path_buf()).unwrap();
     let paths = RuntimePaths::under(directory.clone(), directory).unwrap();
     Fixture {
         _temporary: temporary,

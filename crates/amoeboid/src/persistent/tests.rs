@@ -10,7 +10,7 @@ use super::*;
 use crate::journal::{
     EventPayload, Journal, JournalArgs, PersistFailure, Persistence, StoredEvent,
 };
-use crate::runtime::paths::{AbsDir, RuntimePaths};
+use crate::runtime::paths::{AbsoluteDirectory, RuntimePaths};
 
 /// A counter that is reconciled once opened: by an `Open` observation (`Manual`), or by itself
 /// on recovery (`Auto`, for end-to-end tests where nothing else would send the observation).
@@ -405,7 +405,7 @@ async fn spawn_counter(
 #[tokio::test]
 async fn state_survives_killing_and_respawning_the_actor() {
     let temporary = tempfile::tempdir().unwrap();
-    let directory = AbsDir::parse(temporary.path().to_path_buf()).unwrap();
+    let directory = AbsoluteDirectory::parse(temporary.path().to_path_buf()).unwrap();
     let (journal, _) = Actor::spawn(
         None,
         Journal,
