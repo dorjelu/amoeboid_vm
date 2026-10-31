@@ -380,11 +380,29 @@ async fn status_of(client: &mut Client, name: &str) -> Option<crate::vm::VmCondi
         .map(|vm| vm.condition)
 }
 
-/// Polls status until `name` is quarantined (its twin reports after replaying); `None` if it
-/// isn't within 5 s.
-async fn until_quarantined(client: &mut Client, name: &str) -> Option<crate::diagnostic::Report> {
+/// Asks status once, while the twin may still be replaying: a VM that can't be replayed is
+/// answered quarantined, never unknown. Then waits (up to 5 s) for its quarantine record to be
+/// durable, read through a second journal connection, so a test may stop the runtime.
+async fn quarantined(
+    client: &mut Client,
+    paths: &RuntimePaths,
+    name: &str,
+) -> Option<crate::diagnostic::Report> {
+    let Some(crate::vm::VmCondition::Quarantined { reason }) = status_of(client, name).await else {
+        return None;
+    };
+    let id = format!("quarantine/{name}");
     for _ in 0..50 {
-        if let Some(crate::vm::VmCondition::Quarantined { reason }) = status_of(client, name).await
+        let id = persistence_id(&id);
+        let answers = journal_exchange(
+            paths,
+            vec![Box::new(move |reply_to| {
+                crate::journal::JournalMessage::Replay { id, reply_to }
+            })],
+        )
+        .await;
+        if let Some(crate::journal::JournalReply::Replayed { replay, .. }) = answers.first()
+            && !replay.events.is_empty()
         {
             return Some(reason);
         }
@@ -406,7 +424,9 @@ async fn an_unreplayable_vm_is_quarantined_recorded_once_and_refused() {
     .await
     .unwrap();
     let mut client = Client::connect(&fixture.paths).await.unwrap();
-    let reason = until_quarantined(&mut client, "broken").await.unwrap();
+    let reason = quarantined(&mut client, &fixture.paths, "broken")
+        .await
+        .unwrap();
     assert_eq!(
         reason.code,
         "persistent.unrecoverable.unknown_event_version"
@@ -464,7 +484,9 @@ async fn a_recorded_quarantine_is_known_from_the_start_and_recorded_once() {
     .await
     .unwrap();
     let mut client = Client::connect(&fixture.paths).await.unwrap();
-    until_quarantined(&mut client, "broken").await.unwrap();
+    quarantined(&mut client, &fixture.paths, "broken")
+        .await
+        .unwrap();
     first.stop();
     first.wait().await;
     let second = start_with(
@@ -546,7 +568,9 @@ async fn vacuuming_a_quarantined_vm_ends_its_processes_removes_its_files_and_ret
     .await
     .unwrap();
     let mut client = Client::connect(&fixture.paths).await.unwrap();
-    until_quarantined(&mut client, "broken").await.unwrap();
+    quarantined(&mut client, &fixture.paths, "broken")
+        .await
+        .unwrap();
     let mut leftover = process::spawn(&SpawnRequest {
         argv: crate::plan::argv::Argv::for_tests(&["sleep", "60"]),
         containment: Containment::Direct,

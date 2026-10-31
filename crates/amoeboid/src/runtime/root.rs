@@ -766,9 +766,16 @@ fn from_vm(myself: &ActorRef<RootMessage>, state: &mut RootState, vm: &VmName, r
                 return vacuum_stopped(myself, state, vm, result);
             }
             if let Some(collection) = state.statuses.get_mut(&operation) {
-                let condition = match result {
-                    Ok(VmOutcome::Status(condition)) => condition,
-                    Ok(VmOutcome::Started(_) | VmOutcome::Stopped) | Err(_) => VmCondition::Unknown,
+                // A twin asked while still replaying reports itself unrecoverable before it
+                // refuses what it stashed, so its refusal finds the VM quarantined.
+                let condition = match (result, state.quarantined.get(vm)) {
+                    (Ok(VmOutcome::Status(condition)), _) => condition,
+                    (Err(_), Some(reason)) => VmCondition::Quarantined {
+                        reason: reason.clone(),
+                    },
+                    (Ok(VmOutcome::Started(_) | VmOutcome::Stopped) | Err(_), _) => {
+                        VmCondition::Unknown
+                    }
                 };
                 collection.collected.insert(vm.clone(), condition);
                 if collection.complete()
