@@ -272,6 +272,13 @@ fn run<B: Behaviour>(
             JournalReply::ReplayFailed { reason, .. } => Input::ReplayFailed(reason),
             JournalReply::Persisted { batch, last } => Input::Persisted { batch, last },
             JournalReply::PersistFailed { batch, reason } => Input::PersistFailed { batch, reason },
+            JournalReply::Streams { .. } | JournalReply::StreamsFailed { .. } => {
+                tracing::debug!(
+                    id = state.id.as_str(),
+                    "stream listing not asked for; ignored"
+                );
+                return Ok(());
+            }
         },
     };
     let core = state.core.take().ok_or(CoreMissing)?;

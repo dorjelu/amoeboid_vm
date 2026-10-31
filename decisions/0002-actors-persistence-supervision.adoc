@@ -140,15 +140,17 @@ The mode machine is a pure function, `step(core, input) -> (core, actions)`; the
 
 `Unrecoverable` is a terminal mode, not a crash. The actor stays alive (so no restart), sends `on_unrecoverable` to its parent once, and answers every stashed and later command with `refuse`. It touches nothing in the world: processes, scope, runtime directory and stream are kept for forensics.
 
-For a VM, the unrecoverable actor is the VM actor itself (or one of its children, which reports to it and makes the VM quarantined). Root records `Quarantined { vm, reason }` in its own stream, not the broken one, so a restarted runtime starts that VM directly as quarantined instead of replaying it again. Nothing respawns or reaps a quarantined VM until `amoeboid vacuum_vm NAME`, which reaps its verified processes, removes its runtime directory and retires its streams. An unrecoverable Root stream means no registry: the runtime refuses to start and reports why.
+For a VM, the unrecoverable actor is the VM actor itself (or one of its children, which reports to it and makes the VM quarantined). Root records `Quarantined { reason }` in the stream `quarantine/<vm>`, not the broken one, so a restarted runtime skips that VM's twin instead of replaying it again. Nothing respawns or reaps a quarantined VM until `amoeboid vacuum_vm NAME`, which reaps its verified processes, removes its runtime directory and retires its streams. If the journal can't list its streams at start, the runtime logs it and twins start on their VM's first request instead.
 
 === Streams and identity
 
-Within a VM subtree only the twin persists. Its children (Hypervisor, Share, Builder, Guest, Watcher) keep no streams: whatever they learn reaches the Vm as an observation, and the Vm persists it in its own stream, so one stream is the complete history of a VM. On recovery the Vm replays, then spawns its children with what they must adopt (`adopt: qemu 812, shares: [d0: 901]`); they check each identity against the world and report `Adopted` or `Lost`, which the Vm persists before deciding. Outside VM subtrees, Root has its own stream (registry, quarantine records).
+Within a VM subtree only the twin persists. Its children (Hypervisor, Share, Builder, Guest, Watcher) keep no streams: whatever they learn reaches the Vm as an observation, and the Vm persists it in its own stream, so one stream is the complete history of a VM. On recovery the Vm replays, then spawns its children with what they must adopt (`adopt: qemu 812, shares: [d0: 901]`); they check each identity against the world and report `Adopted` or `Lost`, which the Vm persists before deciding.
+
+Root is not a persistent actor (it spawns the journal, so it can't replay from it before it runs). The journal's stream names are the registry instead: at start, Root asks the journal for the streams under `vm` and spawns a twin for each, so adoption begins with the runtime rather than on a VM's next request. Quarantine records live in the same log as `quarantine/<name>` streams, appended by Root (position 1; a conflict means already recorded) and listed at start, so a quarantined VM's twin is not spawned and its broken stream is not replayed again.
 
 ----
-vm/work      the twin's stream: the VM's whole history
-runtime      Root's stream
+vm/work              the twin's stream: the VM's whole history
+quarantine/work      present only if the VM is quarantined
 ----
 
 [source,sql]

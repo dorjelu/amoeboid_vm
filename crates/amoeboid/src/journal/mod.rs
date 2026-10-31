@@ -45,6 +45,21 @@ impl PersistenceId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The id one level below: `vm` + `work` = `vm/work`.
+    ///
+    /// # Errors
+    ///
+    /// `segment` is not a valid segment.
+    pub fn child(&self, segment: &str) -> Result<Self, BadPersistenceId> {
+        Self::parse(format!("{}/{segment}", self.0))
+    }
+
+    /// The rest of this id below `parent` (`vm/work` under `vm` is `work`), if it is below it.
+    #[must_use]
+    pub fn below(&self, parent: &Self) -> Option<&str> {
+        self.0.strip_prefix(&parent.0)?.strip_prefix('/')
+    }
 }
 
 /// Position in one stream, from 1.
@@ -115,6 +130,11 @@ pub enum JournalMessage {
         id: PersistenceId,
         reply_to: DerivedActorRef<JournalReply>,
     },
+    /// The ids of every stream directly or indirectly under `under` (`vm` lists `vm/work`, ...).
+    Streams {
+        under: PersistenceId,
+        reply_to: DerivedActorRef<JournalReply>,
+    },
     /// Appends at `first`, `first + 1`, ...; `first` must be the stream's next position.
     Persist {
         batch: BatchId,
@@ -142,6 +162,14 @@ pub enum JournalReply {
     PersistFailed {
         batch: BatchId,
         reason: PersistFailure,
+    },
+    Streams {
+        under: PersistenceId,
+        ids: Vec<PersistenceId>,
+    },
+    StreamsFailed {
+        under: PersistenceId,
+        reason: StoreError,
     },
 }
 
@@ -206,6 +234,13 @@ impl Actor for Journal {
                 let reply = match state.store.replay(&id).await {
                     Ok(events) => JournalReply::Replayed { id, events },
                     Err(reason) => JournalReply::ReplayFailed { id, reason },
+                };
+                (reply, reply_to)
+            }
+            JournalMessage::Streams { under, reply_to } => {
+                let reply = match state.store.streams(&under).await {
+                    Ok(ids) => JournalReply::Streams { under, ids },
+                    Err(reason) => JournalReply::StreamsFailed { under, reason },
                 };
                 (reply, reply_to)
             }

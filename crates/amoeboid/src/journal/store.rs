@@ -89,6 +89,39 @@ impl Store {
         }
     }
 
+    /// Ids of the streams below `under`, in order.
+    pub(super) async fn streams(
+        &mut self,
+        under: &PersistenceId,
+    ) -> Result<Vec<PersistenceId>, StoreError> {
+        match self {
+            Self::Memory(streams) => Ok(streams
+                .keys()
+                .filter(|id| id.below(under).is_some())
+                .cloned()
+                .collect()),
+            Self::Sqlite(connection) => {
+                let prefix = format!("{}/", under.as_str());
+                let names = connection
+                    .call(move |connection| {
+                        let mut statement = connection.prepare_cached(
+                            "SELECT DISTINCT persistence_id FROM events \
+                             WHERE substr(persistence_id, 1, length(?1)) = ?1 \
+                             ORDER BY persistence_id",
+                        )?;
+                        let rows = statement.query_map([prefix], |row| row.get::<_, String>(0))?;
+                        rows.collect::<rusqlite::Result<Vec<String>>>()
+                    })
+                    .await
+                    .map_err(StoreError::of)?;
+                names
+                    .into_iter()
+                    .map(|name| PersistenceId::parse(name).map_err(StoreError::of))
+                    .collect()
+            }
+        }
+    }
+
     pub(super) async fn append(
         &mut self,
         id: &PersistenceId,

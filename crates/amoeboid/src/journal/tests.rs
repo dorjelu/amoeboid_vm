@@ -138,6 +138,21 @@ async fn streams_are_independent() {
 }
 
 #[tokio::test]
+async fn streams_are_listed_by_parent_and_only_below_it() {
+    each_store(async |mut store, _| {
+        for name in ["vm/a", "vm/b", "vmx/c", "quarantine/a"] {
+            store
+                .append(&id(name), Sequence::FIRST, payloads(&["x"]))
+                .await
+                .unwrap();
+        }
+        let listed = store.streams(&id("vm")).await.unwrap();
+        assert_eq!(listed, [id("vm/a"), id("vm/b")]);
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn sqlite_events_survive_reopening() {
     let fixture = fixture();
     let mut store = Store::open(Persistence::Sqlite, &fixture.paths)

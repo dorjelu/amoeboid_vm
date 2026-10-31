@@ -29,10 +29,18 @@ fn fixture() -> Fixture {
 }
 
 async fn start(paths: &RuntimePaths) -> Result<Runtime, StartError> {
+    start_with(paths, Persistence::Memory, root::VmDefaults::production()).await
+}
+
+async fn start_with(
+    paths: &RuntimePaths,
+    persistence: Persistence,
+    vm_defaults: root::VmDefaults,
+) -> Result<Runtime, StartError> {
     Runtime::start(RuntimeConfig {
         paths: paths.clone(),
         hosting: Hosting::InProcess,
-        persistence: Persistence::Memory,
+        persistence,
         version: "test".into(),
         account: crate::vm::Account {
             user: crate::domain::account::UserName::parse("alice".into()).unwrap(),
@@ -40,7 +48,7 @@ async fn start(paths: &RuntimePaths) -> Result<Runtime, StartError> {
             group_id: crate::domain::account::GroupId::new(100),
             home: crate::domain::account::GuestHome::parse("/home/alice".into()).unwrap(),
         },
-        vm_defaults: root::VmDefaults::production(),
+        vm_defaults,
     })
     .await
 }
@@ -186,3 +194,69 @@ async fn connecting_without_a_runtime_is_unreachable_with_a_hint() {
 }
 
 use crate::protocol::ProtocolVersion;
+
+/// Twins of every VM in the journal start with the runtime, not on first request: an
+/// interrupted start is noticed (and recorded as failed) without anyone asking.
+#[tokio::test]
+async fn a_new_runtime_starts_every_known_twin_which_recovers_on_its_own() {
+    use crate::vm::builder::BuildCommand;
+    use crate::vm::local_qemu::Placement;
+    let fixture = fixture();
+    let slow_build = root::VmDefaults {
+        build: BuildCommand::Scripted(crate::plan::argv::Argv::for_tests(&["sleep", "3"])),
+        placement: Placement::Direct,
+    };
+    let first = start_with(&fixture.paths, Persistence::Sqlite, slow_build.clone())
+        .await
+        .unwrap();
+    let mut client = Client::connect(&fixture.paths).await.unwrap();
+    let name = crate::domain::vm_name::VmName::parse("interrupted".into()).unwrap();
+    let request = RequestBody::Vm(crate::protocol::VmRequest::Start {
+        name,
+        shares: Vec::new(),
+        nix_config: None,
+    });
+    // The start is building when the runtime goes away.
+    let pending = tokio::spawn(async move { client.request(request).await });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    first.stop();
+    first.wait().await;
+    drop(pending);
+
+    let second = start_with(&fixture.paths, Persistence::Sqlite, slow_build)
+        .await
+        .unwrap();
+    // No request names the VM; give its twin a moment to recover by itself.
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    second.stop();
+    second.wait().await;
+
+    let (journal, _) = ractor::Actor::spawn(
+        None,
+        crate::journal::Journal,
+        crate::journal::JournalArgs {
+            persistence: Persistence::Sqlite,
+            paths: fixture.paths.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let (reader, mut replies) = crate::testing::probe::<crate::journal::JournalReply>().await;
+    journal
+        .cast(crate::journal::JournalMessage::Replay {
+            id: crate::journal::PersistenceId::parse("vm/interrupted".into()).unwrap(),
+            reply_to: reader.get_derived(),
+        })
+        .unwrap();
+    let crate::journal::JournalReply::Replayed { events, .. } =
+        crate::testing::next(&mut replies).await
+    else {
+        return assert_eq!("a replay", "something else");
+    };
+    let last = events.last().map(|event| event.payload.as_str().to_owned());
+    assert!(
+        last.as_deref()
+            .is_some_and(|payload| payload.contains("vm.restarted_while_starting")),
+        "the twin didn't recover on its own: {last:?}"
+    );
+}

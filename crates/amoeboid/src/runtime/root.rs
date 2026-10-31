@@ -20,7 +20,9 @@ use crate::domain::lifecycle::Incarnation;
 use crate::domain::path::AbsolutePath;
 use crate::domain::share::{ShareRequest, Shares};
 use crate::domain::vm_name::VmName;
-use crate::journal::{Journal, JournalArgs, JournalMessage, Persistence, PersistenceId};
+use crate::journal::{
+    Journal, JournalArgs, JournalMessage, JournalReply, Persistence, PersistenceId,
+};
 use crate::persistent::{Persistent, PersistentArgs, PersistentMessage};
 use crate::protocol::{
     OperationId, ReplyBody, RequestBody, RuntimeId, RuntimeReply, RuntimeRequest, ServerFrame,
@@ -47,6 +49,24 @@ pub enum RootMessage {
     },
     /// A twin's report.
     FromVm(FromVm),
+    /// The journal's answer to Root's own questions (the stream listing at start).
+    Journal(JournalReply),
+}
+
+impl From<JournalReply> for RootMessage {
+    fn from(reply: JournalReply) -> Self {
+        Self::Journal(reply)
+    }
+}
+
+impl TryFrom<RootMessage> for JournalReply {
+    type Error = RootMessage;
+    fn try_from(message: RootMessage) -> Result<Self, RootMessage> {
+        match message {
+            RootMessage::Journal(reply) => Ok(reply),
+            other @ (RootMessage::Request { .. } | RootMessage::FromVm(_)) => Err(other),
+        }
+    }
 }
 
 impl From<FromVm> for RootMessage {
@@ -60,7 +80,7 @@ impl TryFrom<RootMessage> for FromVm {
     fn try_from(message: RootMessage) -> Result<Self, RootMessage> {
         match message {
             RootMessage::FromVm(report) => Ok(report),
-            other @ RootMessage::Request { .. } => Err(other),
+            other @ (RootMessage::Request { .. } | RootMessage::Journal(_)) => Err(other),
         }
     }
 }
@@ -96,6 +116,8 @@ pub struct Root;
 
 pub struct RootState {
     id: RuntimeId,
+    /// `vm`: the parent of every twin's stream, `vm/<name>`.
+    vm_streams: PersistenceId,
     paths: RuntimePaths,
     account: Account,
     vm_defaults: VmDefaults,
@@ -142,8 +164,15 @@ impl Actor for Root {
             myself.get_cell(),
         )
         .await?;
+        // Every VM the journal knows gets its twin now, so adoption starts with the runtime.
+        let vm_streams = PersistenceId::parse("vm".into())?;
+        journal.cast(JournalMessage::Streams {
+            under: vm_streams.clone(),
+            reply_to: myself.get_derived(),
+        })?;
         Ok(RootState {
             id: args.id,
+            vm_streams,
             paths: args.paths,
             account: args.account,
             vm_defaults: args.vm_defaults,
@@ -184,6 +213,32 @@ impl Actor for Root {
                 }
             }
             RootMessage::FromVm(FromVm { vm, report }) => from_vm(state, &vm, report),
+            RootMessage::Journal(JournalReply::Streams { ids, .. }) => {
+                for id in ids {
+                    match id
+                        .below(&state.vm_streams)
+                        .map(|name| VmName::parse(name.to_owned()))
+                    {
+                        Some(Ok(name)) => {
+                            if let Err(failure) = twin(&myself, state, &name).await {
+                                tracing::error!(vm = %name, message = failure.message, "can't start its twin");
+                            }
+                        }
+                        Some(Err(_)) | None => {
+                            tracing::warn!(id = id.as_str(), "a stream under vm/ that names no VM");
+                        }
+                    }
+                }
+            }
+            RootMessage::Journal(JournalReply::StreamsFailed { reason, .. }) => {
+                tracing::error!(%reason, "can't list the VMs; their twins start on first request");
+            }
+            RootMessage::Journal(
+                JournalReply::Replayed { .. }
+                | JournalReply::ReplayFailed { .. }
+                | JournalReply::Persisted { .. }
+                | JournalReply::PersistFailed { .. },
+            ) => tracing::debug!("journal reply Root didn't ask for; ignored"),
         }
         Ok(())
     }
@@ -283,7 +338,10 @@ async fn twin(
         return Ok(twin.clone());
     }
     let vm = state.paths.vm(name).map_err(|error| Report::of(&error))?;
-    let id = PersistenceId::parse(format!("vm/{name}")).map_err(|error| Report::of(&error))?;
+    let id = state
+        .vm_streams
+        .child(name.as_str())
+        .map_err(|error| Report::of(&error))?;
     let (twin, _) = Actor::spawn_linked(
         Some(format!("{}/vm/{name}", state.id)),
         Persistent::<VmTwin>::new(),
