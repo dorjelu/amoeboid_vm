@@ -316,9 +316,9 @@ mod tests {
 
     #[test]
     fn a_vm_whose_sockets_would_not_fit_is_refused() {
-        let run = format!("/{}", "r".repeat(40));
+        let run = format!("/{}", "r".repeat(60));
         let paths = RuntimePaths::under(absolute("/d"), absolute(&run)).unwrap();
-        let name = VmName::parse("n".repeat(60)).unwrap();
+        let name = VmName::parse("n".repeat(40)).unwrap();
         assert!(matches!(
             paths.vm(&name),
             Err(LocationError::SocketTooLong(_))

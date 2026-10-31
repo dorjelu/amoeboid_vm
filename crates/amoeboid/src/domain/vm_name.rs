@@ -1,10 +1,11 @@
-//! `VmName`: `[A-Za-z0-9][A-Za-z0-9-]{0,62}`. Also the guest's hostname, so it follows hostname
+//! `VmName`: `[A-Za-z0-9][A-Za-z0-9-]{0,39}`. Also the guest's hostname, so it follows hostname
 //! label rules; it names directories and the scope unit, so it never contains `/` or `.`.
 
 use serde::{Deserialize, Serialize};
 
-/// Hostname label limit.
-pub const MAX_LENGTH: usize = 63;
+/// Below the hostname label limit (63), leaving room for long `XDG_RUNTIME_DIR` paths: a VM's
+/// sockets live under `<run>/<name>/` and must fit `sun_path`.
+pub const MAX_LENGTH: usize = 40;
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -99,7 +100,7 @@ mod tests {
 
     proptest! {
         #[test]
-        fn every_name_of_the_grammar_is_accepted(name in "[A-Za-z0-9][A-Za-z0-9-]{0,62}") {
+        fn every_name_of_the_grammar_is_accepted(name in "[A-Za-z0-9][A-Za-z0-9-]{0,39}") {
             prop_assert_eq!(VmName::parse(name.clone()).map(String::from), Ok(name));
         }
 
