@@ -7,11 +7,7 @@ use serde::Deserialize;
 
 use super::machine::{Action, Core, Fatal, Input, Mode, ModeName, step};
 use super::*;
-use crate::domain::path::AbsolutePath;
-use crate::journal::{
-    EventPayload, Journal, JournalArgs, PersistFailure, Persistence, Replay, StoredEvent,
-};
-use crate::runtime::paths::RuntimePaths;
+use crate::journal::{EventPayload, Journal, JournalArgs, PersistFailure, Replay, StoredEvent};
 
 /// A counter that is reconciled once opened: by an `Open` observation (`Manual`), or by itself
 /// on recovery (`Auto`, for end-to-end tests where nothing else would send the observation).
@@ -437,14 +433,11 @@ async fn spawn_counter(
 
 #[tokio::test]
 async fn state_survives_killing_and_respawning_the_actor() {
-    let temporary = tempfile::tempdir().unwrap();
-    let directory = AbsolutePath::parse(temporary.path().to_path_buf()).unwrap();
     let (journal, _) = Actor::spawn(
         None,
         Journal,
         JournalArgs {
-            persistence: Persistence::Memory,
-            paths: RuntimePaths::under(directory.clone(), directory).unwrap(),
+            store: crate::journal::JournalStore::Memory,
             clock: crate::clock::Clock::System,
         },
     )

@@ -7,12 +7,11 @@ use rustix::fs::{Mode, OFlags};
 use tokio_rusqlite::rusqlite::{self, ErrorCode, TransactionBehavior, params};
 
 use super::{
-    EventPayload, PersistFailure, Persistence, PersistenceId, Replay, Sequence, StoreError,
+    EventPayload, JournalStore, PersistFailure, PersistenceId, Replay, Sequence, StoreError,
     StoredEvent,
 };
 use crate::clock::Timestamp;
 use crate::nonempty::NonEmpty;
-use crate::runtime::paths::RuntimePaths;
 
 const SCHEMA_VERSION: i64 = 2;
 
@@ -64,14 +63,11 @@ impl StoreError {
 }
 
 impl Store {
-    pub(super) async fn open(
-        persistence: Persistence,
-        paths: &RuntimePaths,
-    ) -> Result<Self, StoreError> {
-        match persistence {
-            Persistence::Memory => Ok(Self::Memory(BTreeMap::new())),
-            Persistence::Sqlite => {
-                let path = paths.journal();
+    pub(super) async fn open(store: &JournalStore) -> Result<Self, StoreError> {
+        match store {
+            JournalStore::Memory => Ok(Self::Memory(BTreeMap::new())),
+            JournalStore::Sqlite(path) => {
+                let path = path.clone();
                 // Created 0600 before SQLite sees it; O_NOFOLLOW refuses a planted symlink.
                 rustix::fs::open(
                     path.as_path(),

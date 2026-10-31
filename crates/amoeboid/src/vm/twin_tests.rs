@@ -47,6 +47,7 @@ fn spec(nix_config: NixConfig) -> VmSpec {
         },
         nix_config,
         boot_timeout_seconds: 90,
+        powerdown_grace_seconds: 30,
     }
 }
 
@@ -651,5 +652,32 @@ fn recovery_carries_on_an_interrupted_stop() {
     assert_eq!(events, Vec::new());
     assert!(
         matches!(outs.as_slice(), [VmOut::StopMachine { processes, .. }] if processes.contains_key(&qemu()))
+    );
+}
+
+#[test]
+fn a_stop_uses_the_powerdown_grace_of_the_start_it_stops() {
+    let mut patient = spec(NixConfig::Existing);
+    patient.powerdown_grace_seconds = 7;
+    let started = VmTwin::on_event(
+        VmTwin::initial(),
+        &VmEvent::StartRequested {
+            operation: OperationId::mint(),
+            generation: Generation::FIRST,
+            spec: patient,
+            seed_own_config: true,
+        },
+    );
+    assert_eq!(started.powerdown_grace_seconds, 7);
+    let (mut state, _) = running();
+    state.powerdown_grace_seconds = 7;
+    let (_, _, outs) = command(
+        state,
+        VmCommand::Stop {
+            operation: OperationId::mint(),
+        },
+    );
+    assert!(
+        matches!(outs.as_slice(), [VmOut::StopMachine { grace, .. }] if *grace == std::time::Duration::from_secs(7))
     );
 }

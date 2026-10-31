@@ -8,9 +8,11 @@ use tokio::net::UnixStream;
 
 use super::*;
 use crate::client::{Client, ClientError};
+use crate::config::daemon::DaemonConfig;
 use crate::domain::path::AbsolutePath;
 use crate::protocol::codec;
 use crate::protocol::{Refusal, ReplyBody, RequestBody, RuntimeReply, RuntimeRequest, ServerFrame};
+use paths::ConfigPaths;
 
 struct Fixture {
     _temporary: tempfile::TempDir,
@@ -37,10 +39,27 @@ async fn start_with(
     persistence: Persistence,
     vm_defaults: root::VmDefaults,
 ) -> Result<Runtime, StartError> {
+    start_configured(paths, persistence, vm_defaults, DaemonConfig::default()).await
+}
+
+/// The configuration directory and home of a fixture: beside its data and run directories.
+fn config_paths(paths: &RuntimePaths) -> ConfigPaths {
+    let root = paths.data().parent().unwrap();
+    ConfigPaths::new(root.join("config"), root.join("home"))
+}
+
+async fn start_configured(
+    paths: &RuntimePaths,
+    persistence: Persistence,
+    vm_defaults: root::VmDefaults,
+    daemon: DaemonConfig,
+) -> Result<Runtime, StartError> {
     Runtime::start(RuntimeConfig {
         paths: paths.clone(),
+        config: config_paths(paths),
         hosting: Hosting::InProcess,
         persistence,
+        daemon: DaemonConfigSource::Given(daemon),
         version: "test".into(),
         account: crate::vm::Account {
             user: crate::domain::account::UserName::parse("alice".into()).unwrap(),
@@ -211,12 +230,15 @@ async fn a_new_runtime_starts_every_known_twin_which_recovers_on_its_own() {
     let slow_build = root::VmDefaults {
         build: BuildCommand::Scripted(crate::plan::argv::Argv::for_tests(&["sleep", "3"])),
         placement: Placement::Direct,
-        restart: super::machine_supervisor::RestartPolicy::production(),
-        timing: super::timing::Timing::quick(),
+        process: super::timing::ProcessTiming::quick(),
     };
-    let first = start_with(&fixture.paths, Persistence::Sqlite, slow_build.clone())
-        .await
-        .unwrap();
+    let first = start_with(
+        &fixture.paths,
+        Persistence::Sqlite(JournalLocation::Configured),
+        slow_build.clone(),
+    )
+    .await
+    .unwrap();
     let mut client = Client::connect(&fixture.paths).await.unwrap();
     let name = crate::domain::vm_name::VmName::parse("interrupted".into()).unwrap();
     let request = RequestBody::Vm(crate::protocol::VmRequest::Start {
@@ -233,9 +255,13 @@ async fn a_new_runtime_starts_every_known_twin_which_recovers_on_its_own() {
     first.wait().await;
     drop(pending);
 
-    let second = start_with(&fixture.paths, Persistence::Sqlite, slow_build)
-        .await
-        .unwrap();
+    let second = start_with(
+        &fixture.paths,
+        Persistence::Sqlite(JournalLocation::Configured),
+        slow_build,
+    )
+    .await
+    .unwrap();
     drop(forks);
     // Asked at once: requests wait for the registry, so the VM is already listed.
     let mut client = Client::connect(&fixture.paths).await.unwrap();
@@ -257,8 +283,7 @@ async fn a_new_runtime_starts_every_known_twin_which_recovers_on_its_own() {
         None,
         crate::journal::Journal,
         crate::journal::JournalArgs {
-            persistence: Persistence::Sqlite,
-            paths: fixture.paths.clone(),
+            store: crate::journal::JournalStore::Sqlite(fixture.paths.journal()),
             clock: crate::clock::Clock::System,
         },
     )
@@ -324,8 +349,7 @@ async fn journal_exchange(
         None,
         crate::journal::Journal,
         crate::journal::JournalArgs {
-            persistence: Persistence::Sqlite,
-            paths: paths.clone(),
+            store: crate::journal::JournalStore::Sqlite(paths.journal()),
             clock: crate::clock::Clock::System,
         },
     )
@@ -423,7 +447,7 @@ async fn an_unreplayable_vm_is_quarantined_recorded_once_and_refused() {
     plant_unreplayable(&fixture.paths, "broken").await;
     let runtime = start_with(
         &fixture.paths,
-        Persistence::Sqlite,
+        Persistence::Sqlite(JournalLocation::Configured),
         root::VmDefaults::production(),
     )
     .await
@@ -484,7 +508,7 @@ async fn a_recorded_quarantine_is_known_from_the_start_and_recorded_once() {
     plant_unreplayable(&fixture.paths, "broken").await;
     let first = start_with(
         &fixture.paths,
-        Persistence::Sqlite,
+        Persistence::Sqlite(JournalLocation::Configured),
         root::VmDefaults::production(),
     )
     .await
@@ -497,7 +521,7 @@ async fn a_recorded_quarantine_is_known_from_the_start_and_recorded_once() {
     first.wait().await;
     let second = start_with(
         &fixture.paths,
-        Persistence::Sqlite,
+        Persistence::Sqlite(JournalLocation::Configured),
         root::VmDefaults::production(),
     )
     .await
@@ -568,7 +592,7 @@ async fn vacuuming_a_quarantined_vm_ends_its_processes_removes_its_files_and_ret
     std::fs::create_dir_all(&stranger).unwrap();
     let runtime = start_with(
         &fixture.paths,
-        Persistence::Sqlite,
+        Persistence::Sqlite(JournalLocation::Configured),
         root::VmDefaults::production(),
     )
     .await
@@ -638,12 +662,15 @@ async fn a_vacuumed_name_starts_as_a_new_vm_after_the_tombstone() {
     let defaults = |seconds: &'static str| root::VmDefaults {
         build: BuildCommand::Scripted(crate::plan::argv::Argv::for_tests(&["sleep", seconds])),
         placement: Placement::Direct,
-        restart: super::machine_supervisor::RestartPolicy::production(),
-        timing: super::timing::Timing::quick(),
+        process: super::timing::ProcessTiming::quick(),
     };
-    let runtime = start_with(&fixture.paths, Persistence::Sqlite, defaults("3"))
-        .await
-        .unwrap();
+    let runtime = start_with(
+        &fixture.paths,
+        Persistence::Sqlite(JournalLocation::Configured),
+        defaults("3"),
+    )
+    .await
+    .unwrap();
     let mut client = Client::connect(&fixture.paths).await.unwrap();
     let start = RequestBody::Vm(VmRequest::Start {
         name: vm_name("reused"),
@@ -673,9 +700,13 @@ async fn a_vacuumed_name_starts_as_a_new_vm_after_the_tombstone() {
     assert_eq!(retired.events, Vec::new());
     let tombstone = retired.last.unwrap().get();
 
-    let runtime = start_with(&fixture.paths, Persistence::Sqlite, defaults("3"))
-        .await
-        .unwrap();
+    let runtime = start_with(
+        &fixture.paths,
+        Persistence::Sqlite(JournalLocation::Configured),
+        defaults("3"),
+    )
+    .await
+    .unwrap();
     drop(forks);
     let mut client = Client::connect(&fixture.paths).await.unwrap();
     assert_eq!(status_of(&mut client, "reused").await, None);
@@ -703,15 +734,18 @@ async fn a_twin_out_of_restarts_fails_its_waiters_is_quarantined_and_can_be_rele
     let defaults = root::VmDefaults {
         build: BuildCommand::Scripted(crate::plan::argv::Argv::for_tests(&["sleep", "3"])),
         placement: Placement::Direct,
-        restart: super::machine_supervisor::RestartPolicy {
-            max_restarts: 0,
-            ..super::machine_supervisor::RestartPolicy::production()
-        },
-        timing: super::timing::Timing::quick(),
+        process: super::timing::ProcessTiming::quick(),
     };
-    let runtime = start_with(&fixture.paths, Persistence::Sqlite, defaults)
-        .await
-        .unwrap();
+    let mut daemon = DaemonConfig::default();
+    daemon.restart.max_restarts = 0;
+    let runtime = start_configured(
+        &fixture.paths,
+        Persistence::Sqlite(JournalLocation::Configured),
+        defaults,
+        daemon,
+    )
+    .await
+    .unwrap();
     let mut starter = Client::connect(&fixture.paths).await.unwrap();
     let start = RequestBody::Vm(VmRequest::Start {
         name: vm_name("halting"),
@@ -793,4 +827,70 @@ async fn a_twin_out_of_restarts_fails_its_waiters_is_quarantined_and_can_be_rele
         ),
         (0, Some(1))
     );
+}
+
+#[test]
+fn the_journal_is_the_builders_else_the_configured_else_the_default_and_never_in_a_vm() {
+    let fixture = fixture();
+    let data = fixture.paths.data().clone();
+    let elsewhere = AbsolutePath::parse("/srv/journal.sqlite".into()).unwrap();
+    let configured = AbsolutePath::parse("/var/lib/journal.sqlite".into()).unwrap();
+    let store = |persistence, configured: Option<&AbsolutePath>| {
+        super::journal_store(&fixture.paths, persistence, configured)
+    };
+    assert!(matches!(
+        store(Persistence::Sqlite(JournalLocation::At(elsewhere.clone())), Some(&configured)),
+        Ok(crate::journal::JournalStore::Sqlite(path)) if path == elsewhere
+    ));
+    assert!(matches!(
+        store(Persistence::Sqlite(JournalLocation::Configured), Some(&configured)),
+        Ok(crate::journal::JournalStore::Sqlite(path)) if path == configured
+    ));
+    assert!(matches!(
+        store(Persistence::Sqlite(JournalLocation::Configured), None),
+        Ok(crate::journal::JournalStore::Sqlite(path)) if path == fixture.paths.journal()
+    ));
+    let inside_vm = data.join("work").join("journal.sqlite");
+    assert!(matches!(
+        store(Persistence::Sqlite(JournalLocation::At(inside_vm)), None),
+        Err(StartError::JournalInsideVm(_))
+    ));
+}
+
+#[tokio::test]
+async fn an_invalid_daemon_config_stops_the_runtime_from_starting_with_every_problem() {
+    let fixture = fixture();
+    let config = config_paths(&fixture.paths);
+    std::fs::create_dir_all(config.directory().as_path()).unwrap();
+    std::fs::write(
+        config.daemon_config().as_path(),
+        "linger = \"yes\"\n[restart]\nmax_restarts = 1000\n",
+    )
+    .unwrap();
+    let started = Runtime::start(RuntimeConfig {
+        paths: fixture.paths.clone(),
+        config,
+        hosting: Hosting::InProcess,
+        persistence: Persistence::Memory,
+        daemon: DaemonConfigSource::File,
+        version: "test".into(),
+        account: crate::vm::Account {
+            user: crate::domain::account::UserName::parse("alice".into()).unwrap(),
+            user_id: crate::domain::account::UserId::new(1000),
+            group_id: crate::domain::account::GroupId::new(100),
+            home: crate::domain::account::GuestHome::parse("/home/alice".into()).unwrap(),
+        },
+        vm_defaults: root::VmDefaults::production(),
+        clock: crate::clock::Clock::System,
+    })
+    .await;
+    let Err(StartError::Config(crate::config::LoadError::Invalid(errors))) = started else {
+        return assert_eq!("an invalid configuration", "something else");
+    };
+    let keys: Vec<&str> = errors
+        .problems
+        .iter()
+        .map(|problem| problem.key.as_str())
+        .collect();
+    assert_eq!(keys, ["linger", "restart.max_restarts"]);
 }

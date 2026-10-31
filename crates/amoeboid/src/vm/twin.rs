@@ -10,6 +10,7 @@
 //! ```
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use ractor::{Actor, ActorCell, ActorProcessingErr, DerivedActorRef};
 use serde::{Deserialize, Serialize};
@@ -123,6 +124,9 @@ pub struct VmTwinState {
     /// The latest start's generation; `None` before the first.
     pub generation: Option<Generation>,
     pub vm: VmState,
+    /// The latest start's powerdown grace (its spec), so every stop of what it started uses
+    /// it, also one carried on after a restart.
+    pub powerdown_grace_seconds: u32,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -231,6 +235,8 @@ pub enum VmOut {
     StopMachine {
         generation: Generation,
         processes: BTreeMap<ProcessRole, ProcessIdentity>,
+        /// How long the guest gets to power off before it is stopped by force.
+        grace: Duration,
     },
     Adopt {
         generation: Generation,
@@ -279,7 +285,7 @@ pub struct VmSetup {
     pub root: DerivedActorRef<FromVm>,
     pub build: BuildCommand,
     pub placement: Placement,
-    pub timing: crate::runtime::timing::Timing,
+    pub timing: crate::runtime::timing::ProcessTiming,
 }
 
 /// Refs to the twin's children (spawned by the twin itself when it starts) and to Root.
@@ -385,6 +391,7 @@ impl Behaviour for VmTwin {
             created: None,
             generation: None,
             vm: VmState::Stopped { last_failure: None },
+            powerdown_grace_seconds: super::DEFAULT_POWERDOWN_GRACE_SECONDS,
         }
     }
 
@@ -438,6 +445,7 @@ impl Behaviour for VmTwin {
             } => Effect::Send(one(VmOut::StopMachine {
                 generation: *generation,
                 processes: processes.clone(),
+                grace: powerdown_grace(state),
             })),
             VmState::Stopped { .. } | VmState::Failed { .. } => Effect::None,
         }
@@ -526,12 +534,14 @@ impl Behaviour for VmTwin {
             VmOut::StopMachine {
                 generation,
                 processes,
+                grace,
             } => peers
                 .hypervisor
                 .send_message(HypervisorCommand::Stop {
                     generation,
                     vm: peers.vm.clone(),
                     processes,
+                    grace,
                 })
                 .is_ok(),
             VmOut::Adopt {
@@ -674,6 +684,7 @@ fn stop(state: &VmTwinState, operation: OperationId) -> Effect<VmEvent, VmOut> {
     let stop_machine = |generation, vm: &VmState| VmOut::StopMachine {
         generation,
         processes: processes_of(vm),
+        grace: powerdown_grace(state),
     };
     match &state.vm {
         VmState::Running { generation, .. } => Effect::Persist {
@@ -850,6 +861,7 @@ fn guest_vm(state: &VmTwinState, observation: GuestVmObservation) -> Effect<VmEv
                     VmOut::StopMachine {
                         generation,
                         processes: processes.clone(),
+                        grace: powerdown_grace(state),
                     },
                     done(*operation, Err(reason)),
                 ],
@@ -968,16 +980,22 @@ fn hypervisor(state: &VmTwinState, observation: HypervisorObservation) -> Effect
 /// The fold: total, so a replayed event never fails. Events of another generation than the
 /// state's leave it unchanged (they are never persisted that way, but the fold doesn't rely
 /// on it).
+fn powerdown_grace(state: &VmTwinState) -> Duration {
+    Duration::from_secs(u64::from(state.powerdown_grace_seconds))
+}
+
 fn evolve(state: VmTwinState, event: &VmEvent) -> VmTwinState {
     let VmTwinState {
         created,
         generation: latest,
         vm,
+        powerdown_grace_seconds,
     } = state;
     let rebuild = |vm| VmTwinState {
         created,
         generation: latest,
         vm,
+        powerdown_grace_seconds,
     };
     match event {
         VmEvent::Created {
@@ -987,6 +1005,7 @@ fn evolve(state: VmTwinState, event: &VmEvent) -> VmTwinState {
             created: Some((*incarnation, *backend)),
             generation: latest,
             vm,
+            powerdown_grace_seconds,
         },
         VmEvent::StartRequested {
             operation,
@@ -996,6 +1015,7 @@ fn evolve(state: VmTwinState, event: &VmEvent) -> VmTwinState {
         } => VmTwinState {
             created,
             generation: Some(*generation),
+            powerdown_grace_seconds: spec.powerdown_grace_seconds,
             vm: VmState::Starting {
                 operation: *operation,
                 generation: *generation,

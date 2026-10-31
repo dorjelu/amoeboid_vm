@@ -14,7 +14,7 @@ use crate::adapters::files::{self, FileError};
 use crate::adapters::process::{self, Liveness, ProcessError, Signal};
 use crate::domain::process::ProcessIdentity;
 use crate::runtime::paths::VmPaths;
-use crate::runtime::timing::Timing;
+use crate::runtime::timing::ProcessTiming;
 
 const POLL: Duration = Duration::from_millis(100);
 
@@ -52,7 +52,7 @@ impl crate::diagnostic::Diagnostic for VacuumError {
 /// # Errors
 ///
 /// `/proc` can't be read, a process survives `SIGKILL`, or a directory can't be removed.
-pub async fn vacuum(vm: &VmPaths, timing: &Timing) -> Result<(), VacuumError> {
+pub async fn vacuum(vm: &VmPaths, timing: &ProcessTiming) -> Result<(), VacuumError> {
     let found = process::find_by_vm(vm.name())?;
     if !found.is_empty() {
         tracing::info!(vm = %vm.name(), processes = found.len(), "ending the VM's processes");
@@ -156,7 +156,7 @@ mod tests {
         // Give the stubborn shell time to install its trap.
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        vacuum(&vm, &Timing::quick()).await.unwrap();
+        vacuum(&vm, &ProcessTiming::quick()).await.unwrap();
 
         for spawned in [&mut gentle, &mut stubborn] {
             assert!(spawned.child.try_wait().unwrap().is_some());
@@ -172,7 +172,7 @@ mod tests {
     #[tokio::test]
     async fn vacuuming_a_vm_with_nothing_left_succeeds() {
         let temporary = tempfile::tempdir().unwrap();
-        vacuum(&paths(temporary.path(), "gone"), &Timing::quick())
+        vacuum(&paths(temporary.path(), "gone"), &ProcessTiming::quick())
             .await
             .unwrap();
     }

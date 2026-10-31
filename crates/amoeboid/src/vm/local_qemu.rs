@@ -32,7 +32,7 @@ use crate::domain::process::{LocalRole, Nonce, ProcessIdentity, ProcessRole, Sco
 use crate::plan;
 use crate::plan::argv::IdMap;
 use crate::runtime::paths::VmPaths;
-use crate::runtime::timing::Timing;
+use crate::runtime::timing::ProcessTiming;
 
 const SOCKET_POLL: Duration = Duration::from_millis(100);
 
@@ -86,8 +86,8 @@ pub enum Placement {
 pub struct LocalQemuSetup {
     pub report: DerivedActorRef<HypervisorObservation>,
     pub placement: Placement,
-    /// Powerdown and terminate graces, socket wait.
-    pub timing: Timing,
+    /// Terminate grace and socket wait; the powerdown grace comes with each stop.
+    pub timing: ProcessTiming,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -119,7 +119,7 @@ pub struct LocalQemu;
 pub struct LocalQemuState {
     report: DerivedActorRef<HypervisorObservation>,
     placement: Placement,
-    timing: Timing,
+    timing: ProcessTiming,
     generation: Option<Generation>,
     processes: BTreeMap<ProcessRole, ProcessIdentity>,
     machine: Machine,
@@ -170,7 +170,8 @@ impl Actor for LocalQemu {
                 generation,
                 vm,
                 processes,
-            }) => stop(&myself, state, generation, &vm, processes).await,
+                grace,
+            }) => stop(&myself, state, generation, &vm, processes, grace).await,
             LocalQemuMessage::Escalate { generation, signal } => {
                 let qemu = ProcessRole::Local(LocalRole::Qemu);
                 let stopping = matches!(state.machine, Machine::Stopping { .. });
@@ -459,6 +460,7 @@ async fn stop(
     generation: Generation,
     vm: &VmPaths,
     processes: BTreeMap<ProcessRole, ProcessIdentity>,
+    grace: Duration,
 ) {
     if state.generation != Some(generation) {
         state.begin(generation);
@@ -483,7 +485,7 @@ async fn stop(
         return;
     }
     let next = match qmp::powerdown(&vm.control_socket()).await {
-        Ok(()) => state.timing.powerdown_grace,
+        Ok(()) => grace,
         Err(error) => {
             tracing::warn!(%error, "can't ask the guest to power off; terminating qemu");
             Duration::ZERO
@@ -623,7 +625,7 @@ mod tests {
             LocalQemuSetup {
                 report: fixture.report.clone(),
                 placement: Placement::Direct,
-                timing: crate::runtime::timing::Timing::quick(),
+                timing: crate::runtime::timing::ProcessTiming::quick(),
             },
         )
         .await
@@ -801,6 +803,7 @@ mod tests {
                 generation,
                 vm: fixture.vm.clone(),
                 processes: started.clone(),
+                grace: Duration::from_secs(1),
             })
             .unwrap();
         assert_eq!(until_stopped(&mut fixture.observations).await, None);
@@ -825,7 +828,7 @@ mod tests {
             LocalQemuSetup {
                 report: fixture.report.clone(),
                 placement: Placement::Direct,
-                timing: crate::runtime::timing::Timing::quick(),
+                timing: crate::runtime::timing::ProcessTiming::quick(),
             },
         )
         .await
@@ -844,6 +847,7 @@ mod tests {
                 generation,
                 vm: fixture.vm.clone(),
                 processes: started.clone(),
+                grace: Duration::from_secs(1),
             })
             .unwrap();
         assert_eq!(until_stopped(&mut fixture.observations).await, None);
@@ -900,7 +904,7 @@ mod tests {
             LocalQemuSetup {
                 report: fixture.report.clone(),
                 placement: Placement::Direct,
-                timing: crate::runtime::timing::Timing::quick(),
+                timing: crate::runtime::timing::ProcessTiming::quick(),
             },
         )
         .await

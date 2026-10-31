@@ -27,7 +27,8 @@ use crate::persistent::{Persistent, PersistentArgs};
 use crate::protocol::RuntimeId;
 use crate::vm::twin::{FromVm, TwinMessage, VmSetup, VmTwin};
 
-/// How often and how fast a VM's twin is restarted before the VM is given up.
+/// How often and how fast a VM's twin is restarted before the VM is given up. Comes from
+/// `daemon_config.toml` (`config::daemon::RestartConfig::policy`), which holds the defaults.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RestartPolicy {
     /// Restarts allowed within `window`; the next failure gives the VM up.
@@ -37,18 +38,6 @@ pub struct RestartPolicy {
     /// The first restart's delay; each further one doubles it.
     pub backoff_first: Duration,
     pub backoff_max: Duration,
-}
-
-impl RestartPolicy {
-    #[must_use]
-    pub fn production() -> Self {
-        Self {
-            max_restarts: 5,
-            window: Duration::from_secs(600),
-            backoff_first: Duration::from_secs(1),
-            backoff_max: Duration::from_secs(30),
-        }
-    }
 }
 
 /// What kind of failure ended a twin; the restart reaction depends on it.
@@ -213,8 +202,11 @@ pub struct MachineSupervisorArgs {
     pub from_vm: DerivedActorRef<FromVm>,
     pub journal: ActorRef<JournalMessage>,
     pub paths: RuntimePaths,
-    /// Includes the restart policy and timing.
+    /// How twins run their children.
     pub vm_defaults: VmDefaults,
+    pub restart: RestartPolicy,
+    /// How long a twin waits for the journal to persist.
+    pub persist_timeout: Duration,
 }
 
 pub struct MachineSupervisor;
@@ -401,9 +393,9 @@ async fn spawn(
                             root: args.from_vm.clone(),
                             build: args.vm_defaults.build.clone(),
                             placement: args.vm_defaults.placement,
-                            timing: args.vm_defaults.timing,
+                            timing: args.vm_defaults.process,
                         },
-                        persist_timeout: args.vm_defaults.timing.persist_timeout,
+                        persist_timeout: args.persist_timeout,
                     },
                     myself.get_cell(),
                 )
@@ -450,7 +442,7 @@ fn failed(
     failure: TwinFailure,
 ) {
     let (history, decision) = decide(
-        &state.args.vm_defaults.restart,
+        &state.args.restart,
         history,
         failure.clone(),
         Instant::now(),
@@ -493,7 +485,7 @@ mod tests {
 
     use super::*;
     use crate::domain::path::AbsolutePath;
-    use crate::journal::{Journal, JournalArgs, Persistence};
+    use crate::journal::{Journal, JournalArgs};
     use crate::testing::{next, probe};
     use crate::vm::builder::BuildCommand;
     use crate::vm::local_qemu::Placement;
@@ -653,8 +645,7 @@ mod tests {
             None,
             Journal,
             JournalArgs {
-                persistence: Persistence::Memory,
-                paths: paths.clone(),
+                store: crate::journal::JournalStore::Memory,
                 clock: crate::clock::Clock::System,
             },
         )
@@ -675,9 +666,10 @@ mod tests {
                 vm_defaults: VmDefaults {
                     build: BuildCommand::Scripted(crate::plan::argv::Argv::for_tests(&["true"])),
                     placement: Placement::Direct,
-                    restart: policy,
-                    timing: crate::runtime::timing::Timing::quick(),
+                    process: crate::runtime::timing::ProcessTiming::quick(),
                 },
+                restart: policy,
+                persist_timeout: Duration::from_secs(5),
             },
         )
         .await

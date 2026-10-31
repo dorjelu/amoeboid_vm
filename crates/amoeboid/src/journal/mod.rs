@@ -11,8 +11,8 @@ use ractor::{Actor, ActorProcessingErr, ActorRef, DerivedActorRef};
 use serde::Serialize;
 
 use crate::clock::Clock;
+use crate::domain::path::AbsolutePath;
 use crate::nonempty::NonEmpty;
-use crate::runtime::paths::RuntimePaths;
 use store::Store;
 
 /// `vm/work`, `runtime`: `/`-joined, non-empty segments of `[A-Za-z0-9-]` (VM names are
@@ -229,18 +229,17 @@ pub enum PersistFailure {
 #[error("{0}")]
 pub struct StoreError(String);
 
-/// Public selector; the store itself stays private so no outside implementation can weaken the
-/// append-position fence.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Persistence {
-    /// At [`RuntimePaths::journal`], created `0600`.
-    Sqlite,
+/// Where the journal keeps its streams. Public selector; the store itself stays private so no
+/// outside implementation can weaken the append-position fence.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum JournalStore {
+    /// A SQLite file, created `0600` and opened without following a symlink.
+    Sqlite(AbsolutePath),
     Memory,
 }
 
 pub struct JournalArgs {
-    pub persistence: Persistence,
-    pub paths: RuntimePaths,
+    pub store: JournalStore,
     /// Stamps every append and tombstone (`at`); identifiers and times come from the journal,
     /// never from an event handler.
     pub clock: Clock,
@@ -263,7 +262,7 @@ impl Actor for Journal {
         _myself: ActorRef<JournalMessage>,
         args: JournalArgs,
     ) -> Result<JournalState, ActorProcessingErr> {
-        let store = Store::open(args.persistence, &args.paths).await?;
+        let store = Store::open(&args.store).await?;
         Ok(JournalState {
             store,
             clock: args.clock,

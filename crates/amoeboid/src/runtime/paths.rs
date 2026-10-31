@@ -30,6 +30,65 @@ pub enum LocationError {
 
 // TODO: give the runtime's own files (daemon.lock, journal.sqlite) a location separate from
 // the VM data directory (decision 0002, open questions).
+/// The operator's configuration: `$XDG_CONFIG_HOME/amoeboid` (else `~/.config/amoeboid`),
+/// and the home directory `~/…` in its files stands for.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ConfigPaths {
+    directory: AbsolutePath,
+    home: AbsolutePath,
+}
+
+impl ConfigPaths {
+    #[must_use]
+    pub fn new(directory: AbsolutePath, home: AbsolutePath) -> Self {
+        Self { directory, home }
+    }
+
+    /// # Errors
+    ///
+    /// `HOME` is unset or not absolute.
+    pub fn from_env(
+        environment: impl Fn(&'static str) -> Option<OsString>,
+    ) -> Result<Self, LocationError> {
+        let home =
+            PathBuf::from(environment("HOME").ok_or(LocationError::MissingEnvironment("HOME"))?);
+        let directory = match environment("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
+            Some(xdg) => PathBuf::from(xdg).join("amoeboid"),
+            None => home.join(".config/amoeboid"),
+        };
+        Ok(Self {
+            directory: AbsolutePath::parse(directory)?,
+            home: AbsolutePath::parse(home)?,
+        })
+    }
+
+    #[must_use]
+    pub fn directory(&self) -> &AbsolutePath {
+        &self.directory
+    }
+
+    #[must_use]
+    pub fn home(&self) -> &AbsolutePath {
+        &self.home
+    }
+
+    #[must_use]
+    pub fn run_config(&self) -> AbsolutePath {
+        self.directory.join("run_config.toml")
+    }
+
+    #[must_use]
+    pub fn daemon_config(&self) -> AbsolutePath {
+        self.directory.join("daemon_config.toml")
+    }
+
+    /// One directory per preset: `presets/NAME`.
+    #[must_use]
+    pub fn presets(&self) -> AbsolutePath {
+        self.directory.join("nix_presets")
+    }
+}
+
 /// `data` holds `daemon.lock`, the journal and one directory per VM; `run`
 /// (`$XDG_RUNTIME_DIR/amoeboid`, `0700`) holds the socket and one runtime directory per VM.
 #[derive(Clone, PartialEq, Eq, Debug)]

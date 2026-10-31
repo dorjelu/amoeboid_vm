@@ -104,6 +104,17 @@ pub struct VmSpec {
     pub account: Account,
     pub nix_config: NixConfig,
     pub boot_timeout_seconds: u32,
+    /// How long the guest gets to power off when stopped; absent in starts recorded before it
+    /// existed.
+    #[serde(default = "default_powerdown_grace_seconds")]
+    pub powerdown_grace_seconds: u32,
+}
+
+/// A stop's powerdown grace when no start recorded one.
+pub const DEFAULT_POWERDOWN_GRACE_SECONDS: u32 = 30;
+
+fn default_powerdown_grace_seconds() -> u32 {
+    DEFAULT_POWERDOWN_GRACE_SECONDS
 }
 
 /// Where a VM is, as the operator sees it: the twin's state without its internals.

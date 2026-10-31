@@ -182,6 +182,31 @@ pub fn decode(text: &str, home: &AbsolutePath) -> Result<DaemonConfig, ConfigErr
     )
 }
 
+/// `daemon_config.toml`, or the defaults when there is none.
+///
+/// # Errors
+///
+/// It can't be read, or it is invalid.
+pub fn load(paths: &crate::runtime::paths::ConfigPaths) -> Result<DaemonConfig, super::LoadError> {
+    match super::read(&paths.daemon_config())? {
+        None => Ok(DaemonConfig::default()),
+        Some(text) => Ok(decode(&text, paths.home())?),
+    }
+}
+
+impl RestartConfig {
+    /// The machine supervisor's policy.
+    #[must_use]
+    pub fn policy(&self) -> crate::runtime::machine_supervisor::RestartPolicy {
+        crate::runtime::machine_supervisor::RestartPolicy {
+            max_restarts: self.max_restarts,
+            window: self.window.duration(),
+            backoff_first: self.backoff_first.duration(),
+            backoff_max: self.backoff_max.duration(),
+        }
+    }
+}
+
 /// Canonical text: every key written (the journal path only when set), paths under `home` as
 /// `~/…`.
 #[must_use]

@@ -1,18 +1,12 @@
-//! How long the runtime waits for things (0003 §Time): values handed in, so each test picks its
-//! own and production code has no test-only constants.
+//! Process-level waits (0003 §Time, §Configuration): set by the code that builds the runtime,
+//! never by a configuration file, so each test picks its own. The timeouts operators tune come
+//! from the configuration files instead (status, persist and restart from
+//! `daemon_config.toml`; boot and powerdown from `run_config.toml`).
 
 use std::time::Duration;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Timing {
-    /// From qemu starting to the guest's sshd answering.
-    pub boot_timeout: Duration,
-    /// How long a status question waits for twins; later answers are dropped.
-    pub status_timeout: Duration,
-    /// No `Persisted` within this: a persistent actor fails and is restarted.
-    pub persist_timeout: Duration,
-    /// How long the guest gets to power off after the ACPI request, before qemu is terminated.
-    pub powerdown_grace: Duration,
+pub struct ProcessTiming {
     /// How long qemu gets after SIGTERM before SIGKILL.
     pub terminate_grace: Duration,
     /// How long virtiofsd may take to create its sockets.
@@ -23,14 +17,10 @@ pub struct Timing {
     pub vacuum_kill_grace: Duration,
 }
 
-impl Timing {
+impl ProcessTiming {
     #[must_use]
     pub fn production() -> Self {
         Self {
-            boot_timeout: Duration::from_secs(120),
-            status_timeout: Duration::from_secs(5),
-            persist_timeout: Duration::from_secs(10),
-            powerdown_grace: Duration::from_secs(30),
             terminate_grace: Duration::from_secs(10),
             socket_wait: Duration::from_secs(10),
             vacuum_terminate_grace: Duration::from_secs(10),
@@ -43,7 +33,6 @@ impl Timing {
     #[must_use]
     pub fn quick() -> Self {
         Self {
-            powerdown_grace: Duration::from_secs(1),
             terminate_grace: Duration::from_secs(1),
             socket_wait: Duration::from_secs(2),
             vacuum_terminate_grace: Duration::from_secs(1),

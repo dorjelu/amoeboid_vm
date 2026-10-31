@@ -22,6 +22,45 @@ use toml::{Table, Value};
 use crate::domain::path::AbsolutePath;
 use crate::nonempty::NonEmpty;
 
+/// Reading a configuration file failed: it can't be read, or it is invalid.
+#[derive(Debug, thiserror::Error)]
+pub enum LoadError {
+    #[error("can't read {path}: {source}")]
+    Read {
+        path: String,
+        source: std::io::Error,
+    },
+    #[error(transparent)]
+    Invalid(#[from] ConfigErrors),
+}
+
+impl crate::diagnostic::Diagnostic for LoadError {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::Read { .. } => "config.read",
+            Self::Invalid(errors) => errors.code(),
+        }
+    }
+    fn hint(&self) -> Option<String> {
+        match self {
+            Self::Read { .. } => None,
+            Self::Invalid(errors) => errors.hint(),
+        }
+    }
+}
+
+/// The file's text; `None` when there is no file (the defaults apply).
+fn read(path: &AbsolutePath) -> Result<Option<String>, LoadError> {
+    match std::fs::read_to_string(path.as_path()) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(LoadError::Read {
+            path: path.display().to_string(),
+            source,
+        }),
+    }
+}
+
 /// Which file a problem is in.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ConfigFile {

@@ -43,6 +43,8 @@ pub enum HypervisorCommand {
         generation: Generation,
         vm: VmPaths,
         processes: BTreeMap<ProcessRole, ProcessIdentity>,
+        /// How long the guest gets to power off before it is stopped by force.
+        grace: std::time::Duration,
     },
     /// After a runtime restart: watch these if they are still the same processes.
     Adopt {

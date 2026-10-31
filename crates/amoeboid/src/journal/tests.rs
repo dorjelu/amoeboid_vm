@@ -10,6 +10,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use super::store::Store;
 use super::*;
 use crate::domain::path::AbsolutePath;
+use crate::runtime::paths::RuntimePaths;
 
 fn id(s: &str) -> PersistenceId {
     PersistenceId::parse(s.to_owned()).unwrap()
@@ -49,13 +50,14 @@ fn fixture() -> Fixture {
 }
 
 async fn each_store(test: impl AsyncFn(Store, &Fixture)) {
-    for persistence in [Persistence::Memory, Persistence::Sqlite] {
+    for sqlite in [false, true] {
         let fixture = fixture();
-        test(
-            Store::open(persistence, &fixture.paths).await.unwrap(),
-            &fixture,
-        )
-        .await;
+        let store = if sqlite {
+            JournalStore::Sqlite(fixture.paths.journal())
+        } else {
+            JournalStore::Memory
+        };
+        test(Store::open(&store).await.unwrap(), &fixture).await;
     }
 }
 
@@ -159,7 +161,7 @@ async fn streams_are_listed_by_parent_and_only_below_it() {
 #[tokio::test]
 async fn sqlite_events_survive_reopening() {
     let fixture = fixture();
-    let mut store = Store::open(Persistence::Sqlite, &fixture.paths)
+    let mut store = Store::open(&JournalStore::Sqlite(fixture.paths.journal()))
         .await
         .unwrap();
     store
@@ -167,7 +169,7 @@ async fn sqlite_events_survive_reopening() {
         .await
         .unwrap();
     drop(store);
-    let mut reopened = Store::open(Persistence::Sqlite, &fixture.paths)
+    let mut reopened = Store::open(&JournalStore::Sqlite(fixture.paths.journal()))
         .await
         .unwrap();
     assert_eq!(reopened.replay(&id("vm/a")).await.unwrap().events.len(), 1);
@@ -176,7 +178,7 @@ async fn sqlite_events_survive_reopening() {
 #[tokio::test]
 async fn the_sqlite_file_is_created_owner_only() {
     let fixture = fixture();
-    Store::open(Persistence::Sqlite, &fixture.paths)
+    Store::open(&JournalStore::Sqlite(fixture.paths.journal()))
         .await
         .unwrap();
     let mode = std::fs::metadata(fixture.paths.journal())
@@ -192,7 +194,7 @@ async fn a_symlink_at_the_journal_path_is_refused() {
     let target = fixture.paths.data().as_path().join("elsewhere");
     std::os::unix::fs::symlink(&target, fixture.paths.journal()).unwrap();
     assert!(
-        Store::open(Persistence::Sqlite, &fixture.paths)
+        Store::open(&JournalStore::Sqlite(fixture.paths.journal()))
             .await
             .is_err()
     );
@@ -242,13 +244,11 @@ async fn the_journal_actor_answers_persist_and_replay_through_derived_refs() {
         }
     }
 
-    let fixture = fixture();
     let (journal, _) = Actor::spawn(
         None,
         Journal,
         JournalArgs {
-            persistence: Persistence::Memory,
-            paths: fixture.paths.clone(),
+            store: crate::journal::JournalStore::Memory,
             clock: crate::clock::Clock::System,
         },
     )
@@ -387,7 +387,7 @@ async fn a_version_1_journal_is_migrated_and_keeps_its_events() {
             )
             .unwrap();
     }
-    let mut store = Store::open(Persistence::Sqlite, &fixture.paths)
+    let mut store = Store::open(&JournalStore::Sqlite(fixture.paths.journal()))
         .await
         .unwrap();
     assert_eq!(store.replay(&id("vm/a")).await.unwrap().events.len(), 1);
@@ -403,8 +403,7 @@ async fn appends_and_tombstones_are_stamped_by_the_journal_clock() {
         None,
         Journal,
         JournalArgs {
-            persistence: Persistence::Sqlite,
-            paths: fixture.paths.clone(),
+            store: crate::journal::JournalStore::Sqlite(fixture.paths.journal()),
             clock: crate::clock::Clock::Manual(manual.clone()),
         },
     )

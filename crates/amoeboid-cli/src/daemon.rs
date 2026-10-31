@@ -9,8 +9,11 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+use amoeboid::adapters::files;
+use amoeboid::config::daemon::DaemonConfig;
 use amoeboid::diagnostic::Report;
 use amoeboid::plan::units;
+use amoeboid::runtime::paths::ConfigPaths;
 
 fn failure(code: &str, message: String, hint: Option<&str>) -> Report {
     Report {
@@ -112,7 +115,23 @@ pub fn install() -> Result<Vec<String>, Report> {
         })?;
         written.push(target.display().to_string());
     }
+    if let Some(config) = seed_daemon_config()? {
+        written.push(config);
+    }
     systemctl(&["daemon-reload"])?;
     systemctl(&["enable", "--now", units::SOCKET_NAME])?;
     Ok(written)
+}
+
+/// Writes `daemon_config.toml` with the defaults unless it exists; the written path, if any.
+fn seed_daemon_config() -> Result<Option<String>, Report> {
+    let paths = ConfigPaths::from_env(std::env::var_os).map_err(|error| Report::of(&error))?;
+    let target = paths.daemon_config();
+    if target.as_path().exists() {
+        return Ok(None);
+    }
+    files::ensure_directory(paths.directory(), 0o700).map_err(|error| Report::of(&error))?;
+    let text = amoeboid::config::daemon::encode(&DaemonConfig::default(), paths.home());
+    files::write_atomically(&target, text.as_bytes(), 0o600).map_err(|error| Report::of(&error))?;
+    Ok(Some(target.display().to_string()))
 }

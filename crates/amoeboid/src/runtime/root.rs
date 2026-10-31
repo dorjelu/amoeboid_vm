@@ -25,25 +25,26 @@
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 use ractor::{Actor, ActorProcessingErr, ActorRef, DerivedActorRef, SupervisionEvent};
 
 use super::listener::{Listener, ListenerArgs};
 use super::machine_supervisor::{
     MachineReport, MachineSupervisor, MachineSupervisorArgs, MachineSupervisorMessage,
-    RestartPolicy,
 };
-use super::paths::RuntimePaths;
+use super::paths::{ConfigPaths, RuntimePaths};
 use super::quarantine::{self, QuarantineCause, QuarantineEvent};
-use super::timing::Timing;
+use super::timing::ProcessTiming;
 use crate::clock::Clock;
+use crate::config::daemon::DaemonConfig;
 use crate::diagnostic::Report;
 use crate::domain::lifecycle::Incarnation;
 use crate::domain::path::AbsolutePath;
 use crate::domain::share::{ShareRequest, Shares};
 use crate::domain::vm_name::VmName;
 use crate::journal::{
-    BatchId, Journal, JournalArgs, JournalMessage, JournalReply, PersistFailure, Persistence,
+    BatchId, Journal, JournalArgs, JournalMessage, JournalReply, JournalStore, PersistFailure,
     PersistenceId, Replay, Sequence, StoreError,
 };
 use crate::nonempty::NonEmpty;
@@ -129,14 +130,13 @@ derived!(
         | RootMessage::Vacuumed { .. }
 );
 
-/// How twins run their children (`nix build` and scoped processes in production) and how
-/// often a failed twin is restarted.
+/// How twins run their children (`nix build` and scoped processes in production) and how long
+/// processes get; set by whoever builds the runtime, never by a configuration file.
 #[derive(Clone, Debug)]
 pub struct VmDefaults {
     pub build: BuildCommand,
     pub placement: Placement,
-    pub restart: RestartPolicy,
-    pub timing: Timing,
+    pub process: ProcessTiming,
 }
 
 impl VmDefaults {
@@ -145,15 +145,17 @@ impl VmDefaults {
         Self {
             build: BuildCommand::Nix,
             placement: Placement::Scoped,
-            restart: RestartPolicy::production(),
-            timing: Timing::production(),
+            process: ProcessTiming::production(),
         }
     }
 }
 
 pub struct RootArgs {
     pub id: RuntimeId,
-    pub persistence: Persistence,
+    pub journal: JournalStore,
+    pub config: ConfigPaths,
+    /// Runtime-wide settings, read when the runtime started.
+    pub daemon: DaemonConfig,
     pub paths: RuntimePaths,
     pub listener: tokio::net::UnixListener,
     /// The guest account of every VM: the user the runtime runs as.
@@ -170,8 +172,10 @@ pub struct RootState {
     /// `quarantine`: the parent of every quarantine record, `quarantine/<name>`.
     quarantine_streams: PersistenceId,
     paths: RuntimePaths,
+    config: ConfigPaths,
     account: Account,
-    timing: Timing,
+    process: ProcessTiming,
+    status_timeout: Duration,
     journal: ActorRef<JournalMessage>,
     machines: ActorRef<MachineSupervisorMessage>,
     /// Where each VM's requests go, as the machine supervisor last reported.
@@ -357,14 +361,13 @@ impl Actor for Root {
             Some(format!("{}/journal", args.id)),
             Journal,
             JournalArgs {
-                persistence: args.persistence,
-                paths: args.paths.clone(),
+                store: args.journal,
                 clock: args.clock,
             },
             myself.get_cell(),
         )
         .await?;
-        let timing = args.vm_defaults.timing;
+        let process = args.vm_defaults.process;
         let (machines, _) = Actor::spawn_linked(
             Some(format!("{}/machines", args.id)),
             MachineSupervisor,
@@ -375,6 +378,8 @@ impl Actor for Root {
                 journal: journal.clone(),
                 paths: args.paths.clone(),
                 vm_defaults: args.vm_defaults,
+                restart: args.daemon.restart.policy(),
+                persist_timeout: args.daemon.timeouts.persist.duration(),
             },
             myself.get_cell(),
         )
@@ -404,8 +409,10 @@ impl Actor for Root {
             vm_streams,
             quarantine_streams,
             paths: args.paths,
+            config: args.config,
             account: args.account,
-            timing,
+            process,
+            status_timeout: args.daemon.timeouts.status.duration(),
             journal,
             machines,
             routes: BTreeMap::new(),
@@ -935,6 +942,8 @@ fn start(
     nix_config: Option<AbsolutePath>,
     reply_to: &DerivedActorRef<ServerFrame>,
 ) -> Result<(), Report> {
+    // Read at every start: a change to the file applies to the next start.
+    let run = crate::config::run::load(&state.config).map_err(|error| Report::of(&error))?;
     let home = AbsolutePath::parse(state.account.home.as_str().into())
         .map_err(|error| Report::of(&error))?;
     let shares = Shares::validate(shares, &[home], |directory| {
@@ -945,8 +954,8 @@ fn start(
         shares,
         account: state.account.clone(),
         nix_config: nix_config.map_or(NixConfig::Existing, NixConfig::From),
-        boot_timeout_seconds: u32::try_from(state.timing.boot_timeout.as_secs())
-            .unwrap_or(u32::MAX),
+        boot_timeout_seconds: run.timeouts.boot.get(),
+        powerdown_grace_seconds: run.timeouts.powerdown.get(),
     };
     state.waiters.insert(operation, (name, reply_to.clone()));
     twin.cast(PersistentMessage::Command(VmCommand::Start {
@@ -1209,12 +1218,12 @@ fn remove(myself: &ActorRef<RootMessage>, state: &mut RootState, name: &VmName) 
         vacuum.step = VacuumStep::Removing;
     }
     let paths = state.paths.vm(name);
-    let timing = state.timing;
+    let process = state.process;
     let root = myself.clone();
     let name = name.clone();
     tokio::spawn(async move {
         let result = match paths {
-            Ok(paths) => vacuum::vacuum(&paths, &timing)
+            Ok(paths) => vacuum::vacuum(&paths, &process)
                 .await
                 .map_err(|error| Report::of(&error)),
             Err(error) => Err(Report::of(&error)),
@@ -1375,7 +1384,7 @@ fn status(
     for twin in asked {
         let _ = twin.cast(PersistentMessage::Command(VmCommand::Status { operation }));
     }
-    myself.send_after(state.timing.status_timeout, move || {
-        RootMessage::StatusTimeout { operation }
+    myself.send_after(state.status_timeout, move || RootMessage::StatusTimeout {
+        operation,
     });
 }

@@ -244,6 +244,18 @@ pub fn decode(text: &str, home: &AbsolutePath) -> Result<RunConfig, ConfigErrors
     )
 }
 
+/// `run_config.toml`, or the defaults when there is none.
+///
+/// # Errors
+///
+/// It can't be read, or it is invalid.
+pub fn load(paths: &crate::runtime::paths::ConfigPaths) -> Result<RunConfig, super::LoadError> {
+    match super::read(&paths.run_config())? {
+        None => Ok(RunConfig::default()),
+        Some(text) => Ok(decode(&text, paths.home())?),
+    }
+}
+
 /// Canonical text: every key written, paths under `home` as `~/…`, modes explicit.
 #[must_use]
 pub fn encode(config: &RunConfig, home: &AbsolutePath) -> String {

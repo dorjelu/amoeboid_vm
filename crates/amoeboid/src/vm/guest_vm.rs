@@ -305,6 +305,7 @@ mod tests {
             },
             nix_config: NixConfig::Existing,
             boot_timeout_seconds: 60,
+            powerdown_grace_seconds: 30,
         }
     }
 
