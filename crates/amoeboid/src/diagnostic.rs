@@ -282,9 +282,10 @@ mod tests {
             Box::new(crate::vm::twin::TwinError::GenerationsExhausted),
             Box::new(crate::vm::twin::TwinError::Stopping),
             Box::new(crate::vm::twin::TwinError::Cancelled),
-            Box::new(crate::vm::local_qemu::LocalQemuError::SocketsMissing(
-                "d1.sock".into(),
-            )),
+            Box::new(crate::vm::local_qemu::LocalQemuError::SocketsMissing {
+                sockets: "d1.sock".into(),
+                waited: std::time::Duration::from_secs(10),
+            }),
             Box::new(crate::vm::local_qemu::LocalQemuError::QemuExited(
                 crate::adapters::process::Exit::Code(1),
             )),

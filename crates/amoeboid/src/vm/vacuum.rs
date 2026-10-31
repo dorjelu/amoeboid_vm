@@ -4,7 +4,7 @@
 //! stopped the VM gracefully and been stopped; whatever is left is ended by force.
 //!
 //! ```text
-//! find_by_vm ─▶ TERM each ─▶ wait ≤ TERMINATE_GRACE ─▶ KILL survivors ─▶ wait ≤ KILL_GRACE
+//! find_by_vm ─▶ TERM each ─▶ wait ≤ terminate grace ─▶ KILL survivors ─▶ wait ≤ kill grace
 //!            ─▶ any survivor: Survived (directories kept)   else: remove runtime, state
 //! ```
 
@@ -14,11 +14,8 @@ use crate::adapters::files::{self, FileError};
 use crate::adapters::process::{self, Liveness, ProcessError, Signal};
 use crate::domain::process::ProcessIdentity;
 use crate::runtime::paths::VmPaths;
+use crate::runtime::timing::Timing;
 
-/// How long the VM's processes get after SIGTERM before SIGKILL.
-const TERMINATE_GRACE: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 10 });
-/// How long the kernel gets to take killed processes away.
-const KILL_GRACE: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, thiserror::Error)]
@@ -55,13 +52,13 @@ impl crate::diagnostic::Diagnostic for VacuumError {
 /// # Errors
 ///
 /// `/proc` can't be read, a process survives `SIGKILL`, or a directory can't be removed.
-pub async fn vacuum(vm: &VmPaths) -> Result<(), VacuumError> {
+pub async fn vacuum(vm: &VmPaths, timing: &Timing) -> Result<(), VacuumError> {
     let found = process::find_by_vm(vm.name())?;
     if !found.is_empty() {
         tracing::info!(vm = %vm.name(), processes = found.len(), "ending the VM's processes");
     }
-    let survivors = end(found, Signal::Terminate, TERMINATE_GRACE).await?;
-    let survivors = end(survivors, Signal::Kill, KILL_GRACE).await?;
+    let survivors = end(found, Signal::Terminate, timing.vacuum_terminate_grace).await?;
+    let survivors = end(survivors, Signal::Kill, timing.vacuum_kill_grace).await?;
     if !survivors.is_empty() {
         return Err(VacuumError::Survived(survivors.len()));
     }
@@ -159,7 +156,7 @@ mod tests {
         // Give the stubborn shell time to install its trap.
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        vacuum(&vm).await.unwrap();
+        vacuum(&vm, &Timing::quick()).await.unwrap();
 
         for spawned in [&mut gentle, &mut stubborn] {
             assert!(spawned.child.try_wait().unwrap().is_some());
@@ -175,6 +172,8 @@ mod tests {
     #[tokio::test]
     async fn vacuuming_a_vm_with_nothing_left_succeeds() {
         let temporary = tempfile::tempdir().unwrap();
-        vacuum(&paths(temporary.path(), "gone")).await.unwrap();
+        vacuum(&paths(temporary.path(), "gone"), &Timing::quick())
+            .await
+            .unwrap();
     }
 }

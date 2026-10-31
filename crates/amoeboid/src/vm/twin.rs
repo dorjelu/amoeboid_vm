@@ -279,6 +279,7 @@ pub struct VmSetup {
     pub root: DerivedActorRef<FromVm>,
     pub build: BuildCommand,
     pub placement: Placement,
+    pub timing: crate::runtime::timing::Timing,
 }
 
 /// Refs to the twin's children (spawned by the twin itself when it starts) and to Root.
@@ -584,6 +585,7 @@ impl Behaviour for VmTwin {
             LocalQemuSetup {
                 report: twin.get_derived(),
                 placement: setup.placement,
+                timing: setup.timing,
             },
             twin.get_cell(),
         )

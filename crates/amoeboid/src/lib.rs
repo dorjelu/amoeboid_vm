@@ -2,6 +2,7 @@
 
 pub mod adapters;
 pub mod client;
+pub mod clock;
 pub mod diagnostic;
 pub mod domain;
 pub mod journal;

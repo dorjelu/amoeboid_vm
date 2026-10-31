@@ -49,6 +49,7 @@ async fn start_with(
             home: crate::domain::account::GuestHome::parse("/home/alice".into()).unwrap(),
         },
         vm_defaults,
+        clock: crate::clock::Clock::System,
     })
     .await
 }
@@ -211,6 +212,7 @@ async fn a_new_runtime_starts_every_known_twin_which_recovers_on_its_own() {
         build: BuildCommand::Scripted(crate::plan::argv::Argv::for_tests(&["sleep", "3"])),
         placement: Placement::Direct,
         restart: super::machine_supervisor::RestartPolicy::production(),
+        timing: super::timing::Timing::quick(),
     };
     let first = start_with(&fixture.paths, Persistence::Sqlite, slow_build.clone())
         .await
@@ -257,6 +259,7 @@ async fn a_new_runtime_starts_every_known_twin_which_recovers_on_its_own() {
         crate::journal::JournalArgs {
             persistence: Persistence::Sqlite,
             paths: fixture.paths.clone(),
+            clock: crate::clock::Clock::System,
         },
     )
     .await
@@ -323,6 +326,7 @@ async fn journal_exchange(
         crate::journal::JournalArgs {
             persistence: Persistence::Sqlite,
             paths: paths.clone(),
+            clock: crate::clock::Clock::System,
         },
     )
     .await
@@ -635,6 +639,7 @@ async fn a_vacuumed_name_starts_as_a_new_vm_after_the_tombstone() {
         build: BuildCommand::Scripted(crate::plan::argv::Argv::for_tests(&["sleep", seconds])),
         placement: Placement::Direct,
         restart: super::machine_supervisor::RestartPolicy::production(),
+        timing: super::timing::Timing::quick(),
     };
     let runtime = start_with(&fixture.paths, Persistence::Sqlite, defaults("3"))
         .await
@@ -702,6 +707,7 @@ async fn a_twin_out_of_restarts_fails_its_waiters_is_quarantined_and_can_be_rele
             max_restarts: 0,
             ..super::machine_supervisor::RestartPolicy::production()
         },
+        timing: super::timing::Timing::quick(),
     };
     let runtime = start_with(&fixture.paths, Persistence::Sqlite, defaults)
         .await

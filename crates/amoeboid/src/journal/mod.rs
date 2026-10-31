@@ -10,6 +10,7 @@ use std::num::NonZeroU64;
 use ractor::{Actor, ActorProcessingErr, ActorRef, DerivedActorRef};
 use serde::Serialize;
 
+use crate::clock::Clock;
 use crate::nonempty::NonEmpty;
 use crate::runtime::paths::RuntimePaths;
 use store::Store;
@@ -240,12 +241,16 @@ pub enum Persistence {
 pub struct JournalArgs {
     pub persistence: Persistence,
     pub paths: RuntimePaths,
+    /// Stamps every append and tombstone (`at`); identifiers and times come from the journal,
+    /// never from an event handler.
+    pub clock: Clock,
 }
 
 pub struct Journal;
 
 pub struct JournalState {
     store: Store,
+    clock: Clock,
 }
 
 impl Actor for Journal {
@@ -259,7 +264,10 @@ impl Actor for Journal {
         args: JournalArgs,
     ) -> Result<JournalState, ActorProcessingErr> {
         let store = Store::open(args.persistence, &args.paths).await?;
-        Ok(JournalState { store })
+        Ok(JournalState {
+            store,
+            clock: args.clock,
+        })
     }
 
     async fn handle(
@@ -285,7 +293,7 @@ impl Actor for Journal {
                 (reply, reply_to)
             }
             JournalMessage::Retire { id, reply_to } => {
-                let reply = match state.store.retire(&id).await {
+                let reply = match state.store.retire(&id, state.clock.now()).await {
                     Ok(()) => JournalReply::Retired { id },
                     Err(reason) => JournalReply::RetireFailed { id, reason },
                 };
@@ -298,7 +306,8 @@ impl Actor for Journal {
                 events,
                 reply_to,
             } => {
-                let reply = match state.store.append(&id, first, events).await {
+                let at = state.clock.now();
+                let reply = match state.store.append(&id, first, events, at).await {
                     Ok(last) => JournalReply::Persisted { batch, last },
                     Err(reason) => JournalReply::PersistFailed { batch, reason },
                 };

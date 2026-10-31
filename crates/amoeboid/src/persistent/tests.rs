@@ -445,6 +445,7 @@ async fn state_survives_killing_and_respawning_the_actor() {
         JournalArgs {
             persistence: Persistence::Memory,
             paths: RuntimePaths::under(directory.clone(), directory).unwrap(),
+            clock: crate::clock::Clock::System,
         },
     )
     .await

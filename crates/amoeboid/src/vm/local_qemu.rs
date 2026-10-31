@@ -32,14 +32,8 @@ use crate::domain::process::{LocalRole, Nonce, ProcessIdentity, ProcessRole, Sco
 use crate::plan;
 use crate::plan::argv::IdMap;
 use crate::runtime::paths::VmPaths;
+use crate::runtime::timing::Timing;
 
-/// How long the guest gets to power off after the ACPI request, before qemu is terminated.
-const POWERDOWN_GRACE: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 30 });
-/// How long qemu gets after SIGTERM before SIGKILL.
-const TERMINATE_GRACE: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 10 });
-
-/// How long virtiofsd may take to create its sockets.
-const SOCKET_WAIT: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 10 });
 const SOCKET_POLL: Duration = Duration::from_millis(100);
 
 /// The backend's mailbox: commands from the twin (through a `DerivedActorRef`) and its own
@@ -92,6 +86,8 @@ pub enum Placement {
 pub struct LocalQemuSetup {
     pub report: DerivedActorRef<HypervisorObservation>,
     pub placement: Placement,
+    /// Powerdown and terminate graces, socket wait.
+    pub timing: Timing,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -100,8 +96,8 @@ pub enum LocalQemuError {
     File(#[from] FileError),
     #[error(transparent)]
     Process(#[from] ProcessError),
-    #[error("virtiofsd didn't create {0} within {SOCKET_WAIT:?}")]
-    SocketsMissing(String),
+    #[error("virtiofsd didn't create {sockets} within {waited:?}")]
+    SocketsMissing { sockets: String, waited: Duration },
     #[error("qemu exited ({0:?})")]
     QemuExited(Exit),
     #[error("{role} exited ({exit:?}), so the VM lost a shared directory")]
@@ -123,6 +119,7 @@ pub struct LocalQemu;
 pub struct LocalQemuState {
     report: DerivedActorRef<HypervisorObservation>,
     placement: Placement,
+    timing: Timing,
     generation: Option<Generation>,
     processes: BTreeMap<ProcessRole, ProcessIdentity>,
     machine: Machine,
@@ -143,6 +140,7 @@ impl Actor for LocalQemu {
         std::future::ready(Ok(LocalQemuState {
             report: setup.report,
             placement: setup.placement,
+            timing: setup.timing,
             generation: None,
             processes: BTreeMap::new(),
             machine: Machine::Down,
@@ -182,7 +180,8 @@ impl Actor for LocalQemu {
                         let _ = process::signal(identity, signal);
                     }
                     if signal == Signal::Terminate {
-                        myself.send_after(TERMINATE_GRACE, move || LocalQemuMessage::Escalate {
+                        let grace = state.timing.terminate_grace;
+                        myself.send_after(grace, move || LocalQemuMessage::Escalate {
                             generation,
                             signal: Signal::Kill,
                         });
@@ -412,7 +411,7 @@ async fn boot(
             Watched::Child(spawned.child),
         );
     }
-    let deadline = tokio::time::Instant::now() + SOCKET_WAIT;
+    let deadline = tokio::time::Instant::now() + state.timing.socket_wait;
     loop {
         let missing: Vec<String> = shares
             .iter()
@@ -423,7 +422,10 @@ async fn boot(
             break;
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(LocalQemuError::SocketsMissing(missing.join(", ")));
+            return Err(LocalQemuError::SocketsMissing {
+                sockets: missing.join(", "),
+                waited: state.timing.socket_wait,
+            });
         }
         tokio::time::sleep(SOCKET_POLL).await;
     }
@@ -481,7 +483,7 @@ async fn stop(
         return;
     }
     let next = match qmp::powerdown(&vm.control_socket()).await {
-        Ok(()) => POWERDOWN_GRACE,
+        Ok(()) => state.timing.powerdown_grace,
         Err(error) => {
             tracing::warn!(%error, "can't ask the guest to power off; terminating qemu");
             Duration::ZERO
@@ -545,7 +547,7 @@ impl crate::diagnostic::Diagnostic for LocalQemuError {
         match self {
             Self::File(inner) => inner.code(),
             Self::Process(inner) => inner.code(),
-            Self::SocketsMissing(_) => "hypervisor.sockets_missing",
+            Self::SocketsMissing { .. } => "hypervisor.sockets_missing",
             Self::QemuExited(_) => "hypervisor.qemu_exited",
             Self::ShareExited { .. } => "hypervisor.share_exited",
             Self::Lost(_) => "hypervisor.lost",
@@ -555,7 +557,7 @@ impl crate::diagnostic::Diagnostic for LocalQemuError {
         match self {
             Self::File(inner) => inner.hint(),
             Self::Process(inner) => inner.hint(),
-            Self::SocketsMissing(_) | Self::ShareExited { .. } => {
+            Self::SocketsMissing { .. } | Self::ShareExited { .. } => {
                 Some("see the VM's virtiofsd.log".into())
             }
             Self::QemuExited(_) => Some("see the VM's console.log".into()),
@@ -621,6 +623,7 @@ mod tests {
             LocalQemuSetup {
                 report: fixture.report.clone(),
                 placement: Placement::Direct,
+                timing: crate::runtime::timing::Timing::quick(),
             },
         )
         .await
@@ -822,6 +825,7 @@ mod tests {
             LocalQemuSetup {
                 report: fixture.report.clone(),
                 placement: Placement::Direct,
+                timing: crate::runtime::timing::Timing::quick(),
             },
         )
         .await
@@ -896,6 +900,7 @@ mod tests {
             LocalQemuSetup {
                 report: fixture.report.clone(),
                 placement: Placement::Direct,
+                timing: crate::runtime::timing::Timing::quick(),
             },
         )
         .await

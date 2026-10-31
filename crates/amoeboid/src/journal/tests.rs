@@ -25,6 +25,10 @@ fn payloads(items: &[&str]) -> NonEmpty<EventPayload> {
     .unwrap()
 }
 
+fn at() -> crate::clock::Timestamp {
+    crate::clock::Timestamp::from_milliseconds(1_000)
+}
+
 fn sequence(n: u64) -> Sequence {
     Sequence(NonZeroU64::new(n).unwrap())
 }
@@ -59,11 +63,11 @@ async fn each_store(test: impl AsyncFn(Store, &Fixture)) {
 async fn appended_events_replay_in_order_with_positions_from_one() {
     each_store(async |mut store, _| {
         store
-            .append(&id("vm/a"), Sequence::FIRST, payloads(&["x", "y"]))
+            .append(&id("vm/a"), Sequence::FIRST, payloads(&["x", "y"]), at())
             .await
             .unwrap();
         let last = store
-            .append(&id("vm/a"), sequence(3), payloads(&["z"]))
+            .append(&id("vm/a"), sequence(3), payloads(&["z"]), at())
             .await
             .unwrap();
         assert_eq!(last, sequence(3));
@@ -91,11 +95,11 @@ async fn an_unknown_stream_replays_empty() {
 async fn appending_at_a_taken_position_is_a_conflict_and_writes_nothing() {
     each_store(async |mut store, _| {
         store
-            .append(&id("vm/a"), Sequence::FIRST, payloads(&["x"]))
+            .append(&id("vm/a"), Sequence::FIRST, payloads(&["x"]), at())
             .await
             .unwrap();
         let stale = store
-            .append(&id("vm/a"), Sequence::FIRST, payloads(&["stale"]))
+            .append(&id("vm/a"), Sequence::FIRST, payloads(&["stale"]), at())
             .await;
         assert!(matches!(
             stale,
@@ -110,7 +114,7 @@ async fn appending_at_a_taken_position_is_a_conflict_and_writes_nothing() {
 async fn appending_past_the_next_position_is_a_conflict() {
     each_store(async |mut store, _| {
         let gap = store
-            .append(&id("vm/a"), sequence(2), payloads(&["x"]))
+            .append(&id("vm/a"), sequence(2), payloads(&["x"]), at())
             .await;
         assert!(matches!(
             gap,
@@ -124,11 +128,11 @@ async fn appending_past_the_next_position_is_a_conflict() {
 async fn streams_are_independent() {
     each_store(async |mut store, _| {
         store
-            .append(&id("vm/a"), Sequence::FIRST, payloads(&["a"]))
+            .append(&id("vm/a"), Sequence::FIRST, payloads(&["a"]), at())
             .await
             .unwrap();
         store
-            .append(&id("vm/b"), Sequence::FIRST, payloads(&["b"]))
+            .append(&id("vm/b"), Sequence::FIRST, payloads(&["b"]), at())
             .await
             .unwrap();
         assert_eq!(store.replay(&id("vm/a")).await.unwrap().events.len(), 1);
@@ -142,7 +146,7 @@ async fn streams_are_listed_by_parent_and_only_below_it() {
     each_store(async |mut store, _| {
         for name in ["vm/a", "vm/b", "vmx/c", "quarantine/a"] {
             store
-                .append(&id(name), Sequence::FIRST, payloads(&["x"]))
+                .append(&id(name), Sequence::FIRST, payloads(&["x"]), at())
                 .await
                 .unwrap();
         }
@@ -159,7 +163,7 @@ async fn sqlite_events_survive_reopening() {
         .await
         .unwrap();
     store
-        .append(&id("vm/a"), Sequence::FIRST, payloads(&["x"]))
+        .append(&id("vm/a"), Sequence::FIRST, payloads(&["x"]), at())
         .await
         .unwrap();
     drop(store);
@@ -245,6 +249,7 @@ async fn the_journal_actor_answers_persist_and_replay_through_derived_refs() {
         JournalArgs {
             persistence: Persistence::Memory,
             paths: fixture.paths.clone(),
+            clock: crate::clock::Clock::System,
         },
     )
     .await
@@ -283,10 +288,10 @@ async fn the_journal_actor_answers_persist_and_replay_through_derived_refs() {
 async fn a_retired_stream_replays_empty_keeps_its_position_and_is_not_listed() {
     each_store(async |mut store, _| {
         store
-            .append(&id("vm/a"), Sequence::FIRST, payloads(&["x", "y"]))
+            .append(&id("vm/a"), Sequence::FIRST, payloads(&["x", "y"]), at())
             .await
             .unwrap();
-        store.retire(&id("vm/a")).await.unwrap();
+        store.retire(&id("vm/a"), at()).await.unwrap();
         assert_eq!(
             store.replay(&id("vm/a")).await.unwrap(),
             Replay {
@@ -303,19 +308,19 @@ async fn a_retired_stream_replays_empty_keeps_its_position_and_is_not_listed() {
 async fn a_retired_stream_continues_after_its_tombstone_and_lists_again() {
     each_store(async |mut store, _| {
         store
-            .append(&id("vm/a"), Sequence::FIRST, payloads(&["old"]))
+            .append(&id("vm/a"), Sequence::FIRST, payloads(&["old"]), at())
             .await
             .unwrap();
-        store.retire(&id("vm/a")).await.unwrap();
+        store.retire(&id("vm/a"), at()).await.unwrap();
         let reused = store
-            .append(&id("vm/a"), Sequence::FIRST, payloads(&["new"]))
+            .append(&id("vm/a"), Sequence::FIRST, payloads(&["new"]), at())
             .await;
         assert!(matches!(
             reused,
             Err(PersistFailure::Conflict { first: 1, next: 2 })
         ));
         store
-            .append(&id("vm/a"), sequence(2), payloads(&["new"]))
+            .append(&id("vm/a"), sequence(2), payloads(&["new"]), at())
             .await
             .unwrap();
         let replay = store.replay(&id("vm/a")).await.unwrap();
@@ -334,14 +339,14 @@ async fn a_retired_stream_continues_after_its_tombstone_and_lists_again() {
 #[tokio::test]
 async fn retiring_twice_or_an_empty_stream_changes_nothing() {
     each_store(async |mut store, _| {
-        store.retire(&id("vm/none")).await.unwrap();
+        store.retire(&id("vm/none"), at()).await.unwrap();
         assert_eq!(store.replay(&id("vm/none")).await.unwrap(), Replay::empty());
         store
-            .append(&id("vm/a"), Sequence::FIRST, payloads(&["x"]))
+            .append(&id("vm/a"), Sequence::FIRST, payloads(&["x"]), at())
             .await
             .unwrap();
-        store.retire(&id("vm/a")).await.unwrap();
-        store.retire(&id("vm/a")).await.unwrap();
+        store.retire(&id("vm/a"), at()).await.unwrap();
+        store.retire(&id("vm/a"), at()).await.unwrap();
         assert_eq!(
             store.replay(&id("vm/a")).await.unwrap().last,
             Some(sequence(1))
@@ -355,11 +360,11 @@ async fn retiring_leaves_other_streams_live() {
     each_store(async |mut store, _| {
         for stream in ["vm/a", "vm/b"] {
             store
-                .append(&id(stream), Sequence::FIRST, payloads(&["x"]))
+                .append(&id(stream), Sequence::FIRST, payloads(&["x"]), at())
                 .await
                 .unwrap();
         }
-        store.retire(&id("vm/a")).await.unwrap();
+        store.retire(&id("vm/a"), at()).await.unwrap();
         assert_eq!(store.streams(&id("vm")).await.unwrap(), vec![id("vm/b")]);
         assert_eq!(store.replay(&id("vm/b")).await.unwrap().events.len(), 1);
     })
@@ -386,6 +391,53 @@ async fn a_version_1_journal_is_migrated_and_keeps_its_events() {
         .await
         .unwrap();
     assert_eq!(store.replay(&id("vm/a")).await.unwrap().events.len(), 1);
-    store.retire(&id("vm/a")).await.unwrap();
+    store.retire(&id("vm/a"), at()).await.unwrap();
     assert_eq!(store.streams(&id("vm")).await.unwrap(), vec![]);
+}
+
+#[tokio::test]
+async fn appends_and_tombstones_are_stamped_by_the_journal_clock() {
+    let fixture = fixture();
+    let manual = crate::clock::ManualClock::at(crate::clock::Timestamp::from_milliseconds(5_000));
+    let (journal, _) = Actor::spawn(
+        None,
+        Journal,
+        JournalArgs {
+            persistence: Persistence::Sqlite,
+            paths: fixture.paths.clone(),
+            clock: crate::clock::Clock::Manual(manual.clone()),
+        },
+    )
+    .await
+    .unwrap();
+    let (reader, mut replies) = crate::testing::probe::<JournalReply>().await;
+    journal
+        .cast(JournalMessage::Persist {
+            batch: BatchId::FIRST,
+            id: id("vm/a"),
+            first: Sequence::FIRST,
+            events: payloads(&["x"]),
+            reply_to: reader.get_derived(),
+        })
+        .unwrap();
+    crate::testing::next(&mut replies).await;
+    manual.advance(std::time::Duration::from_secs(2));
+    journal
+        .cast(JournalMessage::Retire {
+            id: id("vm/a"),
+            reply_to: reader.get_derived(),
+        })
+        .unwrap();
+    crate::testing::next(&mut replies).await;
+    journal.stop(None);
+    let connection =
+        tokio_rusqlite::rusqlite::Connection::open(fixture.paths.journal().as_path()).unwrap();
+    let stamps: (i64, i64) = connection
+        .query_row(
+            "SELECT (SELECT at FROM events), (SELECT at FROM tombstones)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(stamps, (5_000, 7_000));
 }

@@ -16,6 +16,7 @@ pub mod root;
 pub mod session;
 #[cfg(test)]
 mod tests;
+pub mod timing;
 
 use std::os::unix::fs::DirBuilderExt as _;
 
@@ -64,6 +65,8 @@ pub struct RuntimeConfig {
     /// The guest account of every VM: the user the runtime runs as.
     pub account: crate::vm::Account,
     pub vm_defaults: root::VmDefaults,
+    /// Wall time for the journal's stamps.
+    pub clock: crate::clock::Clock,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -129,6 +132,7 @@ impl Runtime {
             version,
             account,
             vm_defaults,
+            clock,
         } = config;
         for directory in [paths.data(), paths.run()] {
             std::fs::DirBuilder::new()
@@ -164,6 +168,7 @@ impl Runtime {
                 listener,
                 account,
                 vm_defaults,
+                clock,
             },
         )
         .await

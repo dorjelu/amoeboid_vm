@@ -2,7 +2,6 @@
 //! fence: an append must start at the stream's next position.
 
 use std::collections::BTreeMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustix::fs::{Mode, OFlags};
 use tokio_rusqlite::rusqlite::{self, ErrorCode, TransactionBehavior, params};
@@ -11,6 +10,7 @@ use super::{
     EventPayload, PersistFailure, Persistence, PersistenceId, Replay, Sequence, StoreError,
     StoredEvent,
 };
+use crate::clock::Timestamp;
 use crate::nonempty::NonEmpty;
 use crate::runtime::paths::RuntimePaths;
 
@@ -55,14 +55,6 @@ impl MemoryStream {
     fn live(&self) -> bool {
         self.events.len() > self.through
     }
-}
-
-fn now_milliseconds() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| {
-            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
-        })
 }
 
 impl StoreError {
@@ -164,11 +156,13 @@ impl Store {
         }
     }
 
+    /// Appends `events` at `first`, stamped `at`.
     pub(super) async fn append(
         &mut self,
         id: &PersistenceId,
         first: Sequence,
         events: NonEmpty<EventPayload>,
+        at: Timestamp,
     ) -> Result<Sequence, PersistFailure> {
         match self {
             Self::Memory(streams) => {
@@ -189,9 +183,10 @@ impl Store {
                 let persistence_id = id.as_str().to_owned();
                 let rows: Vec<String> = events.iter().map(|event| event.0.clone()).collect();
                 let first_value = first.get();
+                let at = at.milliseconds();
                 connection
                     .call(move |connection| {
-                        append_rows(connection, &persistence_id, first_value, &rows)
+                        append_rows(connection, &persistence_id, first_value, &rows, at)
                     })
                     .await
                     .map_err(|error| match error {
@@ -211,7 +206,11 @@ impl Store {
     /// Retires every event the stream holds now: a tombstone at its last position. Later
     /// appends continue after it and are live. Retiring an empty or retired stream changes
     /// nothing.
-    pub(super) async fn retire(&mut self, id: &PersistenceId) -> Result<(), StoreError> {
+    pub(super) async fn retire(
+        &mut self,
+        id: &PersistenceId,
+        at: Timestamp,
+    ) -> Result<(), StoreError> {
         match self {
             Self::Memory(streams) => {
                 if let Some(stream) = streams.get_mut(id) {
@@ -221,7 +220,7 @@ impl Store {
             }
             Self::Sqlite(connection) => {
                 let persistence_id = id.as_str().to_owned();
-                let at = now_milliseconds();
+                let at = at.milliseconds();
                 connection
                     .call(move |connection| {
                         connection
@@ -333,6 +332,7 @@ fn append_rows(
     persistence_id: &str,
     first: u64,
     payloads: &[String],
+    at: i64,
 ) -> Result<(), PersistFailure> {
     let store = |error: rusqlite::Error| PersistFailure::Store(StoreError::of(error));
     let transaction = connection
@@ -349,7 +349,6 @@ fn append_rows(
     if first != next {
         return Err(PersistFailure::Conflict { first, next });
     }
-    let at = now_milliseconds();
     {
         let mut insert = transaction
             .prepare_cached(

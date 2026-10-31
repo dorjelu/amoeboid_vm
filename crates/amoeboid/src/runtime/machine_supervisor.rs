@@ -11,7 +11,9 @@
 //! ```
 
 use std::collections::{BTreeMap, VecDeque};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use ractor::{Actor, ActorProcessingErr, ActorRef, DerivedActorRef, SupervisionEvent};
 
@@ -95,7 +97,8 @@ pub enum RestartDecision {
     Exhausted { restarts: u32 },
 }
 
-/// Records `failure` at `now` and decides. Pure.
+/// Records `failure` at `now` (tokio's monotonic clock, so a paused test runtime controls the
+/// window) and decides. Pure.
 #[must_use]
 pub fn decide(
     policy: &RestartPolicy,
@@ -210,9 +213,8 @@ pub struct MachineSupervisorArgs {
     pub from_vm: DerivedActorRef<FromVm>,
     pub journal: ActorRef<JournalMessage>,
     pub paths: RuntimePaths,
-    /// Includes the restart policy.
+    /// Includes the restart policy and timing.
     pub vm_defaults: VmDefaults,
-    pub persist_timeout: Duration,
 }
 
 pub struct MachineSupervisor;
@@ -399,8 +401,9 @@ async fn spawn(
                             root: args.from_vm.clone(),
                             build: args.vm_defaults.build.clone(),
                             placement: args.vm_defaults.placement,
+                            timing: args.vm_defaults.timing,
                         },
-                        persist_timeout: args.persist_timeout,
+                        persist_timeout: args.vm_defaults.timing.persist_timeout,
                     },
                     myself.get_cell(),
                 )
@@ -652,6 +655,7 @@ mod tests {
             JournalArgs {
                 persistence: Persistence::Memory,
                 paths: paths.clone(),
+                clock: crate::clock::Clock::System,
             },
         )
         .await
@@ -672,8 +676,8 @@ mod tests {
                     build: BuildCommand::Scripted(crate::plan::argv::Argv::for_tests(&["true"])),
                     placement: Placement::Direct,
                     restart: policy,
+                    timing: crate::runtime::timing::Timing::quick(),
                 },
-                persist_timeout: Duration::from_secs(5),
             },
         )
         .await
@@ -799,6 +803,38 @@ mod tests {
         let quiet =
             tokio::time::timeout(Duration::from_millis(300), supervised.reports.recv()).await;
         assert!(quiet.is_err(), "{quiet:?}");
+        supervised.supervisor.stop(None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn after_a_quiet_window_a_failure_restarts_again_instead_of_giving_up() {
+        let policy = RestartPolicy {
+            max_restarts: 1,
+            window: Duration::from_secs(600),
+            backoff_first: Duration::from_secs(1),
+            backoff_max: Duration::from_secs(30),
+        };
+        let mut supervised = supervised(policy).await;
+        supervised
+            .supervisor
+            .cast(MachineSupervisorMessage::Ensure {
+                name: vm("patient"),
+            })
+            .unwrap();
+        let first = up(&mut supervised.reports).await.unwrap();
+        kill_child(supervised.runtime, "patient", &first, "builder");
+        assert!(matches!(
+            next(&mut supervised.reports).await,
+            MachineReport::Restarting { attempt: 1, .. }
+        ));
+        let second = up(&mut supervised.reports).await.unwrap();
+        // Ten quiet minutes in virtual time: the first failure no longer counts.
+        tokio::time::advance(Duration::from_secs(601)).await;
+        kill_child(supervised.runtime, "patient", &second, "builder");
+        assert!(matches!(
+            next(&mut supervised.reports).await,
+            MachineReport::Restarting { attempt: 1, .. }
+        ));
         supervised.supervisor.stop(None);
     }
 }

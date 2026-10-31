@@ -148,6 +148,20 @@ Implementation notes:
 * A vacuum terminates the twin through the supervisor; a twin that is up stops the VM gracefully first. A twin that fails while the vacuum waits for its stop is terminated instead.
 * The twin's error for a start interrupted by a restart now reads "the VM's twin restarted while the VM was starting" (`vm.restarted_while_starting`): it applies to a runtime restart and to a supervisor restart alike.
 
+== Time
+
+Time reaches the runtime only through values it is given, so tests control it.
+
+[cols="1,2,2"]
+|===
+|Kind |Source |In tests
+|Wall time (journal `at` stamps on events and tombstones) |`Clock` in `RuntimeConfig`, passed to the journal: `Clock::System`, or `Clock::Manual(ManualClock)` that tests set and advance; `Timestamp` is milliseconds since the Unix epoch |a manual clock: stamps are known values
+|Monotonic time and timers (`send_after`, `sleep`, `timeout`, the restart budget's window) |tokio's clock: `decide` takes `tokio::time::Instant` |`tokio::time::pause()` / `advance()`; only in tests without real processes or I/O, because a paused runtime auto-advances when idle and would fire timeouts while a real child runs
+|Durations (grace periods, waits, timeouts) |`Timing` in `VmDefaults`: boot timeout, status timeout, persist timeout, LocalQemu powerdown and terminate grace and socket wait, vacuum terminate and kill grace; `Timing::production()` |each test picks its own; no `cfg!(test)` switches in production code
+|===
+
+A `Clock` of our own for timers was rejected: every timer runs on tokio's, which tokio already makes injectable, and wrapping `send_after` and `sleep` would duplicate it. Identifiers stay `Ulid::generate`: they need to be unique and roughly time-ordered, not reproducible.
+
 == Runtime placement
 
 === The runtime's own files

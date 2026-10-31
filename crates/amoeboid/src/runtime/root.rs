@@ -25,7 +25,6 @@
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
 
 use ractor::{Actor, ActorProcessingErr, ActorRef, DerivedActorRef, SupervisionEvent};
 
@@ -36,6 +35,8 @@ use super::machine_supervisor::{
 };
 use super::paths::RuntimePaths;
 use super::quarantine::{self, QuarantineCause, QuarantineEvent};
+use super::timing::Timing;
+use crate::clock::Clock;
 use crate::diagnostic::Report;
 use crate::domain::lifecycle::Incarnation;
 use crate::domain::path::AbsolutePath;
@@ -56,15 +57,6 @@ use crate::vm::local_qemu::Placement;
 use crate::vm::twin::{FromVm, TwinMessage, VmCommand, VmOutcome, VmReport};
 use crate::vm::vacuum;
 use crate::vm::{Account, NixConfig, SshEndpoint, VmCondition, VmSpec, VmStatus};
-
-/// How long a status question waits for the twins; later answers are dropped.
-const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// How long a VM may take from qemu starting to sshd answering.
-const BOOT_TIMEOUT_SECONDS: u32 = 120;
-
-/// No `Persisted` within this: the persistent actor stops and is restarted.
-const PERSIST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 pub enum RootMessage {
@@ -144,6 +136,7 @@ pub struct VmDefaults {
     pub build: BuildCommand,
     pub placement: Placement,
     pub restart: RestartPolicy,
+    pub timing: Timing,
 }
 
 impl VmDefaults {
@@ -153,6 +146,7 @@ impl VmDefaults {
             build: BuildCommand::Nix,
             placement: Placement::Scoped,
             restart: RestartPolicy::production(),
+            timing: Timing::production(),
         }
     }
 }
@@ -165,6 +159,7 @@ pub struct RootArgs {
     /// The guest account of every VM: the user the runtime runs as.
     pub account: Account,
     pub vm_defaults: VmDefaults,
+    pub clock: Clock,
 }
 
 pub struct Root;
@@ -176,6 +171,7 @@ pub struct RootState {
     quarantine_streams: PersistenceId,
     paths: RuntimePaths,
     account: Account,
+    timing: Timing,
     journal: ActorRef<JournalMessage>,
     machines: ActorRef<MachineSupervisorMessage>,
     /// Where each VM's requests go, as the machine supervisor last reported.
@@ -363,10 +359,12 @@ impl Actor for Root {
             JournalArgs {
                 persistence: args.persistence,
                 paths: args.paths.clone(),
+                clock: args.clock,
             },
             myself.get_cell(),
         )
         .await?;
+        let timing = args.vm_defaults.timing;
         let (machines, _) = Actor::spawn_linked(
             Some(format!("{}/machines", args.id)),
             MachineSupervisor,
@@ -377,7 +375,6 @@ impl Actor for Root {
                 journal: journal.clone(),
                 paths: args.paths.clone(),
                 vm_defaults: args.vm_defaults,
-                persist_timeout: PERSIST_TIMEOUT,
             },
             myself.get_cell(),
         )
@@ -408,6 +405,7 @@ impl Actor for Root {
             quarantine_streams,
             paths: args.paths,
             account: args.account,
+            timing,
             journal,
             machines,
             routes: BTreeMap::new(),
@@ -947,7 +945,8 @@ fn start(
         shares,
         account: state.account.clone(),
         nix_config: nix_config.map_or(NixConfig::Existing, NixConfig::From),
-        boot_timeout_seconds: BOOT_TIMEOUT_SECONDS,
+        boot_timeout_seconds: u32::try_from(state.timing.boot_timeout.as_secs())
+            .unwrap_or(u32::MAX),
     };
     state.waiters.insert(operation, (name, reply_to.clone()));
     twin.cast(PersistentMessage::Command(VmCommand::Start {
@@ -1210,11 +1209,12 @@ fn remove(myself: &ActorRef<RootMessage>, state: &mut RootState, name: &VmName) 
         vacuum.step = VacuumStep::Removing;
     }
     let paths = state.paths.vm(name);
+    let timing = state.timing;
     let root = myself.clone();
     let name = name.clone();
     tokio::spawn(async move {
         let result = match paths {
-            Ok(paths) => vacuum::vacuum(&paths)
+            Ok(paths) => vacuum::vacuum(&paths, &timing)
                 .await
                 .map_err(|error| Report::of(&error)),
             Err(error) => Err(Report::of(&error)),
@@ -1317,7 +1317,7 @@ fn vacuum_failed(state: &mut RootState, name: &VmName, failure: Report) {
 
 /// Answers for one VM or every VM. Quarantined and restarting VMs are answered by Root; twins
 /// that are up are asked (tell-only); twins being spawned are asked once up. The reply goes out
-/// when all are in or `STATUS_TIMEOUT` passes.
+/// when all are in or the status timeout passes.
 fn status(
     myself: &ActorRef<RootMessage>,
     state: &mut RootState,
@@ -1375,7 +1375,7 @@ fn status(
     for twin in asked {
         let _ = twin.cast(PersistentMessage::Command(VmCommand::Status { operation }));
     }
-    myself.send_after(STATUS_TIMEOUT, move || RootMessage::StatusTimeout {
-        operation,
+    myself.send_after(state.timing.status_timeout, move || {
+        RootMessage::StatusTimeout { operation }
     });
 }

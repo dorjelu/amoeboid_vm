@@ -43,6 +43,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         version: env!("CARGO_PKG_VERSION").to_owned(),
         account,
         vm_defaults: VmDefaults::production(),
+        clock: amoeboid::clock::Clock::System,
     })
     .await?;
     let stopper = runtime.stopper();
