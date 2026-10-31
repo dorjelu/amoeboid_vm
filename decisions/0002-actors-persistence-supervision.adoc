@@ -300,4 +300,5 @@ Moot now that `steps` is replaced, recorded so they are not reintroduced: the st
 * Supervision strategy and restart intensity for the VM level and below.
 * `daemon restart` policy with VMs running (with adoption it can simply restart).
 * Stream trimming: at generation end, or kept for history.
+* Location of the runtime's own files: `daemon.lock` and `journal.sqlite` currently share `$XDG_DATA_HOME/amoeboid` with VM data; they are to move to a separate location.
 * Snapshot cadence, if streams turn out not to be short.

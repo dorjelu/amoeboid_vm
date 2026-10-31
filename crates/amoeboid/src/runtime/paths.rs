@@ -51,6 +51,8 @@ pub enum PathError {
     SocketTooLong(PathBuf),
 }
 
+// TODO: give the runtime's own files (daemon.lock, journal.sqlite) a location separate from
+// the VM data directory (decision 0002, open questions).
 /// `data` holds `daemon.lock` and the journal; `run` (`$XDG_RUNTIME_DIR/amoeboid`, `0700`)
 /// holds the socket.
 #[derive(Clone, PartialEq, Eq, Debug)]
