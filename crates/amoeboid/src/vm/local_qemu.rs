@@ -154,6 +154,15 @@ impl Actor for LocalQemu {
                     });
                 }
             }
+            LocalQemuMessage::Command(HypervisorCommand::Stop { generation }) => {
+                if state.generation == Some(generation) {
+                    state.machine = Machine::Stopping { reason: None };
+                    state.terminate_all();
+                    if state.processes.is_empty() {
+                        state.stopped(generation, None);
+                    }
+                }
+            }
             LocalQemuMessage::Command(HypervisorCommand::Adopt {
                 generation,
                 vm: _,

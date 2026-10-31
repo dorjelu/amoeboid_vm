@@ -36,6 +36,8 @@ pub enum HypervisorCommand {
         generation: Generation,
         plan: BootPlan,
     },
+    /// Stop the machine of this generation; answered by `MachineStopped`.
+    Stop { generation: Generation },
     /// After a runtime restart: watch these if they are still the same processes.
     Adopt {
         generation: Generation,
