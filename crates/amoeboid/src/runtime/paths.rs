@@ -193,6 +193,12 @@ impl VmPaths {
         self.ssh_directory().join("known_hosts")
     }
 
+    /// `nix build` output, appended on every build.
+    #[must_use]
+    pub fn build_log(&self) -> AbsolutePath {
+        self.state.join("build.log")
+    }
+
     #[must_use]
     pub fn console_log(&self) -> AbsolutePath {
         self.state.join("console.log")

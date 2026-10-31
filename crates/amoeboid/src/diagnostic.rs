@@ -212,6 +212,14 @@ mod tests {
                 source: io(),
             }),
             Box::new(ProcessError::List(io())),
+            Box::new(crate::adapters::ssh::SshError::Keygen(
+                crate::adapters::process::Exit::Code(1),
+            )),
+            Box::new(crate::adapters::ssh::SshError::Port(io())),
+            Box::new(crate::adapters::nix::NixError::Failed {
+                exit: crate::adapters::process::Exit::Code(1),
+                tail: "x".into(),
+            }),
         ]
     }
 

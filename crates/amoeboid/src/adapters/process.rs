@@ -323,10 +323,15 @@ pub fn spawn(request: &SpawnRequest) -> Result<Spawned, ProcessError> {
             command.stdout(file).stderr(error_file);
         }
     }
+    // Tests that hold lock fds must not see a fork mid-flight (testing::forks).
+    #[cfg(test)]
+    let forks = crate::testing::forks();
     let child = command.spawn().map_err(|source| ProcessError::Spawn {
         program: program.clone(),
         source,
     })?;
+    #[cfg(test)]
+    drop(forks);
     let process = child
         .id()
         .and_then(NonZeroU32::new)
@@ -341,6 +346,26 @@ pub fn spawn(request: &SpawnRequest) -> Result<Spawned, ProcessError> {
         source: std::io::Error::other("exited before it could be identified"),
     })?;
     Ok(Spawned { identity, child })
+}
+
+/// Runs `argv` as a direct child to completion: stdin closed, output as given.
+///
+/// # Errors
+///
+/// `Output`, `Spawn`.
+pub async fn run(
+    argv: &Argv,
+    directory: &AbsolutePath,
+    output: &Output,
+) -> Result<Exit, ProcessError> {
+    let spawned = spawn(&SpawnRequest {
+        argv: argv.clone(),
+        containment: Containment::Direct,
+        nonce: Nonce::mint(),
+        directory: directory.clone(),
+        output: output.clone(),
+    })?;
+    Ok(exited(Watched::Child(spawned.child)).await)
 }
 
 /// The process carrying `nonce` in its environment, among those this user may inspect.
@@ -407,9 +432,7 @@ mod tests {
 
     use super::*;
 
-    /// Holds the fork guard only while forking.
     fn sleeper(nonce: &Nonce, containment: Containment) -> Spawned {
-        let _forks = crate::testing::forks();
         spawn(&SpawnRequest {
             argv: Argv::for_tests(&["sleep", "30"]),
             containment,

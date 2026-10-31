@@ -18,7 +18,8 @@ pub fn golden_text(name: &str) -> String {
     std::fs::read_to_string(path).unwrap()
 }
 
-/// Held by every test that forks or holds a lock fd. A fork copies all open fds until its child
+/// Held by `adapters::process::spawn` around each fork (in test builds) and by every test that
+/// holds a lock fd. A fork copies all open fds until its child
 /// execs (`O_CLOEXEC` acts at exec, not fork), so a parallel fork can keep a dropped lock alive.
 pub fn forks() -> std::sync::MutexGuard<'static, ()> {
     static FORKS: std::sync::Mutex<()> = std::sync::Mutex::new(());

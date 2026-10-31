@@ -83,7 +83,13 @@ async fn a_second_runtime_is_refused_while_the_first_holds_the_lock() {
 }
 
 #[tokio::test]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "drops and retakes daemon.lock: no fork may pin it meanwhile; this runtime spawns \
+              nothing, so the guard can't deadlock"
+)]
 async fn a_stopped_runtime_releases_the_lock_and_socket_for_the_next() {
+    let _forks = crate::testing::forks();
     let fixture = fixture();
     let first = start(&fixture.paths).await.unwrap();
     first.stop();
