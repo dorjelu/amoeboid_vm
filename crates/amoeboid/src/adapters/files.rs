@@ -78,6 +78,16 @@ pub fn ensure_directory(path: &AbsolutePath, mode: u32) -> Result<(), FileError>
 /// # Errors
 ///
 /// `Read`.
+pub fn read_bytes(path: &AbsolutePath) -> Result<Vec<u8>, FileError> {
+    std::fs::read(path.as_path()).map_err(|source| FileError::Read {
+        path: path.display().to_string(),
+        source,
+    })
+}
+
+/// # Errors
+///
+/// `Read`.
 pub fn read_to_string(path: &AbsolutePath) -> Result<String, FileError> {
     std::fs::read_to_string(path.as_path()).map_err(|source| FileError::Read {
         path: path.display().to_string(),

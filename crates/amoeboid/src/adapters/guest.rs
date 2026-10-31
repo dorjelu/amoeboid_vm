@@ -12,6 +12,7 @@ use rustix::io::Errno;
 
 use crate::domain::path::AbsolutePath;
 use crate::domain::relative_path::RelativePath;
+use crate::domain::tree::Tree;
 
 #[derive(Debug, thiserror::Error)]
 pub enum GuestError {
@@ -158,6 +159,80 @@ impl GuestTree {
     }
 }
 
+impl GuestTree {
+    /// Replaces the directory `path` with `tree`: written aside, swapped in by rename, the old
+    /// content then removed without following anything the guest left in it.
+    ///
+    /// # Errors
+    ///
+    /// `Write`, including when a parent component is a symlink.
+    pub fn replace_tree(&self, path: &RelativePath, tree: &Tree) -> Result<(), GuestError> {
+        let failed = Self::failed(path);
+        let (parents, name) = path.split();
+        let suffix = ulid::Ulid::generate();
+        let fresh_name = format!(".{name}.new-{suffix}");
+        let stale_name = format!(".{name}.old-{suffix}");
+        let fresh = RelativePath::parse(
+            &parents
+                .iter()
+                .copied()
+                .chain([fresh_name.as_str()])
+                .collect::<Vec<_>>()
+                .join("/"),
+        )
+        .map_err(|error| failed(std::io::Error::other(error)))?;
+        self.ensure_directory(&fresh)?;
+        for (relative, content) in tree.files() {
+            self.replace_file(&fresh.join(relative), content, 0o644)?;
+        }
+        let parent = self
+            .directory(&parents)
+            .map_err(|error| failed(error.into()))?;
+        let had_old = match rustix::fs::renameat(&parent, name, &parent, stale_name.as_str()) {
+            Ok(()) => true,
+            Err(Errno::NOENT) => false,
+            Err(error) => return Err(failed(error.into())),
+        };
+        rustix::fs::renameat(&parent, fresh_name.as_str(), &parent, name)
+            .map_err(|error| failed(error.into()))?;
+        if had_old {
+            remove_tree(&parent, &stale_name).map_err(|error| failed(error.into()))?;
+        }
+        Ok(())
+    }
+}
+
+/// Removes `name` under `parent`, whatever it is. A directory is entered through `openat2`
+/// with symlinks refused and emptied first, so nothing outside is ever reached.
+fn remove_tree(parent: &OwnedFd, name: &str) -> Result<(), Errno> {
+    match rustix::fs::unlinkat(parent, name, AtFlags::empty()) {
+        Ok(()) | Err(Errno::NOENT) => return Ok(()),
+        Err(Errno::ISDIR) => {}
+        Err(error) => return Err(error),
+    }
+    let directory = rustix::fs::openat2(
+        parent,
+        name,
+        OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::RDONLY,
+        Mode::empty(),
+        RESOLVE,
+    )?;
+    let mut names = Vec::new();
+    for entry in rustix::fs::Dir::read_from(&directory)? {
+        let entry = entry?;
+        let Ok(entry_name) = entry.file_name().to_str() else {
+            continue;
+        };
+        if entry_name != "." && entry_name != ".." {
+            names.push(entry_name.to_owned());
+        }
+    }
+    for entry_name in names {
+        remove_tree(&directory, &entry_name)?;
+    }
+    rustix::fs::unlinkat(parent, name, AtFlags::REMOVEDIR)
+}
+
 impl crate::diagnostic::Diagnostic for GuestError {
     fn code(&self) -> &'static str {
         match self {
@@ -235,6 +310,34 @@ mod tests {
         let result = tree.replace_file(&relative("home/file"), b"x", 0o644);
         assert!(matches!(result, Err(GuestError::Write { .. })));
         assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_tree_replaces_a_directory_and_the_old_one_is_removed_without_following_links() {
+        let (temporary, root, tree) = tree();
+        let outside = temporary.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("keep"), b"host").unwrap();
+        let reference = root.as_path().join("home/amoeboid/reference");
+        std::fs::create_dir_all(reference.join("old")).unwrap();
+        std::fs::write(reference.join("old/stale.nix"), b"stale").unwrap();
+        std::os::unix::fs::symlink(&outside, reference.join("planted")).unwrap();
+        let mut content = Tree::default();
+        content.insert(relative("flake.nix"), b"flake".to_vec());
+        content.insert(relative("sub/base.nix"), b"base".to_vec());
+        tree.replace_tree(&relative("home/amoeboid/reference"), &content)
+            .unwrap();
+        assert_eq!(
+            std::fs::read(reference.join("sub/base.nix")).unwrap(),
+            b"base"
+        );
+        assert!(!reference.join("old").exists());
+        assert!(!reference.join("planted").exists());
+        assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"host");
+        let siblings = std::fs::read_dir(root.as_path().join("home/amoeboid"))
+            .unwrap()
+            .count();
+        assert_eq!(siblings, 1);
     }
 
     #[test]
