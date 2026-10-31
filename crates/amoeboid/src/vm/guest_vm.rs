@@ -17,6 +17,7 @@ use crate::adapters::guest::{GuestError, GuestTree};
 use crate::adapters::ssh::{self, SshError};
 use crate::diagnostic::Report;
 use crate::domain::host_key::HostPublicKey;
+use crate::domain::path::AbsolutePath;
 use crate::domain::port::LoopbackPort;
 use crate::domain::relative_path::{BadRelativePath, RelativePath};
 use crate::plan;
@@ -53,7 +54,7 @@ pub enum GuestVmCommand {
     Prepare {
         generation: Generation,
         vm: VmPaths,
-        spec: VmSpec,
+        spec: Box<VmSpec>,
         /// Write the guest's own config copy: on a VM's first start and on a rebase.
         seed_own_config: bool,
     },
@@ -94,6 +95,8 @@ pub enum GuestVmError {
     File(#[from] FileError),
     #[error(transparent)]
     Path(#[from] BadRelativePath),
+    #[error(transparent)]
+    Home(#[from] crate::domain::path::PathError),
 }
 
 pub struct GuestVm;
@@ -213,6 +216,7 @@ async fn prepare(
     )?;
     // No terminal is ever attached, so no size to pass on.
     guest.remove_file(&RelativePath::parse("term")?)?;
+    copy_home_files(&guest, spec)?;
     let mut config = files::read_tree(&vm.nix_config())?;
     config.insert(
         RelativePath::parse("host.nix")?,
@@ -227,8 +231,30 @@ async fn prepare(
         GUEST_README.as_bytes(),
         0o644,
     )?;
-    let port = ssh::free_port()?;
+    let port = match spec.ssh_port {
+        Some(port) => port,
+        None => ssh::free_port()?,
+    };
     Ok((port, host_key))
+}
+
+/// The configured files under the host user's home, copied into the guest's home (the guest
+/// home has the host home's path; its contents live under `home/` in the guest directory).
+/// The host copy wins on every start; a missing file is skipped with a warning.
+fn copy_home_files(guest: &GuestTree, spec: &VmSpec) -> Result<(), GuestVmError> {
+    let host_home = AbsolutePath::parse(spec.account.home.as_str().into())?;
+    let guest_home = RelativePath::parse("home")?;
+    for file in &spec.home_files {
+        if let Some((bytes, mode)) = files::read_regular_file(&host_home.join_relative(file))? {
+            guest.replace_file(&guest_home.join(file), &bytes, mode)?;
+        } else {
+            tracing::warn!(
+                file = file.as_str(),
+                "not copying a home file into the VM: no such file"
+            );
+        }
+    }
+    Ok(())
 }
 
 impl crate::diagnostic::Diagnostic for GuestVmError {
@@ -238,6 +264,7 @@ impl crate::diagnostic::Diagnostic for GuestVmError {
             Self::Guest(inner) => inner.code(),
             Self::File(inner) => inner.code(),
             Self::Path(inner) => inner.code(),
+            Self::Home(inner) => inner.code(),
         }
     }
     fn hint(&self) -> Option<String> {
@@ -246,6 +273,7 @@ impl crate::diagnostic::Diagnostic for GuestVmError {
             Self::Guest(inner) => inner.hint(),
             Self::File(inner) => inner.hint(),
             Self::Path(inner) => inner.hint(),
+            Self::Home(inner) => inner.hint(),
         }
     }
 }
@@ -306,6 +334,8 @@ mod tests {
             nix_config: NixConfig::Existing,
             boot_timeout_seconds: 60,
             powerdown_grace_seconds: 30,
+            home_files: Vec::new(),
+            ssh_port: None,
         }
     }
 
@@ -322,7 +352,7 @@ mod tests {
             .cast(GuestVmCommand::Prepare {
                 generation: Generation::FIRST,
                 vm: fixture.vm.clone(),
-                spec: spec(),
+                spec: Box::new(spec()),
                 seed_own_config,
             })
             .unwrap();
@@ -390,6 +420,72 @@ mod tests {
         assert!(matches!(
             next(&mut fixture).await,
             GuestVmObservation::SshTimedOut { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn home_files_are_copied_with_their_mode_and_missing_ones_skipped() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut fixture = fixture().await;
+        // Under target/: a guest home may not lie under /tmp.
+        let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .canonicalize()
+            .unwrap();
+        let home = tempfile::tempdir_in(target).unwrap();
+        std::fs::create_dir_all(home.path().join(".config/git")).unwrap();
+        std::fs::write(home.path().join(".config/git/config"), "[user]\n").unwrap();
+        std::fs::set_permissions(
+            home.path().join(".config/git/config"),
+            std::fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
+        let mut spec = spec();
+        spec.account.home = GuestHome::parse(home.path().to_str().unwrap().into()).unwrap();
+        spec.home_files = vec![
+            RelativePath::parse(".config/git/config").unwrap(),
+            RelativePath::parse(".missing").unwrap(),
+        ];
+        fixture
+            .guest_vm
+            .cast(GuestVmCommand::Prepare {
+                generation: Generation::FIRST,
+                vm: fixture.vm.clone(),
+                spec: Box::new(spec),
+                seed_own_config: true,
+            })
+            .unwrap();
+        assert!(matches!(
+            next(&mut fixture).await,
+            GuestVmObservation::Prepared { .. }
+        ));
+        let copied = fixture.vm.guest().as_path().join("home/.config/git/config");
+        assert_eq!(std::fs::read(&copied).unwrap(), b"[user]\n");
+        assert_eq!(
+            std::fs::metadata(&copied).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert!(!fixture.vm.guest().as_path().join("home/.missing").exists());
+    }
+
+    #[tokio::test]
+    async fn a_configured_port_is_used_instead_of_a_free_one() {
+        let mut fixture = fixture().await;
+        let mut spec = spec();
+        let wanted = LoopbackPort::new(std::num::NonZeroU16::new(40_123).unwrap());
+        spec.ssh_port = Some(wanted);
+        fixture
+            .guest_vm
+            .cast(GuestVmCommand::Prepare {
+                generation: Generation::FIRST,
+                vm: fixture.vm.clone(),
+                spec: Box::new(spec),
+                seed_own_config: false,
+            })
+            .unwrap();
+        assert!(matches!(
+            next(&mut fixture).await,
+            GuestVmObservation::Prepared { port, .. } if port == wanted
         ));
     }
 }

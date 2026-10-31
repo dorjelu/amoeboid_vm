@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::domain::account::{GroupId, GuestHome, UserId, UserName};
 use crate::domain::path::AbsolutePath;
 use crate::domain::port::LoopbackPort;
+use crate::domain::relative_path::RelativePath;
 use crate::domain::share::Shares;
 
 pub use crate::domain::lifecycle::{Generation, Incarnation};
@@ -95,6 +96,45 @@ pub enum NixConfig {
     Existing,
     /// Create the VM's copy from this directory, or replace it (rebase).
     From(AbsolutePath),
+    /// Create or replace it from this preset; the Builder finds it (and seeds `default`).
+    Preset(crate::config::run::PresetName),
+}
+
+impl From<crate::config::run::NixConfigSource> for NixConfig {
+    fn from(source: crate::config::run::NixConfigSource) -> Self {
+        match source {
+            crate::config::run::NixConfigSource::Preset(name) => Self::Preset(name),
+            crate::config::run::NixConfigSource::Directory(path) => Self::From(path),
+        }
+    }
+}
+
+/// A start as Root hands it to the twin: what the operator gave, or the VM's own with what a
+/// new VM gets instead. Only the twin knows whether the VM is new and what it had.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct StartRequest {
+    pub shares: SharesRequest,
+    pub nix_config: NixConfigRequest,
+    pub account: Account,
+    pub home_files: Vec<RelativePath>,
+    pub ssh_port: Option<LoopbackPort>,
+    pub boot_timeout_seconds: u32,
+    pub powerdown_grace_seconds: u32,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum SharesRequest {
+    Given(Shares),
+    /// The VM's last shares; a new VM gets these defaults, or the reason they are unusable.
+    OwnElse(Result<Shares, crate::diagnostic::Report>),
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum NixConfigRequest {
+    /// Create or rebase from this.
+    Given(NixConfig),
+    /// The VM's own; a new VM is created from this.
+    OwnElse(NixConfig),
 }
 
 /// What a start asks for; persisted in the twin's `StartRequested`.
@@ -108,6 +148,12 @@ pub struct VmSpec {
     /// existed.
     #[serde(default = "default_powerdown_grace_seconds")]
     pub powerdown_grace_seconds: u32,
+    /// Under the host user's home, copied into the guest's home on every start.
+    #[serde(default)]
+    pub home_files: Vec<RelativePath>,
+    /// The forwarded port; `None` picks a free one.
+    #[serde(default)]
+    pub ssh_port: Option<LoopbackPort>,
 }
 
 /// A stop's powerdown grace when no start recorded one.

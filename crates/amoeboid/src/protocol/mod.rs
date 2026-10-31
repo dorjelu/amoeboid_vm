@@ -143,9 +143,11 @@ pub enum VmRequest {
     /// them.
     Start {
         name: crate::domain::vm_name::VmName,
-        shares: Vec<crate::domain::share::ShareRequest>,
-        /// Create or rebase from this config directory; `None` keeps the VM's own.
-        nix_config: Option<crate::domain::path::AbsolutePath>,
+        /// `None`: the VM's last shares; a new VM gets `run_config.toml`'s default shares.
+        shares: Option<Vec<crate::domain::share::ShareRequest>>,
+        /// Create or rebase from this; `None` keeps the VM's own, and a new VM is created from
+        /// `run_config.toml`'s base config.
+        nix_config: Option<crate::config::run::NixConfigSource>,
     },
     /// Power the VM off (gracefully, then by force), or take down what a failed start left.
     Stop {

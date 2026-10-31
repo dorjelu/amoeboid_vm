@@ -48,6 +48,26 @@ fn spec(nix_config: NixConfig) -> VmSpec {
         nix_config,
         boot_timeout_seconds: 90,
         powerdown_grace_seconds: 30,
+        home_files: Vec::new(),
+        ssh_port: None,
+    }
+}
+
+/// A request that resolves to `spec(nix_config)`: a given `From` (a rebase), else the VM's
+/// own with `nix_config` for a new VM.
+fn request(nix_config: NixConfig) -> StartRequest {
+    let spec = spec(nix_config.clone());
+    StartRequest {
+        shares: SharesRequest::OwnElse(Ok(spec.shares)),
+        nix_config: match nix_config {
+            NixConfig::From(_) => NixConfigRequest::Given(nix_config),
+            NixConfig::Existing | NixConfig::Preset(_) => NixConfigRequest::OwnElse(nix_config),
+        },
+        account: spec.account,
+        home_files: spec.home_files,
+        ssh_port: spec.ssh_port,
+        boot_timeout_seconds: spec.boot_timeout_seconds,
+        powerdown_grace_seconds: spec.powerdown_grace_seconds,
     }
 }
 
@@ -55,7 +75,7 @@ fn start_command(nix_config: NixConfig) -> (VmCommand, OperationId) {
     let operation = OperationId::mint();
     let command = VmCommand::Start {
         operation,
-        spec: spec(nix_config),
+        request: Box::new(request(nix_config)),
         incarnation: Incarnation::mint(),
     };
     (command, operation)
@@ -668,9 +688,14 @@ fn a_stop_uses_the_powerdown_grace_of_the_start_it_stops() {
             seed_own_config: true,
         },
     );
-    assert_eq!(started.powerdown_grace_seconds, 7);
+    assert_eq!(
+        started.last_spec.map(|spec| spec.powerdown_grace_seconds),
+        Some(7)
+    );
     let (mut state, _) = running();
-    state.powerdown_grace_seconds = 7;
+    if let Some(last) = &mut state.last_spec {
+        last.powerdown_grace_seconds = 7;
+    }
     let (_, _, outs) = command(
         state,
         VmCommand::Stop {
@@ -679,5 +704,129 @@ fn a_stop_uses_the_powerdown_grace_of_the_start_it_stops() {
     );
     assert!(
         matches!(outs.as_slice(), [VmOut::StopMachine { grace, .. }] if *grace == std::time::Duration::from_secs(7))
+    );
+}
+
+fn shares_of(directories: &[&str]) -> Shares {
+    let requests = directories
+        .iter()
+        .map(|directory| crate::domain::share::ShareRequest {
+            directory: crate::domain::share::HostDirectory::parse(
+                AbsolutePath::parse((*directory).into()).unwrap(),
+            )
+            .unwrap(),
+            mode: crate::domain::share::Mode::ReadWrite,
+        })
+        .collect();
+    Shares::validate(requests, &[], |_| true).unwrap()
+}
+
+fn spec_of(events: &[VmEvent]) -> Option<VmSpec> {
+    events.iter().find_map(|event| match event {
+        VmEvent::StartRequested { spec, .. } => Some(spec.clone()),
+        VmEvent::Created { .. }
+        | VmEvent::StopRequested { .. }
+        | VmEvent::Built { .. }
+        | VmEvent::GuestPrepared { .. }
+        | VmEvent::ProcessStarted { .. }
+        | VmEvent::MachineRunning { .. }
+        | VmEvent::MachineStopped { .. }
+        | VmEvent::Ready { .. }
+        | VmEvent::ProcessExited { .. }
+        | VmEvent::ProcessLost { .. }
+        | VmEvent::Failed { .. } => None,
+    })
+}
+
+#[test]
+fn without_shares_a_new_vm_gets_the_default_and_an_existing_one_its_last_shares() {
+    let mut first = request(NixConfig::Existing);
+    first.shares = SharesRequest::OwnElse(Ok(shares_of(&["/srv/default"])));
+    let (state, events, _) = command(
+        VmTwin::initial(),
+        VmCommand::Start {
+            operation: OperationId::mint(),
+            request: Box::new(first),
+            incarnation: Incarnation::mint(),
+        },
+    );
+    assert_eq!(
+        spec_of(&events).map(|spec| spec.shares),
+        Some(shares_of(&["/srv/default"]))
+    );
+    // Stopped again (the start failed), then started without shares: its own, not the default.
+    let (state, ..) = observe(
+        state,
+        VmObservation::Builder(BuilderObservation::BuildFailed {
+            generation: Generation::FIRST,
+            reason: Report {
+                code: "x".into(),
+                message: "x".into(),
+                hint: None,
+            },
+        }),
+    );
+    let mut again = request(NixConfig::Existing);
+    again.shares = SharesRequest::OwnElse(Ok(shares_of(&["/srv/other"])));
+    let (_, events, _) = command(
+        state,
+        VmCommand::Start {
+            operation: OperationId::mint(),
+            request: Box::new(again),
+            incarnation: Incarnation::mint(),
+        },
+    );
+    assert_eq!(
+        spec_of(&events).map(|spec| spec.shares),
+        Some(shares_of(&["/srv/default"]))
+    );
+}
+
+#[test]
+fn an_unusable_default_fails_only_a_new_vm() {
+    let unusable = Report {
+        code: "shares.invalid".into(),
+        message: "x".into(),
+        hint: None,
+    };
+    let mut first = request(NixConfig::Existing);
+    first.shares = SharesRequest::OwnElse(Err(unusable.clone()));
+    let operation = OperationId::mint();
+    let (_, events, outs) = command(
+        VmTwin::initial(),
+        VmCommand::Start {
+            operation,
+            request: Box::new(first),
+            incarnation: Incarnation::mint(),
+        },
+    );
+    assert_eq!(events, Vec::new());
+    assert!(matches!(
+        outs.as_slice(),
+        [VmOut::Root(VmReport::OperationDone { result: Err(report), .. })] if *report == unusable
+    ));
+}
+
+#[test]
+fn a_new_vm_is_created_from_the_base_and_an_existing_one_keeps_its_own_unless_given_one() {
+    let base = NixConfig::Preset(crate::config::run::PresetName::default_preset());
+    let resolve_on = |state: &VmTwinState, nix_config| {
+        let mut request = request(NixConfig::Existing);
+        request.nix_config = nix_config;
+        resolve(state, request).map(|(spec, seed)| (spec.nix_config, seed))
+    };
+    let new = VmTwin::initial();
+    assert_eq!(
+        resolve_on(&new, NixConfigRequest::OwnElse(base.clone())),
+        Ok((base.clone(), true))
+    );
+    let (existing, _) = running();
+    assert_eq!(
+        resolve_on(&existing, NixConfigRequest::OwnElse(base.clone())),
+        Ok((NixConfig::Existing, false))
+    );
+    assert_eq!(
+        resolve_on(&existing, NixConfigRequest::Given(base.clone())),
+        Ok((base, true))
     );
 }

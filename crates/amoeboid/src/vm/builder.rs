@@ -10,6 +10,7 @@ use tokio::task::JoinHandle;
 use super::{Account, Generation, NixConfig, bundled};
 use crate::adapters::files::{self, FileError};
 use crate::adapters::nix::{self, NixError};
+use crate::config::run::PresetName;
 use crate::diagnostic::Report;
 use crate::domain::path::AbsolutePath;
 use crate::domain::relative_path::RelativePath;
@@ -50,6 +51,8 @@ pub enum BuildCommand {
 pub struct BuilderSetup {
     pub report: DerivedActorRef<BuilderObservation>,
     pub command: BuildCommand,
+    /// One directory per preset; `default` is seeded from the bundled config when missing.
+    pub presets: AbsolutePath,
 }
 
 /// What to do with the VM's own config directory on this build.
@@ -58,6 +61,7 @@ pub enum ConfigStep {
     KeepOwn,
     InstallBundled,
     Install(AbsolutePath),
+    InstallPreset(PresetName),
 }
 
 /// Pure: `From` always installs (create or rebase); `Existing` keeps the VM's copy, or
@@ -66,6 +70,7 @@ pub enum ConfigStep {
 pub fn config_step(nix_config: &NixConfig, own_exists: bool) -> ConfigStep {
     match (nix_config, own_exists) {
         (NixConfig::From(source), _) => ConfigStep::Install(source.clone()),
+        (NixConfig::Preset(name), _) => ConfigStep::InstallPreset(name.clone()),
         (NixConfig::Existing, true) => ConfigStep::KeepOwn,
         (NixConfig::Existing, false) => ConfigStep::InstallBundled,
     }
@@ -79,6 +84,8 @@ pub enum BuilderError {
     Nix(#[from] NixError),
     #[error("{path} has no flake.nix, so it is not a NixOS configuration amoeboid can build")]
     MissingFlake { path: String },
+    #[error("there is no preset named {name} in {presets}")]
+    NoPreset { name: String, presets: String },
 }
 
 pub struct Builder;
@@ -121,8 +128,9 @@ impl Actor for Builder {
         }
         let report = state.setup.report.clone();
         let command = state.setup.command.clone();
+        let presets = state.setup.presets.clone();
         state.running = Some(tokio::spawn(async move {
-            let observation = match build(&vm, &account, &nix_config, &command).await {
+            let observation = match build(&vm, &account, &nix_config, &command, &presets).await {
                 Ok(()) => BuilderObservation::Built { generation },
                 Err(error) => BuilderObservation::BuildFailed {
                     generation,
@@ -154,6 +162,7 @@ async fn build(
     account: &Account,
     nix_config: &NixConfig,
     command: &BuildCommand,
+    presets: &AbsolutePath,
 ) -> Result<(), BuilderError> {
     files::ensure_directory(vm.state(), 0o755)?;
     let host = plan::files::host_module(
@@ -170,19 +179,10 @@ async fn build(
             tracing::info!(vm = %vm.name(), "creating its NixOS config from the bundled one");
             files::replace_directory(&own, &bundled::config())?;
         }
-        ConfigStep::Install(source) => {
-            tracing::info!(vm = %vm.name(), source = %source.display(), "installing its NixOS config");
-            let tree = files::read_tree(&source)?;
-            let flake =
-                RelativePath::parse("flake.nix").map_err(|_| BuilderError::MissingFlake {
-                    path: source.display().to_string(),
-                })?;
-            if !tree.contains(&flake) {
-                return Err(BuilderError::MissingFlake {
-                    path: source.display().to_string(),
-                });
-            }
-            files::replace_directory(&own, &tree)?;
+        ConfigStep::Install(source) => install(vm, &own, &source)?,
+        ConfigStep::InstallPreset(name) => {
+            let source = preset(presets, &name)?;
+            install(vm, &own, &source)?;
         }
     }
     let argv = match command {
@@ -195,12 +195,46 @@ async fn build(
     Ok(())
 }
 
+/// The VM's own config replaced by `source`, which must hold a `flake.nix`.
+fn install(vm: &VmPaths, own: &AbsolutePath, source: &AbsolutePath) -> Result<(), BuilderError> {
+    tracing::info!(vm = %vm.name(), source = %source.display(), "installing its NixOS config");
+    let tree = files::read_tree(source)?;
+    let missing = || BuilderError::MissingFlake {
+        path: source.display().to_string(),
+    };
+    let flake = RelativePath::parse("flake.nix").map_err(|_| missing())?;
+    if !tree.contains(&flake) {
+        return Err(missing());
+    }
+    files::replace_directory(own, &tree)?;
+    Ok(())
+}
+
+/// The preset's directory; `default` is created from the bundled config the first time.
+fn preset(presets: &AbsolutePath, name: &PresetName) -> Result<AbsolutePath, BuilderError> {
+    let directory = presets.join(name.as_str());
+    if directory.as_path().is_dir() {
+        return Ok(directory);
+    }
+    if *name != PresetName::default_preset() {
+        return Err(BuilderError::NoPreset {
+            name: name.as_str().to_owned(),
+            presets: presets.display().to_string(),
+        });
+    }
+    tracing::info!(preset = %directory.display(), "creating the default preset from the bundled config");
+    files::ensure_directory(presets, 0o755)?;
+    files::replace_directory(&directory, &bundled::config())?;
+    Ok(directory)
+}
+
 impl crate::diagnostic::Diagnostic for BuilderError {
     fn code(&self) -> &'static str {
         match self {
             Self::File(inner) => inner.code(),
             Self::Nix(inner) => inner.code(),
             Self::MissingFlake { .. } => "builder.missing_flake",
+            Self::NoPreset { .. } => "builder.no_preset",
         }
     }
     fn hint(&self) -> Option<String> {
@@ -210,6 +244,7 @@ impl crate::diagnostic::Diagnostic for BuilderError {
             Self::MissingFlake { .. } => Some(
                 "give a directory holding a flake.nix, or leave it out for the bundled one".into(),
             ),
+            Self::NoPreset { .. } => Some("see the presets with amoeboid presets".into()),
         }
     }
 }
@@ -264,6 +299,7 @@ mod tests {
             BuilderSetup {
                 report: twin.get_derived(),
                 command: BuildCommand::Scripted(Argv::for_tests(&["sh", "-c", script])),
+                presets: root.join("presets"),
             },
         )
         .await
@@ -337,6 +373,27 @@ mod tests {
         assert!(matches!(
             observation,
             BuilderObservation::BuildFailed { reason, .. } if reason.code == "builder.missing_flake"
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_default_preset_is_seeded_from_the_bundled_config_and_others_must_exist() {
+        let mut fixture = fixture("exit 0").await;
+        let default = NixConfig::Preset(PresetName::default_preset());
+        let observation = build_once(&mut fixture, default).await;
+        assert!(
+            matches!(observation, BuilderObservation::Built { .. }),
+            "{observation:?}"
+        );
+        assert_eq!(
+            files::read_tree(&fixture.vm.nix_config()).unwrap(),
+            bundled::config()
+        );
+        let missing = NixConfig::Preset(PresetName::parse("missing".into()).unwrap());
+        let observation = build_once(&mut fixture, missing).await;
+        assert!(matches!(
+            observation,
+            BuilderObservation::BuildFailed { reason, .. } if reason.code == "builder.no_preset"
         ));
     }
 }

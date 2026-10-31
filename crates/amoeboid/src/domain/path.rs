@@ -43,6 +43,12 @@ impl AbsolutePath {
         Self(self.0.join(segment))
     }
 
+    /// `path` below this one; a relative path has no `..`, so the result stays inside.
+    #[must_use]
+    pub(crate) fn join_relative(&self, path: &super::relative_path::RelativePath) -> Self {
+        Self(self.0.join(path.as_str()))
+    }
+
     /// The same path with `suffix` appended to its last segment (`a/b` + `.tmp` = `a/b.tmp`).
     #[must_use]
     pub(crate) fn with_suffix(&self, suffix: &str) -> Self {

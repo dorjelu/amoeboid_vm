@@ -1,5 +1,6 @@
 //! `amoeboid`: the operator's client for the amoeboid runtime.
 
+mod configuration;
 mod daemon;
 mod render;
 mod shares;
@@ -35,11 +36,14 @@ enum Command {
         /// The VM's name: letters, digits and '-', starting with a letter or digit.
         #[arg(long, default_value = "default")]
         name: String,
-        /// Create the VM's NixOS configuration from this directory, or replace it (rebase).
-        /// Without it, an existing VM keeps its own and a new one gets the bundled one.
-        #[arg(long, value_name = "DIRECTORY")]
+        /// Create the VM's NixOS configuration from this preset (see `amoeboid presets`) or
+        /// directory, or replace it (rebase). Without it, an existing VM keeps its own and a new
+        /// one is created from the base config set in the run configuration.
+        #[arg(long, value_name = "PRESET|DIRECTORY")]
         base_nix_config: Option<String>,
-        /// Directories to share into the VM, each PATH[:rw|:ro] (default rw).
+        /// Directories to share into the VM, each PATH[:rw|:ro] (default rw). Without any, an
+        /// existing VM shares what it shared last, and a new one the default shares set in the
+        /// run configuration.
         #[arg(value_name = "SHARE")]
         shares: Vec<String>,
     },
@@ -55,6 +59,15 @@ enum Command {
         #[command(subcommand)]
         action: DaemonAction,
     },
+    /// Manage `run_config.toml`, which the runtime reads at every start.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+    /// List the NixOS config presets new VMs can be created from: directories under the
+    /// configuration directory's `nix_presets`, each a flake. `default` is created from the
+    /// bundled config the first time it is needed.
+    Presets,
     /// Show where each VM is (or one, with --name).
     Status {
         /// Only this VM.
@@ -76,6 +89,13 @@ enum Command {
         /// The VM's name.
         name: String,
     },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Write `run_config.toml` with the defaults, and your git config among the files copied into
+    /// each VM's home if you have one. Refuses to replace an existing file.
+    Init,
 }
 
 #[derive(Subcommand)]
@@ -124,6 +144,19 @@ async fn run(command: Command) -> Result<(), Report> {
                 other @ ReplyBody::Vm(_) => Err(unexpected(&other)),
             }
         }
+        Command::Config {
+            action: ConfigAction::Init,
+        } => {
+            let written = configuration::init()?;
+            render::line(&format!("wrote {written}"));
+            Ok(())
+        }
+        Command::Presets => {
+            for line in configuration::presets()? {
+                render::line(&line);
+            }
+            Ok(())
+        }
         Command::Stop { name } => stop(&runtime_paths()?, name).await,
         Command::Status { name } => status(&runtime_paths()?, name).await,
         Command::VacuumVm { name } => vacuum(&runtime_paths()?, name).await,
@@ -140,13 +173,19 @@ async fn run(command: Command) -> Result<(), Report> {
                 hint: None,
             })?;
             let home = shares::home();
-            let shares = shares
-                .iter()
-                .map(|spec| shares::parse(spec, &working_directory, home.as_deref()))
-                .collect::<Result<Vec<_>, _>>()?;
+            let shares = if shares.is_empty() {
+                None
+            } else {
+                Some(
+                    shares
+                        .iter()
+                        .map(|spec| shares::parse(spec, &working_directory, home.as_deref()))
+                        .collect::<Result<Vec<_>, _>>()?,
+                )
+            };
             let nix_config = base_nix_config
                 .as_deref()
-                .map(|raw| shares::config_directory(raw, &working_directory))
+                .map(|raw| shares::nix_config_source(raw, &working_directory, home.as_deref()))
                 .transpose()?;
             let mut client = connect(&runtime_paths()?).await?;
             render::line(&format!(

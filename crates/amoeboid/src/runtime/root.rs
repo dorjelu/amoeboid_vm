@@ -38,6 +38,7 @@ use super::quarantine::{self, QuarantineCause, QuarantineEvent};
 use super::timing::ProcessTiming;
 use crate::clock::Clock;
 use crate::config::daemon::DaemonConfig;
+use crate::config::run::NixConfigSource;
 use crate::diagnostic::Report;
 use crate::domain::lifecycle::Incarnation;
 use crate::domain::path::AbsolutePath;
@@ -57,7 +58,9 @@ use crate::vm::builder::BuildCommand;
 use crate::vm::local_qemu::Placement;
 use crate::vm::twin::{FromVm, TwinMessage, VmCommand, VmOutcome, VmReport};
 use crate::vm::vacuum;
-use crate::vm::{Account, NixConfig, SshEndpoint, VmCondition, VmSpec, VmStatus};
+use crate::vm::{
+    Account, NixConfigRequest, SharesRequest, SshEndpoint, StartRequest, VmCondition, VmStatus,
+};
 
 #[derive(Debug)]
 pub enum RootMessage {
@@ -380,6 +383,7 @@ impl Actor for Root {
                 vm_defaults: args.vm_defaults,
                 restart: args.daemon.restart.policy(),
                 persist_timeout: args.daemon.timeouts.persist.duration(),
+                presets: args.config.presets(),
             },
             myself.get_cell(),
         )
@@ -931,36 +935,57 @@ fn reply(reply_to: &DerivedActorRef<ServerFrame>, operation: OperationId, body: 
     }
 }
 
-/// Checks the request against the world (shares: each a directory, none hiding the home), then
-/// hands it to the VM's twin.
+/// Reads `run_config.toml` (every start: a change applies to the next one), checks the given
+/// or default shares against the world (each a directory, none hiding the home), and hands the
+/// request to the VM's twin, which knows the VM's own shares and config.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one request's fields, unpacked where it is routed"
+)]
 fn start(
     state: &mut RootState,
     twin: &ActorRef<TwinMessage>,
     operation: OperationId,
     name: VmName,
-    shares: Vec<ShareRequest>,
-    nix_config: Option<AbsolutePath>,
+    shares: Option<Vec<ShareRequest>>,
+    nix_config: Option<NixConfigSource>,
     reply_to: &DerivedActorRef<ServerFrame>,
 ) -> Result<(), Report> {
-    // Read at every start: a change to the file applies to the next start.
     let run = crate::config::run::load(&state.config).map_err(|error| Report::of(&error))?;
     let home = AbsolutePath::parse(state.account.home.as_str().into())
         .map_err(|error| Report::of(&error))?;
-    let shares = Shares::validate(shares, &[home], |directory| {
-        directory.path().as_path().is_dir()
-    })
-    .map_err(|error| Report::of(&error))?;
-    let spec = VmSpec {
+    let validate = |shares| {
+        Shares::validate(shares, std::slice::from_ref(&home), |directory| {
+            directory.path().as_path().is_dir()
+        })
+        .map_err(|error| Report::of(&error))
+    };
+    let shares = match shares {
+        Some(given) => SharesRequest::Given(validate(given)?),
+        // Only used for a new VM: an unusable default fails only that.
+        None => SharesRequest::OwnElse(validate(run.new_vm.default_shares)),
+    };
+    let nix_config = match nix_config {
+        Some(source) => NixConfigRequest::Given(source.into()),
+        None => NixConfigRequest::OwnElse(run.new_vm.base_nix_config.into()),
+    };
+    let account = Account {
+        user: run.guest.user.unwrap_or_else(|| state.account.user.clone()),
+        ..state.account.clone()
+    };
+    let request = StartRequest {
         shares,
-        account: state.account.clone(),
-        nix_config: nix_config.map_or(NixConfig::Existing, NixConfig::From),
+        nix_config,
+        account,
+        home_files: run.guest.home_files,
+        ssh_port: run.ssh.port,
         boot_timeout_seconds: run.timeouts.boot.get(),
         powerdown_grace_seconds: run.timeouts.powerdown.get(),
     };
     state.waiters.insert(operation, (name, reply_to.clone()));
     twin.cast(PersistentMessage::Command(VmCommand::Start {
         operation,
-        spec,
+        request: Box::new(request),
         incarnation: Incarnation::mint(),
     }))
     .map_err(|error| unreachable_twin(&error))

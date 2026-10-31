@@ -243,7 +243,7 @@ async fn a_new_runtime_starts_every_known_twin_which_recovers_on_its_own() {
     let name = crate::domain::vm_name::VmName::parse("interrupted".into()).unwrap();
     let request = RequestBody::Vm(crate::protocol::VmRequest::Start {
         name,
-        shares: Vec::new(),
+        shares: None,
         nix_config: None,
     });
     // The start is building when the runtime goes away.
@@ -465,7 +465,7 @@ async fn an_unreplayable_vm_is_quarantined_recorded_once_and_refused() {
     for request in [
         VmRequest::Start {
             name: name.clone(),
-            shares: Vec::new(),
+            shares: None,
             nix_config: None,
         },
         VmRequest::Stop { name: name.clone() },
@@ -674,7 +674,7 @@ async fn a_vacuumed_name_starts_as_a_new_vm_after_the_tombstone() {
     let mut client = Client::connect(&fixture.paths).await.unwrap();
     let start = RequestBody::Vm(VmRequest::Start {
         name: vm_name("reused"),
-        shares: Vec::new(),
+        shares: None,
         nix_config: None,
     });
     // Vacuumed while building: the stop cancels the start.
@@ -749,7 +749,7 @@ async fn a_twin_out_of_restarts_fails_its_waiters_is_quarantined_and_can_be_rele
     let mut starter = Client::connect(&fixture.paths).await.unwrap();
     let start = RequestBody::Vm(VmRequest::Start {
         name: vm_name("halting"),
-        shares: Vec::new(),
+        shares: None,
         nix_config: None,
     });
     let pending = tokio::spawn(async move { starter.request(start).await });
@@ -893,4 +893,36 @@ async fn an_invalid_daemon_config_stops_the_runtime_from_starting_with_every_pro
         .map(|problem| problem.key.as_str())
         .collect();
     assert_eq!(keys, ["linger", "restart.max_restarts"]);
+}
+
+#[tokio::test]
+async fn an_invalid_run_config_fails_the_start_with_every_problem() {
+    use crate::protocol::VmRequest;
+    let fixture = fixture();
+    let config = config_paths(&fixture.paths);
+    std::fs::create_dir_all(config.directory().as_path()).unwrap();
+    std::fs::write(
+        config.run_config().as_path(),
+        "[ssh]\nport = -1\n[guest]\nshell = \"zsh\"\n",
+    )
+    .unwrap();
+    let runtime = start(&fixture.paths).await.unwrap();
+    let mut client = Client::connect(&fixture.paths).await.unwrap();
+    let reply = client
+        .request(RequestBody::Vm(VmRequest::Start {
+            name: vm_name("configured"),
+            shares: None,
+            nix_config: None,
+        }))
+        .await
+        .unwrap();
+    assert!(
+        matches!(&reply, ReplyBody::Failed(report)
+            if report.code == "config.run.invalid"
+                && report.message.contains("guest.shell")
+                && report.message.contains("ssh.port")),
+        "{reply:?}"
+    );
+    runtime.stop();
+    runtime.wait().await;
 }

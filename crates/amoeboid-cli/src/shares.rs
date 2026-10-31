@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
+use amoeboid::config::run::{NixConfigSource, PresetName};
 use amoeboid::diagnostic::Report;
 use amoeboid::domain::path::AbsolutePath;
 use amoeboid::domain::share::{HostDirectory, ShareRequest, split_mode};
@@ -64,25 +65,45 @@ pub fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
-/// `--base-nix-config`: resolved the same way, without a mode.
+/// `--base-nix-config`: a preset name (`default`, `rust`), or a directory, told apart as in the
+/// run configuration: anything with a `/`, a leading `~`, or `.`/`..` is a directory, resolved
+/// like a share.
 ///
 /// # Errors
 ///
-/// It doesn't resolve to an existing path.
-pub fn config_directory(raw: &str, working_directory: &Path) -> Result<AbsolutePath, Report> {
+/// A bad preset name, or a directory that doesn't resolve.
+pub fn nix_config_source(
+    raw: &str,
+    working_directory: &Path,
+    home: Option<&Path>,
+) -> Result<NixConfigSource, Report> {
+    let is_path = raw.contains('/') || raw.starts_with('~') || raw == "." || raw == "..";
+    if !is_path {
+        return PresetName::parse(raw.to_owned())
+            .map(NixConfigSource::Preset)
+            .map_err(|error| Report::of(&error));
+    }
+    let expanded = match (raw.strip_prefix('~'), home) {
+        (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with('/') => {
+            home.join(rest.trim_start_matches('/'))
+        }
+        _ => PathBuf::from(raw),
+    };
     let resolved = working_directory
-        .join(raw)
+        .join(expanded)
         .canonicalize()
         .map_err(|error| Report {
             code: "cli.base_nix_config.unresolvable".into(),
             message: format!("can't use {raw} as a NixOS config: {error}"),
-            hint: None,
+            hint: Some("give a preset name (see amoeboid presets) or a directory".into()),
         })?;
-    AbsolutePath::parse(resolved).map_err(|error| Report {
-        code: "cli.base_nix_config.path".into(),
-        message: error.to_string(),
-        hint: None,
-    })
+    AbsolutePath::parse(resolved)
+        .map(NixConfigSource::Directory)
+        .map_err(|error| Report {
+            code: "cli.base_nix_config.path".into(),
+            message: error.to_string(),
+            hint: None,
+        })
 }
 
 #[cfg(test)]
@@ -123,5 +144,26 @@ mod tests {
             parse("missing", &root, None).unwrap_err().code,
             "cli.share.unresolvable"
         );
+    }
+
+    #[test]
+    fn a_bare_name_is_a_preset_and_a_path_is_resolved_to_a_directory() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("nix/mine")).unwrap();
+        assert!(matches!(
+            nix_config_source("rust", &root, None).unwrap(),
+            NixConfigSource::Preset(name) if name.as_str() == "rust"
+        ));
+        assert!(matches!(
+            nix_config_source("nix/mine", &root, None).unwrap(),
+            NixConfigSource::Directory(path) if path.as_path() == root.join("nix/mine")
+        ));
+        assert!(matches!(
+            nix_config_source("~/nix/mine", Path::new("/"), Some(&root)).unwrap(),
+            NixConfigSource::Directory(path) if path.as_path() == root.join("nix/mine")
+        ));
+        assert!(nix_config_source("not a name", &root, None).is_err());
+        assert!(nix_config_source("./absent", &root, None).is_err());
     }
 }

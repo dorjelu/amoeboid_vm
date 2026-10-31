@@ -2,8 +2,24 @@
 
 /// `/`-separated, non-empty segments, none `.` or `..`, no NUL. Resolving it can never leave
 /// its root by name; symlinks are refused by the writers (`adapters::guest`, `adapters::files`).
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(
+    Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, serde::Serialize, serde::Deserialize,
+)]
+#[serde(try_from = "String", into = "String")]
 pub struct RelativePath(String);
+
+impl TryFrom<String> for RelativePath {
+    type Error = BadRelativePath;
+    fn try_from(path: String) -> Result<Self, BadRelativePath> {
+        Self::parse(&path)
+    }
+}
+
+impl From<RelativePath> for String {
+    fn from(path: RelativePath) -> Self {
+        path.0
+    }
+}
 
 #[derive(Clone, PartialEq, Eq, Debug, thiserror::Error)]
 #[error("{0:?} is not a plain relative path")]

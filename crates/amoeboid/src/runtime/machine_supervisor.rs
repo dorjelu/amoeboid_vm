@@ -20,6 +20,7 @@ use ractor::{Actor, ActorProcessingErr, ActorRef, DerivedActorRef, SupervisionEv
 use super::paths::RuntimePaths;
 use super::root::VmDefaults;
 use crate::diagnostic::Report;
+use crate::domain::path::AbsolutePath;
 use crate::domain::vm_name::VmName;
 use crate::journal::{JournalMessage, PersistFailure};
 use crate::persistent::machine::Fatal;
@@ -207,6 +208,8 @@ pub struct MachineSupervisorArgs {
     pub restart: RestartPolicy,
     /// How long a twin waits for the journal to persist.
     pub persist_timeout: Duration,
+    /// Where presets live (the twins' Builders seed and read them).
+    pub presets: AbsolutePath,
 }
 
 pub struct MachineSupervisor;
@@ -394,6 +397,7 @@ async fn spawn(
                             build: args.vm_defaults.build.clone(),
                             placement: args.vm_defaults.placement,
                             timing: args.vm_defaults.process,
+                            presets: args.presets.clone(),
                         },
                         persist_timeout: args.persist_timeout,
                     },
@@ -640,6 +644,7 @@ mod tests {
     async fn supervised(policy: RestartPolicy) -> Supervised {
         let temporary = tempfile::tempdir().unwrap();
         let root = AbsolutePath::parse(temporary.path().to_path_buf()).unwrap();
+        let root_path = root.clone();
         let paths = RuntimePaths::under(root.clone(), root).unwrap();
         let (journal, _) = Actor::spawn(
             None,
@@ -670,6 +675,7 @@ mod tests {
                 },
                 restart: policy,
                 persist_timeout: Duration::from_secs(5),
+                presets: root_path.join("presets"),
             },
         )
         .await

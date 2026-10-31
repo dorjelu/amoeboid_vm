@@ -115,6 +115,29 @@ pub fn clear_directory(path: &AbsolutePath) -> Result<(), FileError> {
     Ok(())
 }
 
+/// A regular file's bytes and permission bits; `None` when there is no such file (or it is not
+/// a regular file). Symlinks are followed: this reads the host user's own files.
+///
+/// # Errors
+///
+/// `Read`.
+pub fn read_regular_file(path: &AbsolutePath) -> Result<Option<(Vec<u8>, u32)>, FileError> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let failed = |source: std::io::Error| FileError::Read {
+        path: path.display().to_string(),
+        source,
+    };
+    match std::fs::metadata(path.as_path()) {
+        Ok(metadata) if metadata.is_file() => {
+            let bytes = std::fs::read(path.as_path()).map_err(failed)?;
+            Ok(Some((bytes, metadata.permissions().mode() & 0o777)))
+        }
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(failed(error)),
+    }
+}
+
 /// # Errors
 ///
 /// `Read`.

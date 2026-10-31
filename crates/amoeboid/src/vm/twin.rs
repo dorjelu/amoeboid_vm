@@ -19,7 +19,10 @@ use super::builder::{BuildCommand, Builder, BuilderCommand, BuilderObservation, 
 use super::guest_vm::{GuestVm, GuestVmCommand, GuestVmObservation};
 use super::hypervisor::{Adoptee, BootPlan, HypervisorCommand, HypervisorObservation};
 use super::local_qemu::{LocalQemu, LocalQemuSetup, Placement};
-use super::{Account, Backend, Generation, Incarnation, NixConfig, VmSpec};
+use super::{
+    Account, Backend, Generation, Incarnation, NixConfig, NixConfigRequest, SharesRequest,
+    StartRequest, VmSpec,
+};
 use crate::adapters::process::Exit;
 use crate::diagnostic::Report;
 use crate::domain::account::UserName;
@@ -40,7 +43,8 @@ pub struct VmTwin;
 pub enum VmCommand {
     Start {
         operation: OperationId,
-        spec: VmSpec,
+        /// Resolved into the start's spec by the twin: it knows the VM's own shares and config.
+        request: Box<StartRequest>,
         /// Used only if this VM has no history yet (its first start ever).
         incarnation: Incarnation,
     },
@@ -124,9 +128,9 @@ pub struct VmTwinState {
     /// The latest start's generation; `None` before the first.
     pub generation: Option<Generation>,
     pub vm: VmState,
-    /// The latest start's powerdown grace (its spec), so every stop of what it started uses
-    /// it, also one carried on after a restart.
-    pub powerdown_grace_seconds: u32,
+    /// The latest start's spec: its shares are the VM's own, and its powerdown grace applies
+    /// to every stop of what it started, also one carried on after a restart.
+    pub last_spec: Option<VmSpec>,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -286,6 +290,8 @@ pub struct VmSetup {
     pub build: BuildCommand,
     pub placement: Placement,
     pub timing: crate::runtime::timing::ProcessTiming,
+    /// Where presets live, for a new VM's or a rebase's config.
+    pub presets: crate::domain::path::AbsolutePath,
 }
 
 /// Refs to the twin's children (spawned by the twin itself when it starts) and to Root.
@@ -391,7 +397,7 @@ impl Behaviour for VmTwin {
             created: None,
             generation: None,
             vm: VmState::Stopped { last_failure: None },
-            powerdown_grace_seconds: super::DEFAULT_POWERDOWN_GRACE_SECONDS,
+            last_spec: None,
         }
     }
 
@@ -399,9 +405,9 @@ impl Behaviour for VmTwin {
         match command {
             VmCommand::Start {
                 operation,
-                spec,
+                request,
                 incarnation,
-            } => start(state, operation, spec, incarnation),
+            } => start(state, operation, *request, incarnation),
             VmCommand::Stop { operation } => stop(state, operation),
             VmCommand::Status { operation } => Effect::Send(one(done(
                 operation,
@@ -495,7 +501,7 @@ impl Behaviour for VmTwin {
                 .send_message(GuestVmCommand::Prepare {
                     generation,
                     vm: peers.vm.clone(),
-                    spec,
+                    spec: Box::new(spec),
                     seed_own_config,
                 })
                 .is_ok(),
@@ -583,6 +589,7 @@ impl Behaviour for VmTwin {
             BuilderSetup {
                 report: twin.get_derived(),
                 command: setup.build,
+                presets: setup.presets,
             },
             twin.get_cell(),
         )
@@ -616,10 +623,38 @@ impl Behaviour for VmTwin {
     }
 }
 
+/// The spec of a start: given shares and config, or the VM's own, or (a new VM) the defaults.
+/// `Err` when a new VM's default shares are unusable. Seeding the guest's own config copy
+/// happens for a new VM and for a given config (a rebase).
+fn resolve(state: &VmTwinState, request: StartRequest) -> Result<(VmSpec, bool), Report> {
+    let shares = match (request.shares, &state.last_spec) {
+        (SharesRequest::Given(shares), _) => shares,
+        (SharesRequest::OwnElse(_), Some(last)) => last.shares.clone(),
+        (SharesRequest::OwnElse(default), None) => default?,
+    };
+    let (nix_config, seed_own_config) = match request.nix_config {
+        NixConfigRequest::Given(nix_config) => (nix_config, true),
+        NixConfigRequest::OwnElse(_) if state.created.is_some() => (NixConfig::Existing, false),
+        NixConfigRequest::OwnElse(base) => (base, true),
+    };
+    Ok((
+        VmSpec {
+            shares,
+            account: request.account,
+            nix_config,
+            boot_timeout_seconds: request.boot_timeout_seconds,
+            powerdown_grace_seconds: request.powerdown_grace_seconds,
+            home_files: request.home_files,
+            ssh_port: request.ssh_port,
+        },
+        seed_own_config,
+    ))
+}
+
 fn start(
     state: &VmTwinState,
     operation: OperationId,
-    spec: VmSpec,
+    request: StartRequest,
     incarnation: Incarnation,
 ) -> Effect<VmEvent, VmOut> {
     match &state.vm {
@@ -637,7 +672,10 @@ fn start(
     else {
         return refuse(operation, &TwinError::GenerationsExhausted);
     };
-    let seed_own_config = state.created.is_none() || matches!(spec.nix_config, NixConfig::From(_));
+    let (spec, seed_own_config) = match resolve(state, request) {
+        Ok(resolved) => resolved,
+        Err(reason) => return Effect::Send(one(done(operation, Err(reason)))),
+    };
     let build = VmOut::Build {
         generation,
         account: spec.account.clone(),
@@ -977,25 +1015,33 @@ fn hypervisor(state: &VmTwinState, observation: HypervisorObservation) -> Effect
     }
 }
 
+/// How long the guest gets to power off: the latest start's grace.
+fn powerdown_grace(state: &VmTwinState) -> Duration {
+    Duration::from_secs(u64::from(
+        state
+            .last_spec
+            .as_ref()
+            .map_or(super::DEFAULT_POWERDOWN_GRACE_SECONDS, |spec| {
+                spec.powerdown_grace_seconds
+            }),
+    ))
+}
+
 /// The fold: total, so a replayed event never fails. Events of another generation than the
 /// state's leave it unchanged (they are never persisted that way, but the fold doesn't rely
 /// on it).
-fn powerdown_grace(state: &VmTwinState) -> Duration {
-    Duration::from_secs(u64::from(state.powerdown_grace_seconds))
-}
-
 fn evolve(state: VmTwinState, event: &VmEvent) -> VmTwinState {
     let VmTwinState {
         created,
         generation: latest,
         vm,
-        powerdown_grace_seconds,
+        last_spec,
     } = state;
     let rebuild = |vm| VmTwinState {
         created,
         generation: latest,
         vm,
-        powerdown_grace_seconds,
+        last_spec,
     };
     match event {
         VmEvent::Created {
@@ -1003,9 +1049,7 @@ fn evolve(state: VmTwinState, event: &VmEvent) -> VmTwinState {
             backend,
         } => VmTwinState {
             created: Some((*incarnation, *backend)),
-            generation: latest,
-            vm,
-            powerdown_grace_seconds,
+            ..rebuild(vm)
         },
         VmEvent::StartRequested {
             operation,
@@ -1015,7 +1059,7 @@ fn evolve(state: VmTwinState, event: &VmEvent) -> VmTwinState {
         } => VmTwinState {
             created,
             generation: Some(*generation),
-            powerdown_grace_seconds: spec.powerdown_grace_seconds,
+            last_spec: Some(spec.clone()),
             vm: VmState::Starting {
                 operation: *operation,
                 generation: *generation,
