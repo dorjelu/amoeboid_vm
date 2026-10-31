@@ -49,11 +49,17 @@ mod tests {
     use crate::domain::vm_name::VmNameError;
     use crate::journal::{PersistFailure, PersistenceId};
     use crate::persistent::Unrecoverable;
+    use crate::persistent::machine::Fatal;
     use crate::protocol::Refusal;
     use crate::protocol::codec::FrameError;
     use crate::runtime::StartError;
     use crate::runtime::lock::LockError;
     use crate::runtime::paths::LocationError;
+    use crate::runtime::root::RegistryError;
+
+    fn work() -> crate::domain::vm_name::VmName {
+        crate::domain::vm_name::VmName::parse("Work".into()).unwrap()
+    }
 
     fn io() -> std::io::Error {
         std::io::Error::from(std::io::ErrorKind::PermissionDenied)
@@ -68,6 +74,46 @@ mod tests {
     }
 
     /// One instance of every variant of every library diagnostic.
+    fn registry_and_twin_failures() -> Vec<Box<dyn Diagnostic>> {
+        vec![
+            // Uppercase names: messages must stay lowercase whatever the VM is called.
+            Box::new(RegistryError::Unknown(work())),
+            Box::new(RegistryError::Quarantined {
+                name: work(),
+                reason: "x".into(),
+                releasable: true,
+            }),
+            Box::new(RegistryError::Vacuuming(work())),
+            Box::new(RegistryError::Restarting {
+                name: work(),
+                attempt: 1,
+            }),
+            Box::new(RegistryError::TwinFailed {
+                name: work(),
+                reason: "x".into(),
+            }),
+            Box::new(RegistryError::NotReleasable(work())),
+            Box::new(RegistryError::NotQuarantined(work())),
+            Box::new(Fatal::Replay(crate::journal::tests_support::store_error(
+                "x",
+            ))),
+            Box::new(Fatal::Persist(PersistFailure::Conflict {
+                first: 1,
+                next: 2,
+            })),
+            Box::new(Fatal::Persist(PersistFailure::Store(
+                crate::journal::tests_support::store_error("x"),
+            ))),
+            Box::new(Fatal::PersistTimeout),
+            Box::new(Fatal::Encode("x".into())),
+            Box::new(Fatal::SeqOverflow),
+            Box::new(Fatal::ChildEnded {
+                child: "c".into(),
+                reason: "r".into(),
+            }),
+        ]
+    }
+
     fn protocol_journal_runtime_client() -> Vec<Box<dyn Diagnostic>> {
         let sequence = crate::journal::Sequence::FIRST;
         vec![
@@ -103,17 +149,6 @@ mod tests {
             Box::new(LockError::Open(io())),
             Box::new(LockError::Lock(io())),
             Box::new(LockError::Record(io())),
-            // Uppercase names: messages must stay lowercase whatever the VM is called.
-            Box::new(crate::runtime::root::RegistryError::Unknown(
-                crate::domain::vm_name::VmName::parse("Work".into()).unwrap(),
-            )),
-            Box::new(crate::runtime::root::RegistryError::Quarantined {
-                name: crate::domain::vm_name::VmName::parse("Work".into()).unwrap(),
-                reason: "x".into(),
-            }),
-            Box::new(crate::runtime::root::RegistryError::Vacuuming(
-                crate::domain::vm_name::VmName::parse("Work".into()).unwrap(),
-            )),
             Box::new(crate::vm::vacuum::VacuumError::Survived(2)),
             Box::new(crate::vm::vacuum::VacuumError::Process(ProcessError::List(
                 io(),
@@ -244,7 +279,6 @@ mod tests {
             Box::new(crate::vm::twin::TwinError::SshTimedOut(1)),
             Box::new(crate::vm::twin::TwinError::StoppedWhileStarting),
             Box::new(crate::vm::twin::TwinError::RestartedWhileStarting),
-            Box::new(crate::vm::twin::TwinError::ChildEnded("x".into())),
             Box::new(crate::vm::twin::TwinError::GenerationsExhausted),
             Box::new(crate::vm::twin::TwinError::Stopping),
             Box::new(crate::vm::twin::TwinError::Cancelled),
@@ -274,10 +308,15 @@ mod tests {
     }
 
     fn catalogue() -> Vec<Box<dyn Diagnostic>> {
-        [protocol_journal_runtime_client(), domain(), adapters()]
-            .into_iter()
-            .flatten()
-            .collect()
+        [
+            protocol_journal_runtime_client(),
+            registry_and_twin_failures(),
+            domain(),
+            adapters(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
     }
 
     #[test]

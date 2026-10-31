@@ -77,9 +77,16 @@ pub trait Behaviour: Send + Sync + Sized + 'static {
         myself: ActorCell,
     ) -> impl Future<Output = Result<Self::Peers, ActorProcessingErr>> + Send;
 
-    /// A linked child ended; the observation it means to this behaviour, if any. A child's
-    /// failure is a fact to decide on, not a reason for this actor to fail.
-    fn child_ended(child: ChildEnded) -> Option<Self::Observation>;
+    /// A linked child ended: an observation to decide on, or a reason for this actor to fail
+    /// (its supervisor restarts it, and recovery rebuilds the children). Chosen per child.
+    fn child_ended(child: ChildEnded) -> ChildPolicy<Self::Observation>;
+}
+
+/// What a persistent actor makes of a linked child's end.
+pub enum ChildPolicy<O> {
+    Observe(O),
+    /// Fail with [`machine::Fatal::ChildEnded`].
+    Escalate,
 }
 
 /// A linked child that stopped or failed, from a supervision event.
@@ -226,9 +233,28 @@ impl<B: Behaviour> Actor for Persistent<B> {
             }),
             SupervisionEvent::ActorStarted(_) | SupervisionEvent::ProcessGroupChanged(_) => None,
         };
-        std::future::ready(match ended.and_then(B::child_ended) {
-            Some(observation) => run(&myself, PersistentMessage::Observation(observation), state),
+        std::future::ready(match ended {
             None => Ok(()),
+            Some(child) => {
+                let name = child.name.clone().unwrap_or_else(|| "a child".into());
+                let reason = match &child.reason {
+                    ChildEndReason::Stopped(reason) => reason.clone().unwrap_or_default(),
+                    ChildEndReason::Failed(reason) => reason.clone(),
+                };
+                match B::child_ended(child) {
+                    ChildPolicy::Observe(observation) => {
+                        run(&myself, PersistentMessage::Observation(observation), state)
+                    }
+                    ChildPolicy::Escalate => {
+                        let fatal = machine::Fatal::ChildEnded {
+                            child: name,
+                            reason,
+                        };
+                        tracing::error!(id = state.id.as_str(), %fatal, "stopping");
+                        Err(fatal.into())
+                    }
+                }
+            }
         })
     }
 }

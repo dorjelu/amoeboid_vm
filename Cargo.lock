@@ -18,7 +18,6 @@ dependencies = [
  "listenfd",
  "proptest",
  "ractor",
- "ractor-supervisor",
  "rustix",
  "serde",
  "serde_json",
@@ -545,12 +544,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
-name = "if_chain"
-version = "1.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd62e6b5e86ea8eeeb8db1de02880a6abc01a397b2ebb64b5d74ac255318f5cb"
-
-[[package]]
 name = "indexmap"
 version = "2.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -806,20 +799,6 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-time",
-]
-
-[[package]]
-name = "ractor-supervisor"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "98e817d6ba63d0fe751878b2d7018ae967d7a3d84f362673ce02842a0075bce4"
-dependencies = [
- "futures-util",
- "if_chain",
- "log",
- "ractor",
- "thiserror",
- "uuid",
 ]
 
 [[package]]
@@ -1318,7 +1297,6 @@ version = "1.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a0e2d11620c50695fe12bbbfde96b3477fe606e7284c22d505c12ce51214514"
 dependencies = [
- "getrandom",
  "js-sys",
  "wasm-bindgen",
 ]

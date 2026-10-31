@@ -129,10 +129,15 @@ pub enum VmCondition {
     },
     /// Its twin didn't answer in time (Root's view, never the twin's).
     Unknown,
-    /// Its history can't be replayed; nothing runs for it until `amoeboid vacuum_vm` removes
-    /// it (Root's view, from the VM's quarantine record).
-    Quarantined {
+    /// Its twin failed and is restarted after a backoff (Root's view).
+    Restarting {
         reason: crate::diagnostic::Report,
+        attempt: u32,
+    },
+    /// No twin runs for it until the quarantine is lifted (Root's view, from the VM's
+    /// quarantine record).
+    Quarantined {
+        cause: crate::runtime::quarantine::QuarantineCause,
     },
 }
 

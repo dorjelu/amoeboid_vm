@@ -96,6 +96,9 @@ pub enum Fatal {
     Encode(String),
     #[error("stream position overflow")]
     SeqOverflow,
+    /// A linked child ended and the behaviour escalates its end.
+    #[error("{child} ended: {reason}")]
+    ChildEnded { child: String, reason: String },
 }
 
 pub struct Core<B: Behaviour> {
@@ -472,4 +475,28 @@ fn decode<B: Behaviour>(events: &[StoredEvent]) -> Result<Vec<B::Event>, Unrecov
             })
         })
         .collect()
+}
+
+impl crate::diagnostic::Diagnostic for Fatal {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::Replay(_) => "persistent.fatal.replay",
+            Self::Persist(PersistFailure::Conflict { .. }) => "persistent.fatal.conflict",
+            Self::Persist(PersistFailure::Store(_)) => "persistent.fatal.persist",
+            Self::PersistTimeout => "persistent.fatal.persist_timeout",
+            Self::Encode(_) => "persistent.fatal.encode",
+            Self::SeqOverflow => "persistent.fatal.sequence_overflow",
+            Self::ChildEnded { .. } => "persistent.fatal.child_ended",
+        }
+    }
+    fn hint(&self) -> Option<String> {
+        match self {
+            Self::Replay(_)
+            | Self::Persist(_)
+            | Self::PersistTimeout
+            | Self::Encode(_)
+            | Self::SeqOverflow
+            | Self::ChildEnded { .. } => None,
+        }
+    }
 }

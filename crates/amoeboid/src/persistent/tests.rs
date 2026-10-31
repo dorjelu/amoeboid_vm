@@ -125,8 +125,8 @@ impl<const AUTO: bool> Behaviour for Counter<AUTO> {
     ) -> impl Future<Output = Result<Peers, ActorProcessingErr>> + Send {
         std::future::ready(Ok(setup))
     }
-    fn child_ended(_: ChildEnded) -> Option<CounterObservation> {
-        None
+    fn child_ended(_: ChildEnded) -> ChildPolicy<CounterObservation> {
+        ChildPolicy::Escalate
     }
 }
 

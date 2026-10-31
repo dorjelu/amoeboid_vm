@@ -125,7 +125,7 @@ Root ─┬─ Journal            linked, essential  ─┐
 
 * Budget: 5 restarts within 10 minutes per VM; backoff 1 s, doubling, at most 30 s. The first failure restarts; quarantine comes only once the budget is spent.
 * Twins fail with a typed failure, downcast by the supervisor; anything that doesn't downcast (a panic, an unknown error) is a bug. Reactions start as: persist conflict restarts at once without backoff; persist timeout, replay store error, an escalated child, a spawn failure and a bug restart after backoff. All count against the budget. Per-cause budgets and per-VM policy are room for later, inside the supervisor.
-* Quarantine records carry a cause: `Unreplayable` (only `vacuum_vm` removes it) or `SuspiciousHalt` (the restart budget is spent; the record keeps the restart count and the last failures). Nothing touches the world when a twin fails, so processes, journal and logs stay for debugging. An operator command lifts a `SuspiciousHalt` quarantine: a tombstone on the record, a fresh budget, the twin spawned again. Lifting an `Unreplayable` quarantine is refused with a hint to vacuum.
+* Quarantine records carry a cause: `Unreplayable` (only `vacuum_vm` removes it) or `SuspiciousHalt` (the restart budget is spent; the record keeps the restart count and the last failures). Nothing touches the world when a twin fails, so processes, journal and logs stay for debugging. `amoeboid release_vm NAME` (`VmRequest::Release`, answered `VmReply::Released`) lifts a `SuspiciousHalt` quarantine: a tombstone on the record, a fresh budget, the twin spawned again. Releasing an `Unreplayable` quarantine is refused (`runtime.vm.not_releasable`) with a hint to vacuum; releasing a VM that isn't quarantined is `runtime.vm.not_quarantined`. Quarantine records are version 2 (`{"quarantined": {"cause": …}}`); version 1 records read as `Unreplayable`.
 
 === Requests by state
 
@@ -138,7 +138,15 @@ Root ─┬─ Journal            linked, essential  ─┐
 |Quarantined |refused |Root answers `Quarantined { cause, reason }`
 |===
 
-When a twin fails, Root answers every operation waiting on it with the failure. Root learns a twin's reference from the supervisor (`Up`), so it never awaits a spawn in its own handler.
+When a twin fails, Root answers every operation waiting on it with the failure (`runtime.vm.twin_failed`). Root learns a twin's reference from the supervisor (`Up`), so it never awaits a spawn in its own handler; a status question waits for twins being spawned and asks them once up.
+
+Root's children (Journal, Listener, MachineSupervisor) are all essential, so its supervision handler has nothing to tell apart: any end ends the runtime. Which twin end is expected (a terminate) is known only to the supervisor, which owns the link.
+
+Implementation notes:
+
+* A failed twin's children are killed asynchronously and may still hold their registry names when it is respawned, so children are named `<twin>/<role>@<twin actor id>`. The twin's own name is freed before its supervisor hears of the end (ractor unregisters on `Stopping`), so a restart at once can't collide.
+* A vacuum terminates the twin through the supervisor; a twin that is up stops the VM gracefully first. A twin that fails while the vacuum waits for its stop is terminated instead.
+* The twin's error for a start interrupted by a restart now reads "the VM's twin restarted while the VM was starting" (`vm.restarted_while_starting`): it applies to a runtime restart and to a supervisor restart alike.
 
 == Runtime placement
 
@@ -178,4 +186,3 @@ The CLI remainders (long options only, `amoeboid ssh`, a boot timeout option) an
 
 == Open questions
 
-* The name of the command that lifts a `SuspiciousHalt` quarantine.

@@ -13,6 +13,7 @@ use amoeboid::protocol::{
     ReplyBody, RequestBody, RuntimeReply, RuntimeRequest, VmReply, VmRequest,
 };
 use amoeboid::runtime::paths::RuntimePaths;
+use amoeboid::runtime::quarantine::QuarantineCause;
 use amoeboid::vm::{StartStep, VmCondition};
 use clap::{Parser, Subcommand};
 
@@ -68,6 +69,13 @@ enum Command {
         /// The VM's name.
         name: String,
     },
+    /// Retry a VM quarantined because its runtime kept failing: lift the quarantine and start
+    /// its runtime again with a fresh restart budget. The VM itself is not started or stopped.
+    #[command(name = "release_vm")]
+    ReleaseVm {
+        /// The VM's name.
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -119,6 +127,7 @@ async fn run(command: Command) -> Result<(), Report> {
         Command::Stop { name } => stop(&runtime_paths()?, name).await,
         Command::Status { name } => status(&runtime_paths()?, name).await,
         Command::VacuumVm { name } => vacuum(&runtime_paths()?, name).await,
+        Command::ReleaseVm { name } => release(&runtime_paths()?, name).await,
         Command::Start {
             name,
             base_nix_config,
@@ -164,7 +173,10 @@ async fn run(command: Command) -> Result<(), Report> {
                 ReplyBody::Failed(failure) => Err(failure),
                 other @ (ReplyBody::Runtime(_)
                 | ReplyBody::Vm(
-                    VmReply::Stopped { .. } | VmReply::Status { .. } | VmReply::Vacuumed { .. },
+                    VmReply::Stopped { .. }
+                    | VmReply::Status { .. }
+                    | VmReply::Vacuumed { .. }
+                    | VmReply::Released { .. },
                 )) => Err(unexpected(&other)),
             }
         }
@@ -183,7 +195,31 @@ async fn stop(paths: &RuntimePaths, name: String) -> Result<(), Report> {
         ReplyBody::Failed(failure) => Err(failure),
         other @ (ReplyBody::Runtime(_)
         | ReplyBody::Vm(
-            VmReply::Started { .. } | VmReply::Status { .. } | VmReply::Vacuumed { .. },
+            VmReply::Started { .. }
+            | VmReply::Status { .. }
+            | VmReply::Vacuumed { .. }
+            | VmReply::Released { .. },
+        )) => Err(unexpected(&other)),
+    }
+}
+
+async fn release(paths: &RuntimePaths, name: String) -> Result<(), Report> {
+    let name = VmName::parse(name).map_err(|error| report(&error))?;
+    let mut client = connect(paths).await?;
+    match request(&mut client, RequestBody::Vm(VmRequest::Release { name })).await? {
+        ReplyBody::Vm(VmReply::Released { name }) => {
+            render::line(&format!(
+                "'{name}' is released; see amoeboid status for its condition"
+            ));
+            Ok(())
+        }
+        ReplyBody::Failed(failure) => Err(failure),
+        other @ (ReplyBody::Runtime(_)
+        | ReplyBody::Vm(
+            VmReply::Started { .. }
+            | VmReply::Stopped { .. }
+            | VmReply::Status { .. }
+            | VmReply::Vacuumed { .. },
         )) => Err(unexpected(&other)),
     }
 }
@@ -200,7 +236,10 @@ async fn vacuum(paths: &RuntimePaths, name: String) -> Result<(), Report> {
         ReplyBody::Failed(failure) => Err(failure),
         other @ (ReplyBody::Runtime(_)
         | ReplyBody::Vm(
-            VmReply::Started { .. } | VmReply::Stopped { .. } | VmReply::Status { .. },
+            VmReply::Started { .. }
+            | VmReply::Stopped { .. }
+            | VmReply::Status { .. }
+            | VmReply::Released { .. },
         )) => Err(unexpected(&other)),
     }
 }
@@ -228,7 +267,10 @@ async fn status(paths: &RuntimePaths, name: Option<String>) -> Result<(), Report
         ReplyBody::Failed(failure) => Err(failure),
         other @ (ReplyBody::Runtime(_)
         | ReplyBody::Vm(
-            VmReply::Started { .. } | VmReply::Stopped { .. } | VmReply::Vacuumed { .. },
+            VmReply::Started { .. }
+            | VmReply::Stopped { .. }
+            | VmReply::Vacuumed { .. }
+            | VmReply::Released { .. },
         )) => Err(unexpected(&other)),
     }
 }
@@ -266,9 +308,21 @@ fn describe(condition: &VmCondition) -> String {
             reason.message
         ),
         VmCondition::Unknown => "unknown: its twin didn't answer".into(),
-        VmCondition::Quarantined { reason } => format!(
+        VmCondition::Restarting { reason, attempt } => {
+            format!("restarting (attempt {attempt}): {}", reason.message)
+        }
+        VmCondition::Quarantined {
+            cause: cause @ QuarantineCause::SuspiciousHalt { .. },
+        } => format!(
+            "quarantined: {}; kept for inspection (amoeboid release_vm retries it, \
+             amoeboid vacuum_vm removes it)",
+            cause.summary()
+        ),
+        VmCondition::Quarantined {
+            cause: cause @ QuarantineCause::Unreplayable { .. },
+        } => format!(
             "quarantined: {}; kept for inspection (amoeboid vacuum_vm removes it)",
-            reason.message
+            cause.summary()
         ),
     }
 }

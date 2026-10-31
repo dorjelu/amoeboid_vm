@@ -9,6 +9,7 @@
 
 pub mod listener;
 pub mod lock;
+pub mod machine_supervisor;
 pub mod paths;
 pub mod quarantine;
 pub mod root;

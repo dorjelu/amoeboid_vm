@@ -210,6 +210,7 @@ async fn a_new_runtime_starts_every_known_twin_which_recovers_on_its_own() {
     let slow_build = root::VmDefaults {
         build: BuildCommand::Scripted(crate::plan::argv::Argv::for_tests(&["sleep", "3"])),
         placement: Placement::Direct,
+        restart: super::machine_supervisor::RestartPolicy::production(),
     };
     let first = start_with(&fixture.paths, Persistence::Sqlite, slow_build.clone())
         .await
@@ -387,8 +388,8 @@ async fn quarantined(
     client: &mut Client,
     paths: &RuntimePaths,
     name: &str,
-) -> Option<crate::diagnostic::Report> {
-    let Some(crate::vm::VmCondition::Quarantined { reason }) = status_of(client, name).await else {
+) -> Option<super::quarantine::QuarantineCause> {
+    let Some(crate::vm::VmCondition::Quarantined { cause }) = status_of(client, name).await else {
         return None;
     };
     let id = format!("quarantine/{name}");
@@ -404,7 +405,7 @@ async fn quarantined(
         if let Some(crate::journal::JournalReply::Replayed { replay, .. }) = answers.first()
             && !replay.events.is_empty()
         {
-            return Some(reason);
+            return Some(cause);
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
@@ -424,12 +425,13 @@ async fn an_unreplayable_vm_is_quarantined_recorded_once_and_refused() {
     .await
     .unwrap();
     let mut client = Client::connect(&fixture.paths).await.unwrap();
-    let reason = quarantined(&mut client, &fixture.paths, "broken")
+    let cause = quarantined(&mut client, &fixture.paths, "broken")
         .await
         .unwrap();
-    assert_eq!(
-        reason.code,
-        "persistent.unrecoverable.unknown_event_version"
+    assert!(
+        matches!(&cause, super::quarantine::QuarantineCause::Unreplayable { reason }
+            if reason.code == "persistent.unrecoverable.unknown_event_version"),
+        "{cause:?}"
     );
     let name = crate::domain::vm_name::VmName::parse("broken".into()).unwrap();
     for request in [
@@ -463,7 +465,7 @@ async fn an_unreplayable_vm_is_quarantined_recorded_once_and_refused() {
         return assert_eq!("a replay", "something else");
     };
     assert_eq!(replay.events.len(), 1);
-    assert_eq!(super::quarantine::reason(&replay.events), Some(reason));
+    assert_eq!(super::quarantine::cause(&replay.events), Some(cause));
 }
 
 #[tokio::test]
@@ -632,6 +634,7 @@ async fn a_vacuumed_name_starts_as_a_new_vm_after_the_tombstone() {
     let defaults = |seconds: &'static str| root::VmDefaults {
         build: BuildCommand::Scripted(crate::plan::argv::Argv::for_tests(&["sleep", seconds])),
         placement: Placement::Direct,
+        restart: super::machine_supervisor::RestartPolicy::production(),
     };
     let runtime = start_with(&fixture.paths, Persistence::Sqlite, defaults("3"))
         .await
@@ -681,4 +684,107 @@ async fn a_vacuumed_name_starts_as_a_new_vm_after_the_tombstone() {
     let first = reused.events.first().unwrap();
     assert_eq!(first.sequence.get(), tombstone + 1);
     assert!(first.payload.as_str().contains("\"created\""), "{first:?}");
+}
+
+#[tokio::test]
+async fn a_twin_out_of_restarts_fails_its_waiters_is_quarantined_and_can_be_released() {
+    use super::quarantine::QuarantineCause;
+    use crate::protocol::{VmReply, VmRequest};
+    use crate::vm::VmCondition;
+    use crate::vm::builder::BuildCommand;
+    use crate::vm::local_qemu::Placement;
+    let fixture = fixture();
+    // No restarts allowed: the first failure gives the VM up.
+    let defaults = root::VmDefaults {
+        build: BuildCommand::Scripted(crate::plan::argv::Argv::for_tests(&["sleep", "3"])),
+        placement: Placement::Direct,
+        restart: super::machine_supervisor::RestartPolicy {
+            max_restarts: 0,
+            ..super::machine_supervisor::RestartPolicy::production()
+        },
+    };
+    let runtime = start_with(&fixture.paths, Persistence::Sqlite, defaults)
+        .await
+        .unwrap();
+    let mut starter = Client::connect(&fixture.paths).await.unwrap();
+    let start = RequestBody::Vm(VmRequest::Start {
+        name: vm_name("halting"),
+        shares: Vec::new(),
+        nix_config: None,
+    });
+    let pending = tokio::spawn(async move { starter.request(start).await });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // The twin's builder ends mid-build: the twin escalates, and has no restart left.
+    let twin = ractor::registry::where_is(format!("{}/vm/halting", runtime.id())).unwrap();
+    ractor::registry::where_is(format!(
+        "{}/vm/halting/builder@{}",
+        runtime.id(),
+        twin.get_id()
+    ))
+    .unwrap()
+    .kill();
+    let failed = pending.await.unwrap().unwrap();
+    assert!(
+        matches!(&failed, ReplyBody::Failed(report) if report.code == "runtime.vm.twin_failed"),
+        "{failed:?}"
+    );
+    let mut client = Client::connect(&fixture.paths).await.unwrap();
+    let cause = quarantined(&mut client, &fixture.paths, "halting")
+        .await
+        .unwrap();
+    assert!(
+        matches!(&cause, QuarantineCause::SuspiciousHalt { restarts: 0, failures }
+            if failures.len() == 1 && failures[0].code == "persistent.fatal.child_ended"),
+        "{cause:?}"
+    );
+    let refused = client
+        .request(RequestBody::Vm(VmRequest::Stop {
+            name: vm_name("halting"),
+        }))
+        .await
+        .unwrap();
+    assert!(
+        matches!(&refused, ReplyBody::Failed(report)
+            if report.code == "runtime.vm.quarantined"
+                && report.hint.as_deref().is_some_and(|hint| hint.contains("release_vm"))),
+        "{refused:?}"
+    );
+
+    let released = client
+        .request(RequestBody::Vm(VmRequest::Release {
+            name: vm_name("halting"),
+        }))
+        .await
+        .unwrap();
+    assert!(
+        matches!(released, ReplyBody::Vm(VmReply::Released { .. })),
+        "{released:?}"
+    );
+    // A fresh twin replays the interrupted start as failed; the VM is addressable again.
+    let condition = status_of(&mut client, "halting").await;
+    assert!(
+        matches!(&condition, Some(VmCondition::Failed { reason, .. })
+            if reason.code == "vm.restarted_while_starting"),
+        "{condition:?}"
+    );
+    let again = client
+        .request(RequestBody::Vm(VmRequest::Release {
+            name: vm_name("halting"),
+        }))
+        .await
+        .unwrap();
+    assert!(
+        matches!(&again, ReplyBody::Failed(report) if report.code == "runtime.vm.not_quarantined"),
+        "{again:?}"
+    );
+    runtime.stop();
+    runtime.wait().await;
+    let record = replay(&fixture.paths, "quarantine/halting").await;
+    assert_eq!(
+        (
+            record.events.len(),
+            record.last.map(crate::journal::Sequence::get)
+        ),
+        (0, Some(1))
+    );
 }

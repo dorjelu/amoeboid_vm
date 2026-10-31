@@ -27,7 +27,7 @@ use crate::domain::process::{ProcessIdentity, ProcessRole};
 use crate::domain::share::Shares;
 use crate::nonempty::NonEmpty;
 use crate::persistent::{
-    Behaviour, ChildEndReason, ChildEnded, Effect, PersistentMessage, Unrecoverable,
+    Behaviour, ChildEnded, ChildPolicy, Effect, PersistentMessage, Unrecoverable,
 };
 use crate::protocol::OperationId;
 use crate::runtime::paths::VmPaths;
@@ -55,8 +55,6 @@ pub enum VmObservation {
     Builder(BuilderObservation),
     GuestVm(GuestVmObservation),
     Hypervisor(HypervisorObservation),
-    /// A child actor ended without being asked to (a bug: children don't fail by design).
-    ChildEnded(ChildEnded),
 }
 
 /// The twin's history; persisted, so only facts and decisions, never derived paths.
@@ -306,10 +304,9 @@ pub enum TwinError {
     SshTimedOut(u32),
     #[error("the machine stopped while starting")]
     StoppedWhileStarting,
-    #[error("the runtime restarted while the VM was starting")]
+    /// The twin was restarted (with the runtime, or by its supervisor) mid-start.
+    #[error("the VM's twin restarted while the VM was starting")]
     RestartedWhileStarting,
-    #[error("a part of the VM's runtime ended unexpectedly: {0}")]
-    ChildEnded(String),
     #[error("no generation is left for this VM")]
     GenerationsExhausted,
     #[error("the VM is stopping")]
@@ -327,7 +324,6 @@ impl crate::diagnostic::Diagnostic for TwinError {
             Self::SshTimedOut(_) => "vm.ssh_timed_out",
             Self::StoppedWhileStarting => "vm.stopped_while_starting",
             Self::RestartedWhileStarting => "vm.restarted_while_starting",
-            Self::ChildEnded(_) => "vm.child_ended",
             Self::GenerationsExhausted => "vm.generations_exhausted",
             Self::Stopping => "vm.stopping",
             Self::Cancelled => "vm.cancelled",
@@ -342,7 +338,7 @@ impl crate::diagnostic::Diagnostic for TwinError {
             Self::SshTimedOut(_) | Self::StoppedWhileStarting => {
                 Some("see the VM's console.log".into())
             }
-            Self::RestartedWhileStarting | Self::ChildEnded(_) => Some("start it again".into()),
+            Self::RestartedWhileStarting => Some("start it again".into()),
             Self::Stopping => Some("wait for the stop to finish, then start it".into()),
             Self::GenerationsExhausted | Self::Cancelled => None,
         }
@@ -562,10 +558,16 @@ impl Behaviour for VmTwin {
     }
 
     async fn start(setup: VmSetup, myself: ActorCell) -> Result<VmPeers, ActorProcessingErr> {
+        // Named after the twin, so a child's end names it in logs and in the twin's failure.
+        // The twin's actor id makes the names unique per incarnation: a failed twin's children
+        // are killed asynchronously and may still hold their names when it is respawned.
+        let id = myself.get_id();
+        let child = |role: &str| myself.get_name().map(|twin| format!("{twin}/{role}@{id}"));
+        let names = (child("builder"), child("guest_vm"), child("hypervisor"));
         let twin: ractor::ActorRef<crate::persistent::PersistentMessage<VmCommand, VmObservation>> =
             myself.into();
         let (builder, _) = Actor::spawn_linked(
-            None,
+            names.0,
             Builder,
             BuilderSetup {
                 report: twin.get_derived(),
@@ -575,9 +577,9 @@ impl Behaviour for VmTwin {
         )
         .await?;
         let (guest_vm, _) =
-            Actor::spawn_linked(None, GuestVm, twin.get_derived(), twin.get_cell()).await?;
+            Actor::spawn_linked(names.1, GuestVm, twin.get_derived(), twin.get_cell()).await?;
         let (hypervisor, _) = Actor::spawn_linked(
-            None,
+            names.2,
             LocalQemu,
             LocalQemuSetup {
                 report: twin.get_derived(),
@@ -595,8 +597,10 @@ impl Behaviour for VmTwin {
         })
     }
 
-    fn child_ended(child: ChildEnded) -> Option<VmObservation> {
-        Some(VmObservation::ChildEnded(child))
+    /// The twin and its children are one restart unit (0003 §Supervision): any child's end
+    /// fails the twin, and recovery rebuilds all of them from the stream.
+    fn child_ended(_child: ChildEnded) -> ChildPolicy<VmObservation> {
+        ChildPolicy::Escalate
     }
 }
 
@@ -654,28 +658,6 @@ fn on_observation(state: &VmTwinState, observation: VmObservation) -> Effect<VmE
         VmObservation::Builder(observation) => builder(state, observation),
         VmObservation::GuestVm(observation) => guest_vm(state, observation),
         VmObservation::Hypervisor(observation) => hypervisor(state, observation),
-        VmObservation::ChildEnded(child) => match &state.vm {
-            VmState::Starting {
-                operation,
-                generation,
-                ..
-            } => {
-                let reason = match child.reason {
-                    ChildEndReason::Stopped(reason) => reason.unwrap_or_default(),
-                    ChildEndReason::Failed(reason) => reason,
-                };
-                let name = child.name.unwrap_or_else(|| "a child".into());
-                fail(
-                    *operation,
-                    *generation,
-                    Report::of(&TwinError::ChildEnded(format!("{name}: {reason}"))),
-                )
-            }
-            VmState::Stopped { .. }
-            | VmState::Running { .. }
-            | VmState::Failed { .. }
-            | VmState::Stopping { .. } => Effect::None,
-        },
     }
 }
 

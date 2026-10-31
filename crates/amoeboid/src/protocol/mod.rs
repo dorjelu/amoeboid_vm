@@ -160,6 +160,11 @@ pub enum VmRequest {
     Vacuum {
         name: crate::domain::vm_name::VmName,
     },
+    /// Lift a quarantine whose cause is a suspicious halt (the twin kept failing): its record
+    /// is retired and the twin is started again with a fresh restart budget.
+    Release {
+        name: crate::domain::vm_name::VmName,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -177,6 +182,9 @@ pub enum VmReply {
         vms: Vec<crate::vm::VmStatus>,
     },
     Vacuumed {
+        name: crate::domain::vm_name::VmName,
+    },
+    Released {
         name: crate::domain::vm_name::VmName,
     },
 }

@@ -1,21 +1,25 @@
-//! Root actor: spawns the journal and listener, answers runtime requests, and routes VM
-//! requests to each VM's twin, which it spawns on first use.
+//! Root actor: spawns the journal, the listener and the machine supervisor, answers runtime
+//! requests, and routes VM requests to each VM's twin.
 //!
-//! Root-level strategy: the journal and listener are essential, so the death of either ends
-//! the runtime (systemd restarts it; VMs outlive it by design). A twin that ends is dropped from
-//! the registry and spawned again by the next request for its VM.
+//! Root-level strategy: the journal, the listener and the machine supervisor are essential, so
+//! the end of any of them ends the runtime (systemd restarts it; VMs outlive it by design).
+//! Twins are not Root's children: the machine supervisor runs and restarts them (0003
+//! §Supervision), and Root routes by what it reports.
 //!
 //! Root knows clients only through the in-memory `waiters` table: which session waits on which
 //! operation. A twin answers by operation id; a client reference never enters persisted state.
 //!
 //! ```text
 //! pre_start ─▶ Streams{quarantine} ─▶ Replay quarantine/<name> × listed ─┐
-//!           └▶ Streams{vm} ──────────────────────────────────────────────┴▶ loaded: twins for
+//!           └▶ Streams{vm} ──────────────────────────────────────────────┴▶ loaded: Ensure every
 //!              requests held until loaded                                  vm/* not quarantined
-//! twin Unrecoverable ─▶ quarantined (in memory) ─▶ Replay quarantine/<name>
-//!                       ─▶ no live event: Persist Quarantined at last + 1 (conflict: recorded)
-//! Vacuum ─▶ [twin, not quarantined] Stop ─▶ Stopped ─┐
-//!        └▶ [quarantined] ───────────────────────────┴▶ stop the twin actor ─▶ vacuum task
+//! Ensure ─▶ route Spawning (requests held) ─▶ Up{twin} ─▶ route Up (held requests handled)
+//! Restarting ─▶ route Restarting, waiters failed    Exhausted ─▶ quarantine SuspiciousHalt
+//! twin Unrecoverable ─▶ quarantine Unreplayable
+//! quarantine ─▶ Replay quarantine/<name> ─▶ no live event: Persist at last + 1 (conflict: recorded)
+//! Release (SuspiciousHalt) ─▶ Retire quarantine/<name> ─▶ Ensure (fresh budget) ─▶ Released
+//! Vacuum ─▶ [twin up, not quarantined] Stop ─▶ Stopped ─┐
+//!        └▶ [otherwise] ────────────────────────────────┴▶ Terminate ─▶ Terminated ─▶ vacuum task
 //!           (end processes, remove directories) ─▶ Vacuumed ─▶ Retire vm/<name>
 //!           ─▶ Retire quarantine/<name> ─▶ reply Vacuumed
 //! ```
@@ -26,8 +30,12 @@ use std::time::Duration;
 use ractor::{Actor, ActorProcessingErr, ActorRef, DerivedActorRef, SupervisionEvent};
 
 use super::listener::{Listener, ListenerArgs};
+use super::machine_supervisor::{
+    MachineReport, MachineSupervisor, MachineSupervisorArgs, MachineSupervisorMessage,
+    RestartPolicy,
+};
 use super::paths::RuntimePaths;
-use super::quarantine::{self, QuarantineEvent};
+use super::quarantine::{self, QuarantineCause, QuarantineEvent};
 use crate::diagnostic::Report;
 use crate::domain::lifecycle::Incarnation;
 use crate::domain::path::AbsolutePath;
@@ -38,14 +46,14 @@ use crate::journal::{
     PersistenceId, Replay, Sequence, StoreError,
 };
 use crate::nonempty::NonEmpty;
-use crate::persistent::{Persistent, PersistentArgs, PersistentMessage};
+use crate::persistent::PersistentMessage;
 use crate::protocol::{
     OperationId, ReplyBody, RequestBody, RuntimeId, RuntimeReply, RuntimeRequest, ServerFrame,
     VmReply, VmRequest,
 };
 use crate::vm::builder::BuildCommand;
 use crate::vm::local_qemu::Placement;
-use crate::vm::twin::{FromVm, TwinMessage, VmCommand, VmOutcome, VmReport, VmSetup, VmTwin};
+use crate::vm::twin::{FromVm, TwinMessage, VmCommand, VmOutcome, VmReport};
 use crate::vm::vacuum;
 use crate::vm::{Account, NixConfig, SshEndpoint, VmCondition, VmSpec, VmStatus};
 
@@ -70,6 +78,8 @@ pub enum RootMessage {
     FromVm(FromVm),
     /// The journal's answer to Root's own questions: stream listings and quarantine records.
     Journal(JournalReply),
+    /// The machine supervisor's report: a twin up, restarting, given up or terminated.
+    Machine(MachineReport),
     /// A status collection's time is up: answer with what has arrived.
     StatusTimeout { operation: OperationId },
     /// A vacuum task finished ending the VM's processes and removing its directories.
@@ -79,49 +89,61 @@ pub enum RootMessage {
     },
 }
 
-impl From<JournalReply> for RootMessage {
-    fn from(reply: JournalReply) -> Self {
-        Self::Journal(reply)
-    }
-}
-
-impl TryFrom<RootMessage> for JournalReply {
-    type Error = RootMessage;
-    fn try_from(message: RootMessage) -> Result<Self, RootMessage> {
-        match message {
-            RootMessage::Journal(reply) => Ok(reply),
-            other @ (RootMessage::Request { .. }
-            | RootMessage::FromVm(_)
-            | RootMessage::StatusTimeout { .. }
-            | RootMessage::Vacuumed { .. }) => Err(other),
+/// One wrapper variant per derived type keeps `TryFrom` total (ractor's `get_derived`).
+/// `$others` are every other variant, so a new variant fails to compile until listed.
+macro_rules! derived {
+    ($variant:ident, $type:ty, $($others:pat_param)|+) => {
+        impl From<$type> for RootMessage {
+            fn from(message: $type) -> Self {
+                Self::$variant(message)
+            }
         }
-    }
-}
-
-impl From<FromVm> for RootMessage {
-    fn from(report: FromVm) -> Self {
-        Self::FromVm(report)
-    }
-}
-
-impl TryFrom<RootMessage> for FromVm {
-    type Error = RootMessage;
-    fn try_from(message: RootMessage) -> Result<Self, RootMessage> {
-        match message {
-            RootMessage::FromVm(report) => Ok(report),
-            other @ (RootMessage::Request { .. }
-            | RootMessage::Journal(_)
-            | RootMessage::StatusTimeout { .. }
-            | RootMessage::Vacuumed { .. }) => Err(other),
+        impl TryFrom<RootMessage> for $type {
+            type Error = RootMessage;
+            fn try_from(message: RootMessage) -> Result<Self, RootMessage> {
+                match message {
+                    RootMessage::$variant(inner) => Ok(inner),
+                    other @ ($($others)|+) => Err(other),
+                }
+            }
         }
-    }
+    };
 }
+derived!(
+    Journal,
+    JournalReply,
+    RootMessage::Request { .. }
+        | RootMessage::FromVm(_)
+        | RootMessage::Machine(_)
+        | RootMessage::StatusTimeout { .. }
+        | RootMessage::Vacuumed { .. }
+);
+derived!(
+    FromVm,
+    FromVm,
+    RootMessage::Request { .. }
+        | RootMessage::Journal(_)
+        | RootMessage::Machine(_)
+        | RootMessage::StatusTimeout { .. }
+        | RootMessage::Vacuumed { .. }
+);
+derived!(
+    Machine,
+    MachineReport,
+    RootMessage::Request { .. }
+        | RootMessage::FromVm(_)
+        | RootMessage::Journal(_)
+        | RootMessage::StatusTimeout { .. }
+        | RootMessage::Vacuumed { .. }
+);
 
-/// How twins run their children: `nix build` and scoped processes in production.
+/// How twins run their children (`nix build` and scoped processes in production) and how
+/// often a failed twin is restarted.
 #[derive(Clone, Debug)]
 pub struct VmDefaults {
     pub build: BuildCommand,
     pub placement: Placement,
+    pub restart: RestartPolicy,
 }
 
 impl VmDefaults {
@@ -130,6 +152,7 @@ impl VmDefaults {
         Self {
             build: BuildCommand::Nix,
             placement: Placement::Scoped,
+            restart: RestartPolicy::production(),
         }
     }
 }
@@ -147,22 +170,22 @@ pub struct RootArgs {
 pub struct Root;
 
 pub struct RootState {
-    id: RuntimeId,
     /// `vm`: the parent of every twin's stream, `vm/<name>`.
     vm_streams: PersistenceId,
     /// `quarantine`: the parent of every quarantine record, `quarantine/<name>`.
     quarantine_streams: PersistenceId,
     paths: RuntimePaths,
     account: Account,
-    vm_defaults: VmDefaults,
     journal: ActorRef<JournalMessage>,
-    twins: BTreeMap<VmName, ActorRef<TwinMessage>>,
+    machines: ActorRef<MachineSupervisorMessage>,
+    /// Where each VM's requests go, as the machine supervisor last reported.
+    routes: BTreeMap<VmName, Route>,
     waiters: BTreeMap<OperationId, (VmName, DerivedActorRef<ServerFrame>)>,
     statuses: BTreeMap<OperationId, StatusCollection>,
-    /// Quarantined VMs and why: recorded in the journal, or reported since start. No twin is
-    /// spawned for them and no request reaches one.
-    quarantined: BTreeMap<VmName, Report>,
-    /// Quarantines reported since start whose record is being looked up before the append.
+    /// Quarantined VMs and why: recorded in the journal, or decided since start. No request
+    /// reaches their twin.
+    quarantined: BTreeMap<VmName, QuarantineCause>,
+    /// Quarantines decided since start whose record is being looked up before the append.
     recording: BTreeSet<VmName>,
     /// Quarantine appends in flight.
     appending: BTreeMap<BatchId, VmName>,
@@ -171,8 +194,23 @@ pub struct RootState {
     loading: Option<Loading>,
     /// Vacuums in progress; other requests that would change the VM are refused meanwhile.
     vacuums: BTreeMap<VmName, Vacuum>,
-    /// Twins stopped by a vacuum: their end is expected.
-    vacuumed_twins: BTreeMap<VmName, ActorRef<TwinMessage>>,
+    /// Releases in progress: the quarantine record is being retired.
+    releases: BTreeMap<VmName, (OperationId, DerivedActorRef<ServerFrame>)>,
+}
+
+enum Route {
+    /// `Ensure` sent; requests for the VM wait here, in order.
+    Spawning {
+        held: Vec<RootMessage>,
+    },
+    Up {
+        twin: ActorRef<TwinMessage>,
+    },
+    /// The twin failed; the supervisor restarts it after a backoff.
+    Restarting {
+        reason: Report,
+        attempt: u32,
+    },
 }
 
 struct Vacuum {
@@ -184,13 +222,15 @@ struct Vacuum {
 enum VacuumStep {
     /// The twin is stopping the VM gracefully, as operation `stop`.
     Stopping { stop: OperationId },
+    /// The supervisor is stopping the twin.
+    Terminating,
     /// The vacuum task is ending what is left and removing the directories.
     Removing,
     /// Retiring streams in order; the first is in flight.
     Retiring { remaining: Vec<PersistenceId> },
 }
 
-/// Start-up: the registry is known once both listings and every quarantine reason are in.
+/// Start-up: the registry is known once both listings and every quarantine cause are in.
 /// Requests that arrive meanwhile are held, then handled in order, so no request sees a
 /// registry that is still being filled.
 #[derive(Default)]
@@ -198,7 +238,7 @@ struct Loading {
     held: Vec<RootMessage>,
     /// `None` until the `vm` listing arrives.
     vms: Option<Vec<VmName>>,
-    /// `None` until the `quarantine` listing arrives; then the names whose reason is pending.
+    /// `None` until the `quarantine` listing arrives; then the names whose cause is pending.
     quarantines: Option<BTreeSet<VmName>>,
 }
 
@@ -208,15 +248,27 @@ impl Loading {
     }
 }
 
-/// Requests Root refuses before any twin sees them.
+/// Requests Root refuses or fails before or instead of a twin.
 #[derive(Debug, thiserror::Error)]
 pub enum RegistryError {
     #[error("there is no VM named {0}")]
     Unknown(VmName),
     #[error("the VM {name} is quarantined: {reason}")]
-    Quarantined { name: VmName, reason: String },
+    Quarantined {
+        name: VmName,
+        reason: String,
+        releasable: bool,
+    },
     #[error("the VM {0} is being vacuumed")]
     Vacuuming(VmName),
+    #[error("the twin of the VM {name} failed and is restarting (attempt {attempt})")]
+    Restarting { name: VmName, attempt: u32 },
+    #[error("the twin of the VM {name} failed: {reason}")]
+    TwinFailed { name: VmName, reason: String },
+    #[error("the VM {0} is quarantined because its history can't be replayed")]
+    NotReleasable(VmName),
+    #[error("the VM {0} is not quarantined")]
+    NotQuarantined(VmName),
 }
 
 impl crate::diagnostic::Diagnostic for RegistryError {
@@ -225,15 +277,36 @@ impl crate::diagnostic::Diagnostic for RegistryError {
             Self::Unknown(_) => "runtime.vm.unknown",
             Self::Quarantined { .. } => "runtime.vm.quarantined",
             Self::Vacuuming(_) => "runtime.vm.vacuuming",
+            Self::Restarting { .. } => "runtime.vm.restarting",
+            Self::TwinFailed { .. } => "runtime.vm.twin_failed",
+            Self::NotReleasable(_) => "runtime.vm.not_releasable",
+            Self::NotQuarantined(_) => "runtime.vm.not_quarantined",
         }
     }
     fn hint(&self) -> Option<String> {
         match self {
-            Self::Unknown(_) => Some("see the VMs with amoeboid status".into()),
-            Self::Quarantined { name, .. } => Some(format!(
+            Self::Unknown(_) | Self::NotQuarantined(_) => {
+                Some("see the VMs with amoeboid status".into())
+            }
+            Self::Quarantined {
+                name,
+                releasable: true,
+                ..
+            } => Some(format!(
+                "its logs and history are kept for inspection; retry it with amoeboid release_vm \
+                 {name}, or remove it with amoeboid vacuum_vm {name}"
+            )),
+            Self::Quarantined {
+                name,
+                releasable: false,
+                ..
+            }
+            | Self::NotReleasable(name) => Some(format!(
                 "its history is kept for inspection; remove the VM with amoeboid vacuum_vm {name}"
             )),
             Self::Vacuuming(_) => Some("wait for the vacuum to finish".into()),
+            Self::Restarting { .. } => Some("retry shortly; see amoeboid status".into()),
+            Self::TwinFailed { .. } => Some("see amoeboid status, then retry".into()),
         }
     }
 }
@@ -241,6 +314,8 @@ impl crate::diagnostic::Diagnostic for RegistryError {
 /// A status question to several twins, answered when all have replied or time is up.
 struct StatusCollection {
     collected: BTreeMap<VmName, VmCondition>,
+    /// VMs whose twin is being spawned: asked once it is up.
+    spawning: BTreeSet<VmName>,
     reply_to: DerivedActorRef<ServerFrame>,
 }
 
@@ -268,7 +343,7 @@ impl StatusCollection {
 #[derive(Debug, thiserror::Error)]
 #[error("essential actor {name} ended: {reason}")]
 struct EssentialEnded {
-    name: &'static str,
+    name: String,
     reason: String,
 }
 
@@ -288,6 +363,21 @@ impl Actor for Root {
             JournalArgs {
                 persistence: args.persistence,
                 paths: args.paths.clone(),
+            },
+            myself.get_cell(),
+        )
+        .await?;
+        let (machines, _) = Actor::spawn_linked(
+            Some(format!("{}/machines", args.id)),
+            MachineSupervisor,
+            MachineSupervisorArgs {
+                runtime: args.id,
+                report: myself.get_derived(),
+                from_vm: myself.get_derived(),
+                journal: journal.clone(),
+                paths: args.paths.clone(),
+                vm_defaults: args.vm_defaults,
+                persist_timeout: PERSIST_TIMEOUT,
             },
             myself.get_cell(),
         )
@@ -314,14 +404,13 @@ impl Actor for Root {
             })?;
         }
         Ok(RootState {
-            id: args.id,
             vm_streams,
             quarantine_streams,
             paths: args.paths,
             account: args.account,
-            vm_defaults: args.vm_defaults,
             journal,
-            twins: BTreeMap::new(),
+            machines,
+            routes: BTreeMap::new(),
             waiters: BTreeMap::new(),
             statuses: BTreeMap::new(),
             quarantined: BTreeMap::new(),
@@ -330,7 +419,7 @@ impl Actor for Root {
             next_batch: BatchId::FIRST,
             loading: Some(Loading::default()),
             vacuums: BTreeMap::new(),
-            vacuumed_twins: BTreeMap::new(),
+            releases: BTreeMap::new(),
         })
     }
 
@@ -348,7 +437,7 @@ impl Actor for Root {
         if state.loading.as_ref().is_some_and(Loading::complete)
             && let Some(loading) = state.loading.take()
         {
-            loaded(&myself, state, loading.vms.unwrap_or_default()).await;
+            loaded(state, loading.vms.unwrap_or_default());
             for message in loading.held {
                 handle(&myself, message, state).await;
             }
@@ -356,11 +445,12 @@ impl Actor for Root {
         Ok(())
     }
 
+    /// Every child of Root is essential: whichever ends, the runtime ends.
     fn handle_supervisor_evt(
         &self,
         _myself: ActorRef<RootMessage>,
         event: SupervisionEvent,
-        state: &mut RootState,
+        _state: &mut RootState,
     ) -> impl Future<Output = Result<(), ActorProcessingErr>> + Send {
         let ended = match event {
             SupervisionEvent::ActorTerminated(cell, _, reason) => {
@@ -369,39 +459,17 @@ impl Actor for Root {
             SupervisionEvent::ActorFailed(cell, error) => Some((cell, error.to_string())),
             SupervisionEvent::ActorStarted(_) | SupervisionEvent::ProcessGroupChanged(_) => None,
         };
-        let result = match ended {
+        std::future::ready(match ended {
             None => Ok(()),
             Some((cell, reason)) => {
-                let vacuumed = state
-                    .vacuumed_twins
-                    .iter()
-                    .find(|(_, twin)| twin.get_id() == cell.get_id())
-                    .map(|(name, _)| name.clone());
-                if let Some(name) = vacuumed {
-                    tracing::debug!(vm = %name, "twin stopped for a vacuum");
-                    state.vacuumed_twins.remove(&name);
-                    return std::future::ready(Ok(()));
-                }
-                let twin = state
-                    .twins
-                    .iter()
-                    .find(|(_, twin)| twin.get_id() == cell.get_id())
-                    .map(|(name, _)| name.clone());
-                if let Some(name) = twin {
-                    tracing::warn!(vm = %name, %reason, "twin ended; spawned again on the next request");
-                    state.twins.remove(&name);
-                    Ok(())
-                } else {
-                    let ended = EssentialEnded {
-                        name: essential_name(&cell, state.id),
-                        reason,
-                    };
-                    tracing::error!(%ended, "runtime ending");
-                    Err(ended.into())
-                }
+                let ended = EssentialEnded {
+                    name: cell.get_name().unwrap_or_else(|| "an unnamed child".into()),
+                    reason,
+                };
+                tracing::error!(%ended, "runtime ending");
+                Err(ended.into())
             }
-        };
-        std::future::ready(result)
+        })
     }
 }
 
@@ -415,51 +483,12 @@ async fn handle(myself: &ActorRef<RootMessage>, message: RootMessage, state: &mu
         } => reply(&reply_to, operation, ReplyBody::Runtime(RuntimeReply::Pong)),
         RootMessage::Request {
             operation,
-            body:
-                RequestBody::Vm(VmRequest::Start {
-                    name,
-                    shares,
-                    nix_config,
-                }),
+            body: RequestBody::Vm(request),
             reply_to,
-        } => {
-            let started = start(
-                myself, state, operation, name, shares, nix_config, &reply_to,
-            )
-            .await;
-            if let Err(failure) = started {
-                reply(&reply_to, operation, ReplyBody::Failed(failure));
-            }
-        }
-        RootMessage::Request {
-            operation,
-            body: RequestBody::Vm(VmRequest::Stop { name }),
-            reply_to,
-        } => {
-            let sent = known_twin(state, &name).and_then(|twin| {
-                twin.cast(PersistentMessage::Command(VmCommand::Stop { operation }))
-                    .map_err(|error| unreachable_twin(&error))
-            });
-            match sent {
-                Ok(()) => {
-                    state.waiters.insert(operation, (name, reply_to));
-                }
-                Err(failure) => reply(&reply_to, operation, ReplyBody::Failed(failure)),
-            }
-        }
-        RootMessage::Request {
-            operation,
-            body: RequestBody::Vm(VmRequest::Status { name }),
-            reply_to,
-        } => status(myself, state, operation, name, reply_to),
-        RootMessage::Request {
-            operation,
-            body: RequestBody::Vm(VmRequest::Vacuum { name }),
-            reply_to,
-        } => begin_vacuum(myself, state, operation, name, reply_to),
+        } => vm_request(myself, state, operation, request, reply_to),
         RootMessage::Vacuumed { name, result } => match result {
             Ok(()) => retire_next(myself, state, &name, None),
-            Err(failure) => vacuum_failed(myself, state, &name, failure).await,
+            Err(failure) => vacuum_failed(state, &name, failure),
         },
         RootMessage::StatusTimeout { operation } => {
             if let Some(collection) = state.statuses.remove(&operation) {
@@ -467,19 +496,210 @@ async fn handle(myself: &ActorRef<RootMessage>, message: RootMessage, state: &mu
             }
         }
         RootMessage::FromVm(FromVm { vm, report }) => from_vm(myself, state, &vm, report),
-        RootMessage::Journal(reply) => journal(myself, state, reply).await,
+        RootMessage::Journal(reply) => journal(myself, state, reply),
+        RootMessage::Machine(report) => machine(myself, state, report).await,
     }
 }
 
+fn vm_request(
+    myself: &ActorRef<RootMessage>,
+    state: &mut RootState,
+    operation: OperationId,
+    request: VmRequest,
+    reply_to: DerivedActorRef<ServerFrame>,
+) {
+    let name = match &request {
+        VmRequest::Status { name } => {
+            return status(myself, state, operation, name.clone(), reply_to);
+        }
+        VmRequest::Vacuum { name } => {
+            return begin_vacuum(state, operation, name.clone(), reply_to);
+        }
+        VmRequest::Release { name } => {
+            return release(myself, state, operation, name.clone(), reply_to);
+        }
+        VmRequest::Start { name, .. } | VmRequest::Stop { name } => name.clone(),
+    };
+    if let Some(refusal) = refusal(state, &name) {
+        return reply(&reply_to, operation, ReplyBody::Failed(refusal));
+    }
+    let twin = match state.routes.get_mut(&name) {
+        Some(Route::Up { twin }) => twin.clone(),
+        Some(Route::Spawning { held }) => {
+            return held.push(RootMessage::Request {
+                operation,
+                body: RequestBody::Vm(request),
+                reply_to,
+            });
+        }
+        Some(Route::Restarting { attempt, .. }) => {
+            let failure = Report::of(&RegistryError::Restarting {
+                name,
+                attempt: *attempt,
+            });
+            return reply(&reply_to, operation, ReplyBody::Failed(failure));
+        }
+        // A first start creates the VM: its twin is spawned for it.
+        None if matches!(request, VmRequest::Start { .. }) => {
+            let held = RootMessage::Request {
+                operation,
+                body: RequestBody::Vm(request),
+                reply_to,
+            };
+            return ensure(state, name, vec![held]);
+        }
+        None => {
+            let failure = Report::of(&RegistryError::Unknown(name));
+            return reply(&reply_to, operation, ReplyBody::Failed(failure));
+        }
+    };
+    let sent = match request {
+        VmRequest::Start {
+            name,
+            shares,
+            nix_config,
+        } => start(state, &twin, operation, name, shares, nix_config, &reply_to),
+        VmRequest::Stop { name } => stop(state, &twin, operation, name, &reply_to),
+        VmRequest::Status { .. } | VmRequest::Vacuum { .. } | VmRequest::Release { .. } => Ok(()),
+    };
+    if let Err(failure) = sent {
+        reply(&reply_to, operation, ReplyBody::Failed(failure));
+    }
+}
+
+/// Asks the supervisor for the VM's twin; `held` waits for it.
+fn ensure(state: &mut RootState, name: VmName, held: Vec<RootMessage>) {
+    if let Err(error) = state
+        .machines
+        .cast(MachineSupervisorMessage::Ensure { name: name.clone() })
+    {
+        tracing::error!(vm = %name, %error, "can't reach the machine supervisor");
+    }
+    state.routes.insert(name, Route::Spawning { held });
+}
+
 /// The registry is known: a twin for every VM that isn't quarantined.
-async fn loaded(myself: &ActorRef<RootMessage>, state: &mut RootState, vms: Vec<VmName>) {
+fn loaded(state: &mut RootState, vms: Vec<VmName>) {
     for name in vms {
         if state.quarantined.contains_key(&name) {
             tracing::warn!(vm = %name, "quarantined; its twin is not started");
             continue;
         }
-        if let Err(failure) = twin(myself, state, &name).await {
-            tracing::error!(vm = %name, message = failure.message, "can't start its twin");
+        ensure(state, name, Vec::new());
+    }
+}
+
+/// The machine supervisor's report.
+async fn machine(myself: &ActorRef<RootMessage>, state: &mut RootState, report: MachineReport) {
+    match report {
+        MachineReport::Up { name, twin } => {
+            let previous = state
+                .routes
+                .insert(name.clone(), Route::Up { twin: twin.clone() });
+            for (operation, collection) in &mut state.statuses {
+                if collection.spawning.remove(&name) {
+                    let _ = twin.cast(PersistentMessage::Command(VmCommand::Status {
+                        operation: *operation,
+                    }));
+                }
+            }
+            if let Some(Route::Spawning { held }) = previous {
+                for message in held {
+                    Box::pin(handle(myself, message, state)).await;
+                }
+            }
+        }
+        MachineReport::Restarting {
+            name,
+            failure,
+            attempt,
+            ..
+        } => {
+            twin_failed(state, &name, &failure.report);
+            state.routes.insert(
+                name.clone(),
+                Route::Restarting {
+                    reason: failure.report.clone(),
+                    attempt,
+                },
+            );
+            settle_statuses(state, &name, || VmCondition::Restarting {
+                reason: failure.report.clone(),
+                attempt,
+            });
+        }
+        MachineReport::Exhausted {
+            name,
+            restarts,
+            failures,
+        } => {
+            let last = failures.last().map(|failure| failure.report.clone());
+            if let Some(last) = &last {
+                twin_failed(state, &name, last);
+            }
+            state.routes.remove(&name);
+            let cause = QuarantineCause::SuspiciousHalt {
+                restarts,
+                failures: failures.into_iter().map(|failure| failure.report).collect(),
+            };
+            settle_statuses(state, &name, || VmCondition::Quarantined {
+                cause: cause.clone(),
+            });
+            quarantine(myself, state, &name, cause);
+        }
+        MachineReport::Terminated { name } => {
+            state.routes.remove(&name);
+            if let Some(vacuum) = state.vacuums.get_mut(&name)
+                && matches!(vacuum.step, VacuumStep::Terminating)
+            {
+                remove(myself, state, &name);
+            }
+        }
+    }
+}
+
+/// A twin failed: every operation waiting on it is answered, and a vacuum waiting for its stop
+/// goes on to terminate it.
+fn twin_failed(state: &mut RootState, name: &VmName, reason: &Report) {
+    let failed: Vec<OperationId> = state
+        .waiters
+        .iter()
+        .filter(|(_, (vm, _))| vm == name)
+        .map(|(operation, _)| *operation)
+        .collect();
+    for operation in failed {
+        if let Some((_, reply_to)) = state.waiters.remove(&operation) {
+            let failure = Report::of(&RegistryError::TwinFailed {
+                name: name.clone(),
+                reason: reason.message.clone(),
+            });
+            reply(&reply_to, operation, ReplyBody::Failed(failure));
+        }
+    }
+    if let Some(vacuum) = state.vacuums.get_mut(name)
+        && matches!(vacuum.step, VacuumStep::Stopping { .. })
+    {
+        vacuum.step = VacuumStep::Terminating;
+        terminate(state, name);
+    }
+}
+
+/// Status collections still waiting on `name` get `condition` for it.
+fn settle_statuses(state: &mut RootState, name: &VmName, condition: impl Fn() -> VmCondition) {
+    let mut complete = Vec::new();
+    for (operation, collection) in &mut state.statuses {
+        let waiting = collection.spawning.remove(name)
+            || collection.collected.get(name) == Some(&VmCondition::Unknown);
+        if waiting {
+            collection.collected.insert(name.clone(), condition());
+            if collection.complete() && collection.spawning.is_empty() {
+                complete.push(*operation);
+            }
+        }
+    }
+    for operation in complete {
+        if let Some(collection) = state.statuses.remove(&operation) {
+            collection.reply(operation);
         }
     }
 }
@@ -499,8 +719,8 @@ fn names_below(ids: Vec<PersistenceId>, parent: &PersistenceId) -> Vec<VmName> {
         .collect()
 }
 
-async fn journal(myself: &ActorRef<RootMessage>, state: &mut RootState, reply: JournalReply) {
-    match reply {
+fn journal(myself: &ActorRef<RootMessage>, state: &mut RootState, answer: JournalReply) {
+    match answer {
         JournalReply::Streams { under, ids } => listed(myself, state, &under, ids),
         JournalReply::StreamsFailed { under, reason } => {
             tracing::error!(under = under.as_str(), %reason, "can't list streams; treated as none");
@@ -527,18 +747,24 @@ async fn journal(myself: &ActorRef<RootMessage>, state: &mut RootState, reply: J
             }
         }
         JournalReply::Retired { id } => {
-            if let Some(name) = retiring(state, &id) {
+            if let Some(name) = releasing(state, &id) {
+                released(state, &name);
+            } else if let Some(name) = retiring(state, &id) {
                 retire_next(myself, state, &name, Some(&id));
             }
         }
         JournalReply::RetireFailed { id, reason } => {
-            if let Some(name) = retiring(state, &id) {
-                let failure = Report {
-                    code: "runtime.vm.retire".into(),
-                    message: format!("can't retire {}: {reason}", id.as_str()),
-                    hint: None,
-                };
-                vacuum_failed(myself, state, &name, failure).await;
+            let failure = Report {
+                code: "runtime.vm.retire".into(),
+                message: format!("can't retire {}: {reason}", id.as_str()),
+                hint: None,
+            };
+            if let Some(name) = releasing(state, &id) {
+                if let Some((operation, reply_to)) = state.releases.remove(&name) {
+                    reply(&reply_to, operation, ReplyBody::Failed(failure));
+                }
+            } else if let Some(name) = retiring(state, &id) {
+                vacuum_failed(state, &name, failure);
             }
         }
     }
@@ -566,6 +792,21 @@ fn listed(
     }
 }
 
+/// Marks the VM quarantined and records it, unless it already is. Nothing reaches its twin
+/// from now on; a live twin (an unrecoverable one) stays alive refusing commands.
+fn quarantine(
+    myself: &ActorRef<RootMessage>,
+    state: &mut RootState,
+    name: &VmName,
+    cause: QuarantineCause,
+) {
+    tracing::error!(vm = %name, cause = cause.summary(), "VM quarantined");
+    if state.quarantined.insert(name.clone(), cause).is_none() {
+        state.recording.insert(name.clone());
+        ask_record(myself, state, name);
+    }
+}
+
 /// Asks the journal for a VM's quarantine record.
 fn ask_record(myself: &ActorRef<RootMessage>, state: &RootState, name: &VmName) {
     let asked = state
@@ -586,7 +827,7 @@ fn ask_record(myself: &ActorRef<RootMessage>, state: &RootState, name: &VmName) 
     }
 }
 
-/// A quarantine record: its reason at start, or, for a quarantine reported since, whether it
+/// A quarantine record: its cause at start, or, for a quarantine decided since, whether it
 /// still has to be appended.
 fn quarantine_replayed(
     myself: &ActorRef<RootMessage>,
@@ -606,8 +847,8 @@ fn quarantine_replayed(
         .and_then(|loading| loading.quarantines.as_mut())
         && pending.remove(&name)
     {
-        if let Some(reason) = quarantine::reason(&replay.events) {
-            state.quarantined.insert(name, reason);
+        if let Some(cause) = quarantine::cause(&replay.events) {
+            state.quarantined.insert(name, cause);
         }
         return;
     }
@@ -617,13 +858,13 @@ fn quarantine_replayed(
     if !replay.events.is_empty() {
         return tracing::debug!(vm = %name, "quarantine already recorded");
     }
-    let Some(reason) = state.quarantined.get(&name).cloned() else {
+    let Some(cause) = state.quarantined.get(&name).cloned() else {
         return;
     };
     let appended = Sequence::after(replay.last)
         .ok_or_else(|| "stream position overflow".to_owned())
         .and_then(|first| {
-            let event = quarantine::encode(QuarantineEvent::Quarantined { reason })
+            let event = quarantine::encode(&QuarantineEvent::Quarantined { cause })
                 .map_err(|error| error.to_string())?;
             let batch = state.next_batch;
             state
@@ -663,10 +904,12 @@ fn quarantine_unreadable(state: &mut RootState, id: &PersistenceId, reason: &Sto
     {
         state.quarantined.insert(
             name,
-            Report {
-                code: "runtime.quarantine.unreadable".into(),
-                message: format!("can't read the quarantine record: {reason}"),
-                hint: None,
+            QuarantineCause::Unreplayable {
+                reason: Report {
+                    code: "runtime.quarantine.unreadable".into(),
+                    message: format!("can't read the quarantine record: {reason}"),
+                    hint: None,
+                },
             },
         );
         return;
@@ -685,25 +928,21 @@ fn reply(reply_to: &DerivedActorRef<ServerFrame>, operation: OperationId, body: 
 
 /// Checks the request against the world (shares: each a directory, none hiding the home), then
 /// hands it to the VM's twin.
-async fn start(
-    myself: &ActorRef<RootMessage>,
+fn start(
     state: &mut RootState,
+    twin: &ActorRef<TwinMessage>,
     operation: OperationId,
     name: VmName,
     shares: Vec<ShareRequest>,
     nix_config: Option<AbsolutePath>,
     reply_to: &DerivedActorRef<ServerFrame>,
 ) -> Result<(), Report> {
-    if let Some(refusal) = refusal(state, &name) {
-        return Err(refusal);
-    }
     let home = AbsolutePath::parse(state.account.home.as_str().into())
         .map_err(|error| Report::of(&error))?;
     let shares = Shares::validate(shares, &[home], |directory| {
         directory.path().as_path().is_dir()
     })
     .map_err(|error| Report::of(&error))?;
-    let twin = twin(myself, state, &name).await?;
     let spec = VmSpec {
         shares,
         account: state.account.clone(),
@@ -719,59 +958,32 @@ async fn start(
     .map_err(|error| unreachable_twin(&error))
 }
 
-/// The VM's twin, spawned (linked to Root) on first use.
-async fn twin(
-    myself: &ActorRef<RootMessage>,
+fn stop(
     state: &mut RootState,
-    name: &VmName,
-) -> Result<ActorRef<TwinMessage>, Report> {
-    if let Some(twin) = state.twins.get(name) {
-        return Ok(twin.clone());
-    }
-    let vm = state.paths.vm(name).map_err(|error| Report::of(&error))?;
-    let id = state
-        .vm_streams
-        .child(name.as_str())
-        .map_err(|error| Report::of(&error))?;
-    let (twin, _) = Actor::spawn_linked(
-        Some(format!("{}/vm/{name}", state.id)),
-        Persistent::<VmTwin>::new(),
-        PersistentArgs {
-            id,
-            journal: state.journal.clone(),
-            setup: VmSetup {
-                vm,
-                root: myself.get_derived(),
-                build: state.vm_defaults.build.clone(),
-                placement: state.vm_defaults.placement,
-            },
-            persist_timeout: PERSIST_TIMEOUT,
-        },
-        myself.get_cell(),
-    )
-    .await
-    .map_err(|error| Report {
-        code: "runtime.vm.spawn".into(),
-        message: format!("can't start the VM's twin: {error}"),
-        hint: None,
-    })?;
-    state.twins.insert(name.clone(), twin.clone());
-    Ok(twin)
+    twin: &ActorRef<TwinMessage>,
+    operation: OperationId,
+    name: VmName,
+    reply_to: &DerivedActorRef<ServerFrame>,
+) -> Result<(), Report> {
+    twin.cast(PersistentMessage::Command(VmCommand::Stop { operation }))
+        .map_err(|error| unreachable_twin(&error))?;
+    state.waiters.insert(operation, (name, reply_to.clone()));
+    Ok(())
 }
 
 fn from_vm(myself: &ActorRef<RootMessage>, state: &mut RootState, vm: &VmName, report: VmReport) {
     match report {
         VmReport::OperationDone { operation, result } => {
             if is_vacuum_stop(state, vm, operation) {
-                return vacuum_stopped(myself, state, vm, result);
+                return vacuum_stopped(state, vm, result);
             }
             if let Some(collection) = state.statuses.get_mut(&operation) {
                 // A twin asked while still replaying reports itself unrecoverable before it
                 // refuses what it stashed, so its refusal finds the VM quarantined.
                 let condition = match (result, state.quarantined.get(vm)) {
                     (Ok(VmOutcome::Status(condition)), _) => condition,
-                    (Err(_), Some(reason)) => VmCondition::Quarantined {
-                        reason: reason.clone(),
+                    (Err(_), Some(cause)) => VmCondition::Quarantined {
+                        cause: cause.clone(),
                     },
                     (Ok(VmOutcome::Started(_) | VmOutcome::Stopped) | Err(_), _) => {
                         VmCondition::Unknown
@@ -779,6 +991,7 @@ fn from_vm(myself: &ActorRef<RootMessage>, state: &mut RootState, vm: &VmName, r
                 };
                 collection.collected.insert(vm.clone(), condition);
                 if collection.complete()
+                    && collection.spawning.is_empty()
                     && let Some(collection) = state.statuses.remove(&operation)
                 {
                     collection.reply(operation);
@@ -808,40 +1021,23 @@ fn from_vm(myself: &ActorRef<RootMessage>, state: &mut RootState, vm: &VmName, r
             reply(&reply_to, operation, body);
         }
         VmReport::Unrecoverable { reason } => {
-            tracing::error!(%vm, code = reason.code, message = reason.message, "VM quarantined");
-            // The twin stays alive refusing commands; Root routes nothing to it from now on.
-            if state.quarantined.insert(vm.clone(), reason).is_none() {
-                state.recording.insert(vm.clone());
-                ask_record(myself, state, vm);
-            }
+            quarantine(myself, state, vm, QuarantineCause::Unreplayable { reason });
         }
     }
 }
 
 /// The refusal for a VM being vacuumed or quarantined, if it is one.
 fn refusal(state: &RootState, name: &VmName) -> Option<Report> {
-    if state.vacuums.contains_key(name) {
+    if state.vacuums.contains_key(name) || state.releases.contains_key(name) {
         return Some(Report::of(&RegistryError::Vacuuming(name.clone())));
     }
-    state.quarantined.get(name).map(|reason| {
+    state.quarantined.get(name).map(|cause| {
         Report::of(&RegistryError::Quarantined {
             name: name.clone(),
-            reason: reason.message.clone(),
+            reason: cause.summary(),
+            releasable: matches!(cause, QuarantineCause::SuspiciousHalt { .. }),
         })
     })
-}
-
-/// The twin of a VM the runtime knows (from the journal, or started since) and that isn't
-/// quarantined.
-fn known_twin(state: &RootState, name: &VmName) -> Result<ActorRef<TwinMessage>, Report> {
-    if let Some(refusal) = refusal(state, name) {
-        return Err(refusal);
-    }
-    state
-        .twins
-        .get(name)
-        .cloned()
-        .ok_or_else(|| Report::of(&RegistryError::Unknown(name.clone())))
 }
 
 fn unreachable_twin(error: &dyn std::fmt::Display) -> Report {
@@ -852,25 +1048,93 @@ fn unreachable_twin(error: &dyn std::fmt::Display) -> Report {
     }
 }
 
-/// Starts a vacuum: a twin that can still run stops the VM gracefully first; a quarantined
-/// VM goes straight to removal.
-fn begin_vacuum(
+/// Lifts a `SuspiciousHalt` quarantine: its record is retired, then the twin is spawned with a
+/// fresh budget.
+fn release(
     myself: &ActorRef<RootMessage>,
     state: &mut RootState,
     operation: OperationId,
     name: VmName,
     reply_to: DerivedActorRef<ServerFrame>,
 ) {
-    if state.vacuums.contains_key(&name) {
+    let refused = match state.quarantined.get(&name) {
+        _ if state.vacuums.contains_key(&name) || state.releases.contains_key(&name) => {
+            Some(RegistryError::Vacuuming(name.clone()))
+        }
+        Some(QuarantineCause::SuspiciousHalt { .. }) => None,
+        Some(QuarantineCause::Unreplayable { .. }) => {
+            Some(RegistryError::NotReleasable(name.clone()))
+        }
+        None => Some(RegistryError::NotQuarantined(name.clone())),
+    };
+    if let Some(refused) = refused {
+        return reply(
+            &reply_to,
+            operation,
+            ReplyBody::Failed(Report::of(&refused)),
+        );
+    }
+    let asked = state
+        .quarantine_streams
+        .child(name.as_str())
+        .map_err(|error| Report::of(&error))
+        .and_then(|id| {
+            state
+                .journal
+                .cast(JournalMessage::Retire {
+                    id,
+                    reply_to: myself.get_derived(),
+                })
+                .map_err(|error| Report {
+                    code: "runtime.vm.retire".into(),
+                    message: format!("can't ask the journal to retire the record: {error}"),
+                    hint: None,
+                })
+        });
+    match asked {
+        Ok(()) => {
+            state.releases.insert(name, (operation, reply_to));
+        }
+        Err(failure) => reply(&reply_to, operation, ReplyBody::Failed(failure)),
+    }
+}
+
+/// The VM whose release is retiring `id`, if any.
+fn releasing(state: &RootState, id: &PersistenceId) -> Option<VmName> {
+    let name = id
+        .below(&state.quarantine_streams)
+        .and_then(|name| VmName::parse(name.to_owned()).ok())?;
+    state.releases.contains_key(&name).then_some(name)
+}
+
+fn released(state: &mut RootState, name: &VmName) {
+    state.quarantined.remove(name);
+    ensure(state, name.clone(), Vec::new());
+    if let Some((operation, reply_to)) = state.releases.remove(name) {
+        tracing::info!(vm = %name, "released from quarantine");
+        reply(
+            &reply_to,
+            operation,
+            ReplyBody::Vm(VmReply::Released { name: name.clone() }),
+        );
+    }
+}
+
+/// Starts a vacuum: a twin that is up stops the VM gracefully first; otherwise (quarantined,
+/// restarting, spawning) the twin is terminated and the vacuum task ends what is left.
+fn begin_vacuum(
+    state: &mut RootState,
+    operation: OperationId,
+    name: VmName,
+    reply_to: DerivedActorRef<ServerFrame>,
+) {
+    if state.vacuums.contains_key(&name) || state.releases.contains_key(&name) {
         let failure = Report::of(&RegistryError::Vacuuming(name));
         return reply(&reply_to, operation, ReplyBody::Failed(failure));
     }
-    let step = match (
-        state.quarantined.contains_key(&name),
-        state.twins.get(&name),
-    ) {
-        (true, _) => VacuumStep::Removing,
-        (false, Some(twin)) => {
+    let quarantined = state.quarantined.contains_key(&name);
+    let step = match (quarantined, state.routes.get(&name)) {
+        (false, Some(Route::Up { twin })) => {
             let stop = OperationId::mint();
             if let Err(error) = twin.cast(PersistentMessage::Command(VmCommand::Stop {
                 operation: stop,
@@ -880,12 +1144,15 @@ fn begin_vacuum(
             }
             VacuumStep::Stopping { stop }
         }
+        (true, _) | (false, Some(Route::Spawning { .. } | Route::Restarting { .. })) => {
+            VacuumStep::Terminating
+        }
         (false, None) => {
             let failure = Report::of(&RegistryError::Unknown(name));
             return reply(&reply_to, operation, ReplyBody::Failed(failure));
         }
     };
-    let removing = matches!(step, VacuumStep::Removing);
+    let terminating = matches!(step, VacuumStep::Terminating);
     state.vacuums.insert(
         name.clone(),
         Vacuum {
@@ -894,8 +1161,17 @@ fn begin_vacuum(
             step,
         },
     );
-    if removing {
-        remove(myself, state, &name);
+    if terminating {
+        terminate(state, &name);
+    }
+}
+
+fn terminate(state: &RootState, name: &VmName) {
+    if let Err(error) = state
+        .machines
+        .cast(MachineSupervisorMessage::Terminate { name: name.clone() })
+    {
+        tracing::error!(vm = %name, %error, "can't reach the machine supervisor");
     }
 }
 
@@ -907,14 +1183,14 @@ fn is_vacuum_stop(state: &RootState, vm: &VmName, operation: OperationId) -> boo
 }
 
 /// The twin's answer to a vacuum's stop.
-fn vacuum_stopped(
-    myself: &ActorRef<RootMessage>,
-    state: &mut RootState,
-    vm: &VmName,
-    result: Result<VmOutcome, Report>,
-) {
+fn vacuum_stopped(state: &mut RootState, vm: &VmName, result: Result<VmOutcome, Report>) {
     match result {
-        Ok(_) => remove(myself, state, vm),
+        Ok(_) => {
+            if let Some(vacuum) = state.vacuums.get_mut(vm) {
+                vacuum.step = VacuumStep::Terminating;
+            }
+            terminate(state, vm);
+        }
         Err(failure) => {
             // The twin still runs: nothing to respawn.
             if let Some(vacuum) = state.vacuums.remove(vm) {
@@ -928,14 +1204,10 @@ fn vacuum_stopped(
     }
 }
 
-/// Stops the VM's twin (if any) and starts the vacuum task.
+/// The twin is gone: the vacuum task ends what is left and removes the directories.
 fn remove(myself: &ActorRef<RootMessage>, state: &mut RootState, name: &VmName) {
     if let Some(vacuum) = state.vacuums.get_mut(name) {
         vacuum.step = VacuumStep::Removing;
-    }
-    if let Some(twin) = state.twins.remove(name) {
-        twin.stop(Some("vacuumed".into()));
-        state.vacuumed_twins.insert(name.clone(), twin);
     }
     let paths = state.paths.vm(name);
     let root = myself.clone();
@@ -962,9 +1234,10 @@ fn retiring(state: &RootState, id: &PersistenceId) -> Option<VmName> {
             VacuumStep::Retiring { remaining } if remaining.first() == Some(id) => {
                 Some(name.clone())
             }
-            VacuumStep::Stopping { .. } | VacuumStep::Removing | VacuumStep::Retiring { .. } => {
-                None
-            }
+            VacuumStep::Stopping { .. }
+            | VacuumStep::Terminating
+            | VacuumStep::Removing
+            | VacuumStep::Retiring { .. } => None,
         })
 }
 
@@ -994,7 +1267,10 @@ fn retire_next(
             Vec::new()
         }
         (
-            VacuumStep::Stopping { .. } | VacuumStep::Removing | VacuumStep::Retiring { .. },
+            VacuumStep::Stopping { .. }
+            | VacuumStep::Terminating
+            | VacuumStep::Removing
+            | VacuumStep::Retiring { .. },
             _,
             _,
         ) => {
@@ -1022,22 +1298,15 @@ fn retire_next(
     }
 }
 
-/// A vacuum that failed after its twin was stopped: the VM must stay addressable, so a VM
+/// A vacuum that failed after its twin was terminated: the VM must stay addressable, so a VM
 /// that isn't quarantined gets its twin back (it replays what is left).
-async fn vacuum_failed(
-    myself: &ActorRef<RootMessage>,
-    state: &mut RootState,
-    name: &VmName,
-    failure: Report,
-) {
+fn vacuum_failed(state: &mut RootState, name: &VmName, failure: Report) {
     let Some(vacuum) = state.vacuums.remove(name) else {
         return;
     };
     tracing::error!(vm = %name, message = failure.message, "vacuum failed");
-    if !state.quarantined.contains_key(name)
-        && let Err(respawn) = twin(myself, state, name).await
-    {
-        tracing::error!(vm = %name, message = respawn.message, "can't start its twin again");
+    if !state.quarantined.contains_key(name) && !state.routes.contains_key(name) {
+        ensure(state, name.clone(), Vec::new());
     }
     reply(
         &vacuum.reply_to,
@@ -1046,8 +1315,9 @@ async fn vacuum_failed(
     );
 }
 
-/// Asks one twin, or every twin, for its condition; tell-only: answers are collected as they
-/// arrive and the reply goes out when all are in or `STATUS_TIMEOUT` passes.
+/// Answers for one VM or every VM. Quarantined and restarting VMs are answered by Root; twins
+/// that are up are asked (tell-only); twins being spawned are asked once up. The reply goes out
+/// when all are in or `STATUS_TIMEOUT` passes.
 fn status(
     myself: &ActorRef<RootMessage>,
     state: &mut RootState,
@@ -1055,61 +1325,57 @@ fn status(
     name: Option<VmName>,
     reply_to: DerivedActorRef<ServerFrame>,
 ) {
-    let quarantined = |name: &VmName, reason: &Report| {
-        (
-            name.clone(),
-            VmCondition::Quarantined {
-                reason: reason.clone(),
-            },
-        )
-    };
-    let (asked, known): (Vec<(VmName, ActorRef<TwinMessage>)>, Vec<_>) = match name {
-        Some(name) => match (state.quarantined.get(&name), state.twins.get(&name)) {
-            (Some(reason), _) => (Vec::new(), vec![quarantined(&name, reason)]),
-            (None, Some(twin)) => (vec![(name, twin.clone())], Vec::new()),
-            (None, None) => {
+    let names: Vec<VmName> = match name {
+        Some(name) => {
+            if !state.quarantined.contains_key(&name) && !state.routes.contains_key(&name) {
                 let failure = Report::of(&RegistryError::Unknown(name));
                 return reply(&reply_to, operation, ReplyBody::Failed(failure));
             }
-        },
-        None => (
-            state
-                .twins
-                .iter()
-                .filter(|(name, _)| !state.quarantined.contains_key(*name))
-                .map(|(name, twin)| (name.clone(), twin.clone()))
-                .collect(),
-            state
-                .quarantined
-                .iter()
-                .map(|(name, reason)| quarantined(name, reason))
-                .collect(),
-        ),
-    };
-    let collection = StatusCollection {
-        collected: asked
-            .iter()
-            .map(|(name, _)| (name.clone(), VmCondition::Unknown))
-            .chain(known)
+            vec![name]
+        }
+        None => state
+            .routes
+            .keys()
+            .chain(state.quarantined.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect(),
+    };
+    let mut collection = StatusCollection {
+        collected: BTreeMap::new(),
+        spawning: BTreeSet::new(),
         reply_to,
     };
-    if asked.is_empty() {
+    let mut asked = Vec::new();
+    for name in names {
+        let condition = match (state.quarantined.get(&name), state.routes.get(&name)) {
+            (Some(cause), _) => VmCondition::Quarantined {
+                cause: cause.clone(),
+            },
+            (None, Some(Route::Restarting { reason, attempt })) => VmCondition::Restarting {
+                reason: reason.clone(),
+                attempt: *attempt,
+            },
+            (None, Some(Route::Up { twin })) => {
+                asked.push(twin.clone());
+                VmCondition::Unknown
+            }
+            (None, Some(Route::Spawning { .. }) | None) => {
+                collection.spawning.insert(name.clone());
+                VmCondition::Unknown
+            }
+        };
+        collection.collected.insert(name, condition);
+    }
+    if asked.is_empty() && collection.spawning.is_empty() {
         return collection.reply(operation);
     }
     state.statuses.insert(operation, collection);
-    for (_, twin) in asked {
+    for twin in asked {
         let _ = twin.cast(PersistentMessage::Command(VmCommand::Status { operation }));
     }
     myself.send_after(STATUS_TIMEOUT, move || RootMessage::StatusTimeout {
         operation,
     });
-}
-
-fn essential_name(cell: &ractor::ActorCell, runtime: RuntimeId) -> &'static str {
-    match cell.get_name() {
-        Some(name) if name == format!("{runtime}/journal") => "journal",
-        Some(name) if name == format!("{runtime}/listener") => "listener",
-        Some(_) | None => "unknown child",
-    }
 }
