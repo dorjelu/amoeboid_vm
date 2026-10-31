@@ -5,4 +5,5 @@ pub mod files;
 pub mod guest;
 pub mod nix;
 pub mod process;
+pub mod qmp;
 pub mod ssh;

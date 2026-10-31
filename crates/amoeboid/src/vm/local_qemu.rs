@@ -24,6 +24,7 @@ use crate::adapters::files::{self, FileError};
 use crate::adapters::process::{
     self, Cancel, Containment, Exit, Output, ProcessError, Signal, SpawnRequest, Watched,
 };
+use crate::adapters::qmp;
 use crate::diagnostic::Report;
 use crate::domain::account::{GroupId, UserId};
 use crate::domain::lifecycle::Incarnation;
@@ -31,6 +32,11 @@ use crate::domain::process::{LocalRole, Nonce, ProcessIdentity, ProcessRole, Sco
 use crate::plan;
 use crate::plan::argv::IdMap;
 use crate::runtime::paths::VmPaths;
+
+/// How long the guest gets to power off after the ACPI request, before qemu is terminated.
+const POWERDOWN_GRACE: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 30 });
+/// How long qemu gets after SIGTERM before SIGKILL.
+const TERMINATE_GRACE: Duration = Duration::from_secs(if cfg!(test) { 1 } else { 10 });
 
 /// How long virtiofsd may take to create its sockets.
 const SOCKET_WAIT: Duration = Duration::from_secs(if cfg!(test) { 2 } else { 10 });
@@ -47,6 +53,12 @@ pub enum LocalQemuMessage {
         identity: ProcessIdentity,
         exit: Exit,
     },
+    /// A stop's next step, if qemu is still there: the powerdown grace ran out (terminate), or
+    /// the terminate grace did (kill).
+    Escalate {
+        generation: Generation,
+        signal: Signal,
+    },
 }
 
 impl From<HypervisorCommand> for LocalQemuMessage {
@@ -60,7 +72,9 @@ impl TryFrom<LocalQemuMessage> for HypervisorCommand {
     fn try_from(message: LocalQemuMessage) -> Result<Self, LocalQemuMessage> {
         match message {
             LocalQemuMessage::Command(command) => Ok(command),
-            other @ LocalQemuMessage::Exited { .. } => Err(other),
+            other @ (LocalQemuMessage::Exited { .. } | LocalQemuMessage::Escalate { .. }) => {
+                Err(other)
+            }
         }
     }
 }
@@ -154,12 +168,24 @@ impl Actor for LocalQemu {
                     });
                 }
             }
-            LocalQemuMessage::Command(HypervisorCommand::Stop { generation }) => {
-                if state.generation == Some(generation) {
-                    state.machine = Machine::Stopping { reason: None };
-                    state.terminate_all();
-                    if state.processes.is_empty() {
-                        state.stopped(generation, None);
+            LocalQemuMessage::Command(HypervisorCommand::Stop {
+                generation,
+                vm,
+                processes,
+            }) => stop(&myself, state, generation, &vm, processes).await,
+            LocalQemuMessage::Escalate { generation, signal } => {
+                let qemu = ProcessRole::Local(LocalRole::Qemu);
+                let stopping = matches!(state.machine, Machine::Stopping { .. });
+                if state.generation == Some(generation) && stopping {
+                    if let Some(identity) = state.processes.get(&qemu) {
+                        tracing::warn!(?signal, "qemu is still running; escalating");
+                        let _ = process::signal(identity, signal);
+                    }
+                    if signal == Signal::Terminate {
+                        myself.send_after(TERMINATE_GRACE, move || LocalQemuMessage::Escalate {
+                            generation,
+                            signal: Signal::Kill,
+                        });
                     }
                 }
             }
@@ -308,8 +334,14 @@ impl LocalQemuState {
                 };
                 self.terminate(&qemu);
             }
-            (ProcessRole::Local(LocalRole::Qemu | LocalRole::Virtiofsd(_)), Machine::Down)
-            | (ProcessRole::Local(LocalRole::Virtiofsd(_)), Machine::Stopping { .. }) => {}
+            (ProcessRole::Local(LocalRole::Virtiofsd(_)), Machine::Stopping { reason }) => {
+                // A stop of leftovers without qemu ends when the last of them has gone.
+                if self.processes.is_empty() {
+                    let reason = reason.clone();
+                    self.stopped(generation, reason);
+                }
+            }
+            (ProcessRole::Local(LocalRole::Qemu | LocalRole::Virtiofsd(_)), Machine::Down) => {}
         }
     }
 
@@ -414,6 +446,51 @@ async fn boot(
     state.machine = Machine::Running;
     state.tell(HypervisorObservation::MachineRunning { generation });
     Ok(())
+}
+
+/// Powers the machine off: ACPI request over QMP, then terminate and kill on timers; qemu's
+/// exit stops the shares and reports `MachineStopped`. Processes the twin knows but this
+/// backend doesn't watch yet are adopted first.
+async fn stop(
+    myself: &ActorRef<LocalQemuMessage>,
+    state: &mut LocalQemuState,
+    generation: Generation,
+    vm: &VmPaths,
+    processes: BTreeMap<ProcessRole, ProcessIdentity>,
+) {
+    if state.generation != Some(generation) {
+        state.begin(generation);
+    }
+    for (role, identity) in processes {
+        if state.processes.contains_key(&role) {
+            continue;
+        }
+        if let Ok(Some(watched)) = process::adopt(&identity) {
+            state.processes.insert(role.clone(), identity.clone());
+            state.watch(myself, generation, role, identity, watched);
+        }
+    }
+    if state.processes.is_empty() {
+        state.stopped(generation, None);
+        return;
+    }
+    state.machine = Machine::Stopping { reason: None };
+    let qemu = ProcessRole::Local(LocalRole::Qemu);
+    if !state.processes.contains_key(&qemu) {
+        state.terminate_all();
+        return;
+    }
+    let next = match qmp::powerdown(&vm.control_socket()).await {
+        Ok(()) => POWERDOWN_GRACE,
+        Err(error) => {
+            tracing::warn!(%error, "can't ask the guest to power off; terminating qemu");
+            Duration::ZERO
+        }
+    };
+    myself.send_after(next, move || LocalQemuMessage::Escalate {
+        generation,
+        signal: Signal::Terminate,
+    });
 }
 
 /// Re-watches what an earlier runtime started. All present: the machine runs. Anything lost:
@@ -683,6 +760,96 @@ mod tests {
             Some("hypervisor.qemu_exited".into())
         );
         kill_all(&started);
+    }
+
+    async fn until_stopped(
+        observations: &mut UnboundedReceiver<HypervisorObservation>,
+    ) -> Option<Report> {
+        loop {
+            match next(observations).await {
+                HypervisorObservation::ProcessExited { .. } => {}
+                HypervisorObservation::MachineStopped { reason, .. } => return reason,
+                other @ (HypervisorObservation::ProcessStarted { .. }
+                | HypervisorObservation::MachineRunning { .. }
+                | HypervisorObservation::BootFailed { .. }
+                | HypervisorObservation::Adopted { .. }
+                | HypervisorObservation::Lost { .. }) => unexpected(&format!("{other:?}")),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_asks_the_guest_first_then_escalates_and_stops_the_shares() {
+        let mut fixture = fixture(FAKE_VIRTIOFSD).await;
+        let hypervisor = spawn(&fixture).await;
+        let generation = Generation::FIRST;
+        hypervisor
+            .send_message(HypervisorCommand::Boot {
+                generation,
+                plan: plan(&fixture, Incarnation::mint()),
+            })
+            .unwrap();
+        let started = until_running(&mut fixture.observations).await;
+        // The fake qemu ignores the ACPI request, so the stop has to escalate.
+        let mut commands =
+            crate::adapters::qmp::tests::fake_qmp(fixture.vm.control_socket().as_path());
+        hypervisor
+            .send_message(HypervisorCommand::Stop {
+                generation,
+                vm: fixture.vm.clone(),
+                processes: started.clone(),
+            })
+            .unwrap();
+        assert_eq!(until_stopped(&mut fixture.observations).await, None);
+        assert_eq!(commands.recv().await.as_deref(), Some("qmp_capabilities"));
+        assert_eq!(commands.recv().await.as_deref(), Some("system_powerdown"));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for identity in started.values() {
+            assert_eq!(
+                process::liveness(identity).unwrap(),
+                process::Liveness::Gone
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fresh_backend_stops_processes_it_never_started() {
+        let mut fixture = fixture(FAKE_VIRTIOFSD).await;
+        let generation = Generation::FIRST;
+        let (first, _) = Actor::spawn(
+            None,
+            LocalQemu,
+            LocalQemuSetup {
+                report: fixture.report.clone(),
+                placement: Placement::Direct,
+            },
+        )
+        .await
+        .unwrap();
+        first
+            .cast(LocalQemuMessage::Command(HypervisorCommand::Boot {
+                generation,
+                plan: plan(&fixture, Incarnation::mint()),
+            }))
+            .unwrap();
+        let started = until_running(&mut fixture.observations).await;
+        first.stop_and_wait(None, None).await.unwrap();
+        let second = spawn(&fixture).await;
+        second
+            .send_message(HypervisorCommand::Stop {
+                generation,
+                vm: fixture.vm.clone(),
+                processes: started.clone(),
+            })
+            .unwrap();
+        assert_eq!(until_stopped(&mut fixture.observations).await, None);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for identity in started.values() {
+            assert_eq!(
+                process::liveness(identity).unwrap(),
+                process::Liveness::Gone
+            );
+        }
     }
 
     #[tokio::test]

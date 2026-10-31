@@ -36,8 +36,14 @@ pub enum HypervisorCommand {
         generation: Generation,
         plan: BootPlan,
     },
-    /// Stop the machine of this generation; answered by `MachineStopped`.
-    Stop { generation: Generation },
+    /// Stop the machine of this generation and whatever of it still runs; answered by
+    /// `MachineStopped`. Carries what the twin knows, so a backend that didn't start these
+    /// processes (after a runtime restart) can still stop them.
+    Stop {
+        generation: Generation,
+        vm: VmPaths,
+        processes: BTreeMap<ProcessRole, ProcessIdentity>,
+    },
     /// After a runtime restart: watch these if they are still the same processes.
     Adopt {
         generation: Generation,

@@ -218,6 +218,7 @@ pub enum VmOut {
     },
     StopMachine {
         generation: Generation,
+        processes: BTreeMap<ProcessRole, ProcessIdentity>,
     },
     Adopt {
         generation: Generation,
@@ -543,9 +544,16 @@ impl Behaviour for VmTwin {
                     },
                 })
                 .is_ok(),
-            VmOut::StopMachine { generation } => peers
+            VmOut::StopMachine {
+                generation,
+                processes,
+            } => peers
                 .hypervisor
-                .send_message(HypervisorCommand::Stop { generation })
+                .send_message(HypervisorCommand::Stop {
+                    generation,
+                    vm: peers.vm.clone(),
+                    processes,
+                })
                 .is_ok(),
             VmOut::Adopt {
                 generation,
@@ -692,7 +700,11 @@ fn guest_vm(state: &VmTwinState, observation: GuestVmObservation) -> Effect<VmEv
                 )],
             }
         }
-        (GuestVmObservation::SshTimedOut { .. }, StartProgress::WaitingForSsh { .. }, _) => {
+        (
+            GuestVmObservation::SshTimedOut { .. },
+            StartProgress::WaitingForSsh { processes, .. },
+            _,
+        ) => {
             let reason = Report::of(&TwinError::SshTimedOut(spec.boot_timeout_seconds));
             Effect::Persist {
                 events: one(VmEvent::Failed {
@@ -700,7 +712,10 @@ fn guest_vm(state: &VmTwinState, observation: GuestVmObservation) -> Effect<VmEv
                     reason: reason.clone(),
                 }),
                 then: vec![
-                    VmOut::StopMachine { generation },
+                    VmOut::StopMachine {
+                        generation,
+                        processes: processes.clone(),
+                    },
                     done(*operation, Err(reason)),
                 ],
             }

@@ -236,6 +236,13 @@ mod tests {
                 exit: crate::adapters::process::Exit::Code(1),
             }),
             Box::new(crate::vm::local_qemu::LocalQemuError::Lost("qemu".into())),
+            Box::new(crate::adapters::qmp::QmpError::Connect {
+                socket: "/c".into(),
+                source: io(),
+            }),
+            Box::new(crate::adapters::qmp::QmpError::Io(io())),
+            Box::new(crate::adapters::qmp::QmpError::Timeout),
+            Box::new(crate::adapters::qmp::QmpError::Protocol("x".into())),
             Box::new(crate::adapters::nix::NixError::Failed {
                 exit: crate::adapters::process::Exit::Code(1),
                 tail: "x".into(),
