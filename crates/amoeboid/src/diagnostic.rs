@@ -42,13 +42,17 @@ mod tests {
 
     use super::*;
     use crate::client::ClientError;
+    use crate::domain::account::AccountError;
+    use crate::domain::host_key::HostPublicKeyError;
+    use crate::domain::share::{HostDirectory, HostDirectoryError, ShareProblem, SharesError};
+    use crate::domain::vm_name::VmNameError;
     use crate::journal::{PersistFailure, PersistenceId};
     use crate::persistent::Unrecoverable;
     use crate::protocol::codec::FrameError;
     use crate::protocol::{NotVersion7, Refusal};
     use crate::runtime::StartError;
     use crate::runtime::lock::LockError;
-    use crate::runtime::paths::PathError;
+    use crate::runtime::paths::LocationError;
 
     fn io() -> std::io::Error {
         std::io::Error::from(std::io::ErrorKind::PermissionDenied)
@@ -84,10 +88,14 @@ mod tests {
                 at: sequence,
                 found: 9,
             }),
-            Box::new(PathError::NotAbsolute("rel".into())),
-            Box::new(PathError::NotNormal("/a/..".into())),
-            Box::new(PathError::MissingEnvironment("HOME")),
-            Box::new(PathError::SocketTooLong("/s".into())),
+            Box::new(crate::domain::path::PathError::NotAbsolute(
+                "relative".into(),
+            )),
+            Box::new(crate::domain::path::PathError::NotNormal("/a/..".into())),
+            Box::new(LocationError::MissingEnvironment("HOME")),
+            Box::new(LocationError::SocketTooLong(
+                crate::domain::path::AbsolutePath::parse("/s".into()).unwrap(),
+            )),
             Box::new(LockError::Open(io())),
             Box::new(LockError::Lock(io())),
             Box::new(LockError::Record(io())),
@@ -113,6 +121,37 @@ mod tests {
             Box::new(ClientError::Refused(Refusal::MalformedFrame)),
             Box::new(ClientError::Frame(FrameError::Io(io()))),
             Box::new(ClientError::Closed),
+            Box::new(LocationError::Path(
+                crate::domain::path::PathError::NotNormal("/a/..".into()),
+            )),
+            Box::new(VmNameError::Empty {
+                name: String::new(),
+            }),
+            Box::new(VmNameError::TooLong { name: "x".into() }),
+            Box::new(VmNameError::BadStart { name: "-".into() }),
+            Box::new(VmNameError::BadCharacter {
+                name: "a.b".into(),
+                character: '.',
+            }),
+            Box::new(AccountError::BadUserName("X".into())),
+            Box::new(AccountError::HomeNotAbsolute("/".into())),
+            Box::new(AccountError::HomeReserved {
+                home: "/etc".into(),
+                reserved: "/etc",
+            }),
+            Box::new(AccountError::HomeControlCharacters("/a\tb".into())),
+            Box::new(HostDirectoryError::NotUtf8("/x".into())),
+            Box::new(HostDirectoryError::ControlCharacters("/x".into())),
+            Box::new(SharesError(crate::nonempty::NonEmpty::new(
+                ShareProblem::Duplicate {
+                    directory: HostDirectory::parse(
+                        crate::domain::path::AbsolutePath::parse("/s".into()).unwrap(),
+                    )
+                    .unwrap(),
+                },
+                vec![],
+            ))),
+            Box::new(HostPublicKeyError),
         ]
     }
 

@@ -39,7 +39,7 @@ async fn main() -> ExitCode {
 #[derive(Debug, thiserror::Error)]
 enum CliError {
     #[error(transparent)]
-    Paths(#[from] amoeboid::runtime::paths::PathError),
+    Paths(#[from] amoeboid::runtime::paths::LocationError),
     #[error(transparent)]
     Client(#[from] ClientError),
 }

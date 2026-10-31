@@ -48,7 +48,7 @@ impl Store {
                 let path = paths.journal();
                 // Created 0600 before SQLite sees it; O_NOFOLLOW refuses a planted symlink.
                 rustix::fs::open(
-                    &path,
+                    path.as_path(),
                     OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                     Mode::from_raw_mode(0o600),
                 )

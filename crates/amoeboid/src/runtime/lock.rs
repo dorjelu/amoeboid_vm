@@ -49,7 +49,7 @@ pub enum LockError {
 /// See [`LockError`]. A symlink at the lock path is `Open` (`ELOOP`).
 pub fn acquire(paths: &RuntimePaths, record: &LockRecord) -> Result<Acquire, LockError> {
     let descriptor = rustix::fs::open(
-        paths.lock(),
+        paths.lock().as_path(),
         OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::from_raw_mode(0o600),
     )
@@ -106,7 +106,7 @@ mod tests {
     use std::process::Command;
 
     use super::*;
-    use crate::runtime::paths::AbsoluteDirectory;
+    use crate::domain::path::AbsolutePath;
 
     /// Held by every test here. A fork in a parallel test copies all open fds until its child
     /// execs (`O_CLOEXEC` acts at exec, not fork), briefly keeping a dropped lock alive.
@@ -118,7 +118,7 @@ mod tests {
     }
 
     fn paths(temporary: &tempfile::TempDir) -> RuntimePaths {
-        let directory = AbsoluteDirectory::parse(temporary.path().to_path_buf()).unwrap();
+        let directory = AbsolutePath::parse(temporary.path().to_path_buf()).unwrap();
         RuntimePaths::under(directory.clone(), directory).unwrap()
     }
 

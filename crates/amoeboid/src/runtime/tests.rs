@@ -8,9 +8,9 @@ use tokio::net::UnixStream;
 
 use super::*;
 use crate::client::{Client, ClientError};
+use crate::domain::path::AbsolutePath;
 use crate::protocol::codec;
 use crate::protocol::{Refusal, ReplyBody, RequestBody, RuntimeReply, RuntimeRequest, ServerFrame};
-use paths::AbsoluteDirectory;
 
 struct Fixture {
     _temporary: tempfile::TempDir,
@@ -19,8 +19,8 @@ struct Fixture {
 
 fn fixture() -> Fixture {
     let temporary = tempfile::tempdir().unwrap();
-    let data = AbsoluteDirectory::parse(temporary.path().join("data")).unwrap();
-    let run = AbsoluteDirectory::parse(temporary.path().join("run")).unwrap();
+    let data = AbsolutePath::parse(temporary.path().join("data")).unwrap();
+    let run = AbsolutePath::parse(temporary.path().join("run")).unwrap();
     let paths = RuntimePaths::under(data, run).unwrap();
     Fixture {
         _temporary: temporary,
