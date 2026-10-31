@@ -1,5 +1,6 @@
 //! `amoeboid`: the operator's client for the amoeboid runtime.
 
+mod daemon;
 mod render;
 mod shares;
 
@@ -48,12 +49,24 @@ enum Command {
         #[arg(long, default_value = "default")]
         name: String,
     },
+    /// Manage the runtime that runs the VMs.
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
     /// Show where each VM is (or one, with --name).
     Status {
         /// Only this VM.
         #[arg(long)]
         name: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum DaemonAction {
+    /// Write the systemd user units (amoeboid.socket, amoeboid.service) and enable the socket,
+    /// so the runtime starts on the first connection and is restarted if it fails.
+    Install,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -74,10 +87,18 @@ fn report(error: &impl Diagnostic) -> Report {
 }
 
 async fn run(command: Command) -> Result<(), Report> {
-    let paths = RuntimePaths::from_env(std::env::var_os).map_err(|error| report(&error))?;
     match command {
+        Command::Daemon {
+            action: DaemonAction::Install,
+        } => {
+            for unit in daemon::install()? {
+                render::line(&format!("wrote {unit}"));
+            }
+            render::line("enabled amoeboid.socket; the runtime starts on the first connection");
+            Ok(())
+        }
         Command::Ping => {
-            let mut client = connect(&paths).await?;
+            let mut client = connect(&runtime_paths()?).await?;
             match request(&mut client, RequestBody::Runtime(RuntimeRequest::Ping)).await? {
                 ReplyBody::Runtime(RuntimeReply::Pong) => {
                     render::line(&format!("pong from runtime {}", client.runtime()));
@@ -87,8 +108,8 @@ async fn run(command: Command) -> Result<(), Report> {
                 other @ ReplyBody::Vm(_) => Err(unexpected(&other)),
             }
         }
-        Command::Stop { name } => stop(&paths, name).await,
-        Command::Status { name } => status(&paths, name).await,
+        Command::Stop { name } => stop(&runtime_paths()?, name).await,
+        Command::Status { name } => status(&runtime_paths()?, name).await,
         Command::Start {
             name,
             base_nix_config,
@@ -109,7 +130,7 @@ async fn run(command: Command) -> Result<(), Report> {
                 .as_deref()
                 .map(|raw| shares::config_directory(raw, &working_directory))
                 .transpose()?;
-            let mut client = connect(&paths).await?;
+            let mut client = connect(&runtime_paths()?).await?;
             render::line(&format!(
                 "starting '{name}' (this builds it first; it can take a while)"
             ));
@@ -220,6 +241,10 @@ fn describe(condition: &VmCondition) -> String {
         ),
         VmCondition::Unknown => "unknown: its twin didn't answer".into(),
     }
+}
+
+fn runtime_paths() -> Result<RuntimePaths, Report> {
+    RuntimePaths::from_env(std::env::var_os).map_err(|error| report(&error))
 }
 
 async fn connect(paths: &RuntimePaths) -> Result<Client, Report> {

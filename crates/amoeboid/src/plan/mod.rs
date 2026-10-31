@@ -8,6 +8,7 @@ pub mod qemu;
 pub mod share;
 #[cfg(test)]
 mod tests;
+pub mod units;
 
 /// The guest NIC's MAC address; `nix/base.nix` matches on it.
 pub const GUEST_MAC: &str = "02:00:00:a0:0b:01";
