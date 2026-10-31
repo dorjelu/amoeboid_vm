@@ -155,6 +155,11 @@ pub enum VmRequest {
     Status {
         name: Option<crate::domain::vm_name::VmName>,
     },
+    /// Remove everything the VM owns: stop it, end what is left of its processes, remove its
+    /// directories and retire its history. Works on a quarantined VM.
+    Vacuum {
+        name: crate::domain::vm_name::VmName,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -170,6 +175,9 @@ pub enum VmReply {
     },
     Status {
         vms: Vec<crate::vm::VmStatus>,
+    },
+    Vacuumed {
+        name: crate::domain::vm_name::VmName,
     },
 }
 

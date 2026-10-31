@@ -60,6 +60,14 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Remove a VM and everything it owns: stop it, end any of its processes still running,
+    /// delete its directories (its Nix config, host key, guest files and logs) and retire its
+    /// history. Works on a quarantined VM. The shared directories are not touched.
+    #[command(name = "vacuum_vm")]
+    VacuumVm {
+        /// The VM's name.
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -110,6 +118,7 @@ async fn run(command: Command) -> Result<(), Report> {
         }
         Command::Stop { name } => stop(&runtime_paths()?, name).await,
         Command::Status { name } => status(&runtime_paths()?, name).await,
+        Command::VacuumVm { name } => vacuum(&runtime_paths()?, name).await,
         Command::Start {
             name,
             base_nix_config,
@@ -154,9 +163,9 @@ async fn run(command: Command) -> Result<(), Report> {
                 }
                 ReplyBody::Failed(failure) => Err(failure),
                 other @ (ReplyBody::Runtime(_)
-                | ReplyBody::Vm(VmReply::Stopped { .. } | VmReply::Status { .. })) => {
-                    Err(unexpected(&other))
-                }
+                | ReplyBody::Vm(
+                    VmReply::Stopped { .. } | VmReply::Status { .. } | VmReply::Vacuumed { .. },
+                )) => Err(unexpected(&other)),
             }
         }
     }
@@ -173,9 +182,26 @@ async fn stop(paths: &RuntimePaths, name: String) -> Result<(), Report> {
         }
         ReplyBody::Failed(failure) => Err(failure),
         other @ (ReplyBody::Runtime(_)
-        | ReplyBody::Vm(VmReply::Started { .. } | VmReply::Status { .. })) => {
-            Err(unexpected(&other))
+        | ReplyBody::Vm(
+            VmReply::Started { .. } | VmReply::Status { .. } | VmReply::Vacuumed { .. },
+        )) => Err(unexpected(&other)),
+    }
+}
+
+async fn vacuum(paths: &RuntimePaths, name: String) -> Result<(), Report> {
+    let name = VmName::parse(name).map_err(|error| report(&error))?;
+    let mut client = connect(paths).await?;
+    render::line(&format!("vacuuming '{name}'"));
+    match request(&mut client, RequestBody::Vm(VmRequest::Vacuum { name })).await? {
+        ReplyBody::Vm(VmReply::Vacuumed { name }) => {
+            render::line(&format!("'{name}' is removed"));
+            Ok(())
         }
+        ReplyBody::Failed(failure) => Err(failure),
+        other @ (ReplyBody::Runtime(_)
+        | ReplyBody::Vm(
+            VmReply::Started { .. } | VmReply::Stopped { .. } | VmReply::Status { .. },
+        )) => Err(unexpected(&other)),
     }
 }
 
@@ -201,9 +227,9 @@ async fn status(paths: &RuntimePaths, name: Option<String>) -> Result<(), Report
         }
         ReplyBody::Failed(failure) => Err(failure),
         other @ (ReplyBody::Runtime(_)
-        | ReplyBody::Vm(VmReply::Started { .. } | VmReply::Stopped { .. })) => {
-            Err(unexpected(&other))
-        }
+        | ReplyBody::Vm(
+            VmReply::Started { .. } | VmReply::Stopped { .. } | VmReply::Vacuumed { .. },
+        )) => Err(unexpected(&other)),
     }
 }
 

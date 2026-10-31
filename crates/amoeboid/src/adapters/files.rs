@@ -78,6 +78,23 @@ pub fn ensure_directory(path: &AbsolutePath, mode: u32) -> Result<(), FileError>
 /// Removes everything inside the host-owned directory `path`, keeping the directory. Symlinks
 /// are removed, not followed.
 ///
+/// Removes the directory at `path` and everything in it; symlinks inside are removed, never
+/// followed. Nothing at `path` is not an error.
+///
+/// # Errors
+///
+/// `Write`.
+pub fn remove_directory(path: &AbsolutePath) -> Result<(), FileError> {
+    match std::fs::remove_dir_all(path.as_path()) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(FileError::Write {
+            path: path.display().to_string(),
+            source,
+        }),
+    }
+}
+
 /// # Errors
 ///
 /// `Write`.

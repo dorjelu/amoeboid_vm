@@ -16,6 +16,7 @@ use rustix::process::{Pid, PidfdFlags, Signal as KernelSignal};
 
 use crate::domain::path::AbsolutePath;
 use crate::domain::process::{BootId, Nonce, ProcessId, ProcessIdentity, SLICE, ScopeName};
+use crate::domain::vm_name::VmName;
 use crate::plan::argv::Argv;
 
 #[derive(Debug, thiserror::Error)]
@@ -138,7 +139,13 @@ pub fn boot_id() -> Result<BootId, ProcessError> {
 pub fn identify(process: ProcessId) -> Result<Option<ProcessIdentity>, ProcessError> {
     let stat = match std::fs::read_to_string(format!("/proc/{process}/stat")) {
         Ok(stat) => stat,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // ESRCH: it exited between opening its entry and reading it.
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error()) =>
+        {
+            return Ok(None);
+        }
         Err(source) => {
             return Err(ProcessError::Read {
                 process,
@@ -184,9 +191,19 @@ fn parent(stat: &str) -> Option<u64> {
 /// `/proc` is unreadable or malformed.
 pub fn liveness(identity: &ProcessIdentity) -> Result<Liveness, ProcessError> {
     Ok(match identify(identity.process)? {
-        Some(now) if now == *identity => Liveness::Alive,
+        Some(now) if now == *identity && !zombie(identity.process) => Liveness::Alive,
         Some(_) | None => Liveness::Gone,
     })
+}
+
+/// A zombie: it has exited and only waits for its parent to reap it.
+fn zombie(process: ProcessId) -> bool {
+    std::fs::read_to_string(format!("/proc/{process}/stat"))
+        .ok()
+        .as_deref()
+        .and_then(|stat| stat.rsplit_once(')'))
+        .and_then(|(_, after_name)| after_name.split_ascii_whitespace().next())
+        .is_some_and(|state| matches!(state, "Z" | "X"))
 }
 
 /// A pidfd for exactly `identity`, or `None` when that process is gone. Opened first and checked
@@ -413,6 +430,39 @@ pub async fn run(
 /// `/proc` can't be listed.
 pub fn find_by_nonce(nonce: &Nonce) -> Result<Option<ProcessIdentity>, ProcessError> {
     let wanted = nonce.environment_entry();
+    let carriers = carriers(|entry| entry == wanted.as_bytes())?;
+    let topmost = carriers.iter().find(|(_, parent)| {
+        !carriers
+            .iter()
+            .any(|(process, _)| u64::from(process.get()) == *parent)
+    });
+    match topmost {
+        Some((process, _)) => identify(*process),
+        None => Ok(None),
+    }
+}
+
+/// Every process carrying a nonce of `vm`, children included, among those this user may
+/// inspect; the nonce is the runtime's mark, so this is how a VM's processes are found without
+/// its history.
+///
+/// # Errors
+///
+/// `/proc` can't be listed.
+pub fn find_by_vm(vm: &VmName) -> Result<Vec<ProcessIdentity>, ProcessError> {
+    let prefix = Nonce::vm_entry_prefix(vm);
+    let mut found = Vec::new();
+    for (process, _) in carriers(|entry| entry.starts_with(prefix.as_bytes()))? {
+        // Gone between the scan and now: nothing to find.
+        if let Ok(Some(identity)) = identify(process) {
+            found.push(identity);
+        }
+    }
+    Ok(found)
+}
+
+/// Processes with an environment entry matching `wanted`, with their parent's process id.
+fn carriers(wanted: impl Fn(&[u8]) -> bool) -> Result<Vec<(ProcessId, u64)>, ProcessError> {
     let mut carriers = Vec::new();
     for entry in std::fs::read_dir("/proc").map_err(ProcessError::List)? {
         let Some(process) = entry
@@ -427,23 +477,13 @@ pub fn find_by_nonce(nonce: &Nonce) -> Result<Option<ProcessIdentity>, ProcessEr
         else {
             continue;
         };
-        let has_nonce = environment
-            .split(|byte| *byte == 0)
-            .any(|entry| entry == wanted.as_bytes());
+        let has_nonce = environment.split(|byte| *byte == 0).any(&wanted);
         let stat = std::fs::read_to_string(format!("/proc/{process}/stat")).ok();
         if let (true, Some(parent)) = (has_nonce, stat.as_deref().and_then(parent)) {
             carriers.push((process, parent));
         }
     }
-    let topmost = carriers.iter().find(|(_, parent)| {
-        !carriers
-            .iter()
-            .any(|(process, _)| u64::from(process.get()) == *parent)
-    });
-    match topmost {
-        Some((process, _)) => identify(*process),
-        None => Ok(None),
-    }
+    Ok(carriers)
 }
 
 impl crate::diagnostic::Diagnostic for ProcessError {
@@ -499,6 +539,22 @@ mod tests {
             output: Output::Discard,
         })
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_killed_process_is_gone_before_its_parent_reaps_it() {
+        let mut spawned = sleeper(&fresh_nonce(), Containment::Direct);
+        signal(&spawned.identity, Signal::Kill).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while liveness(&spawned.identity).unwrap() == Liveness::Alive
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // Not reaped yet: the zombie still has its /proc entry.
+        assert!(identify(spawned.identity.process).unwrap().is_some());
+        assert_eq!(liveness(&spawned.identity).unwrap(), Liveness::Gone);
+        spawned.child.wait().await.unwrap();
     }
 
     #[test]

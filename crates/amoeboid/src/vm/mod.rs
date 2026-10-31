@@ -8,6 +8,7 @@ pub mod guest_vm;
 pub mod hypervisor;
 pub mod local_qemu;
 pub mod twin;
+pub mod vacuum;
 
 use serde::{Deserialize, Serialize};
 

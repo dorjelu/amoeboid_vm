@@ -111,6 +111,19 @@ mod tests {
                 name: crate::domain::vm_name::VmName::parse("Work".into()).unwrap(),
                 reason: "x".into(),
             }),
+            Box::new(crate::runtime::root::RegistryError::Vacuuming(
+                crate::domain::vm_name::VmName::parse("Work".into()).unwrap(),
+            )),
+            Box::new(crate::vm::vacuum::VacuumError::Survived(2)),
+            Box::new(crate::vm::vacuum::VacuumError::Process(ProcessError::List(
+                io(),
+            ))),
+            Box::new(crate::vm::vacuum::VacuumError::File(
+                crate::adapters::files::FileError::Write {
+                    path: "/d".into(),
+                    source: io(),
+                },
+            )),
             Box::new(StartError::AlreadyRunning { holder: None }),
             Box::new(StartError::Directory {
                 directory: "/d".into(),

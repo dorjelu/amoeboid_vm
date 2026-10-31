@@ -56,6 +56,25 @@ Status is collected tell-only: Root asks every twin and gathers answers for 5 s.
 
 `amoeboid vacuum_vm NAME` removes everything a VM owns: it stops the VM (reaping its verified processes), removes its runtime directory and state directory, and retires its streams (`vm/<name>`, `quarantine/<name>`). It works on quarantined VMs, which have no twin to stop them.
 
+Root runs it as one operation (`VmRequest::Vacuum`, answered `VmReply::Vacuumed`):
+
+----
+Vacuum ─▶ [twin, not quarantined] VmCommand::Stop ─▶ Stopped ─┐   (stop failed: vacuum fails, twin keeps running)
+       └▶ [quarantined] ───────────────────────────────────────┴▶ stop the twin actor
+          ─▶ vacuum task: TERM every process carrying the VM's nonce, KILL survivors after 10 s,
+             remove runtime and state directories ─▶ RootMessage::Vacuumed
+          ─▶ Retire vm/<name> ─▶ Retire quarantine/<name> ─▶ VmReply::Vacuumed
+----
+
+* Graceful first: a twin that can run stops the VM through its own path (QMP, then signals) and records it; the task only ends what is left.
+* The task needs no history: a VM's processes are found by the environment entry `AMOEBOID_NONCE=<name>/` (VM names hold no `/`, so no other VM's nonce shares the prefix). The nonce is the runtime's mark, so a match is a process the runtime spawned for that VM; each is signalled through a verified pidfd. A zombie counts as gone.
+* The task is not an actor: it runs no conversation, only effects, and tells Root its result.
+* `quarantine/<name>` is retired last, so a vacuum interrupted halfway leaves the VM quarantined and vacuumable again.
+* Only names Root knows (a twin or a quarantine record) are vacuumed; other directories under the data directory (such as the Python launcher's VMs) are never touched.
+* While a vacuum runs, `start`, `stop` and another `vacuum_vm` for that VM are refused (`runtime.vm.vacuuming`).
+* A vacuum that fails after its twin was stopped spawns the twin again (unless quarantined), so the VM stays addressable.
+* Directories are removed with `remove_dir_all`, which removes symlinks inside the guest-writable tree without following them.
+
 A stream is retired by a **tombstone**, not deleted: the journal records that the stream ended, and a retired stream is neither replayed nor listed in the registry. The history stays in the journal.
 
 === Tombstones

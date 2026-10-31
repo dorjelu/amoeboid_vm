@@ -198,6 +198,11 @@ use crate::protocol::ProtocolVersion;
 /// Twins of every VM in the journal start with the runtime, not on first request: an
 /// interrupted start is noticed (and recorded as failed) without anyone asking.
 #[tokio::test]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "drops and retakes daemon.lock: no fork may pin it meanwhile; nothing spawns while \
+              the guard is held"
+)]
 async fn a_new_runtime_starts_every_known_twin_which_recovers_on_its_own() {
     use crate::vm::builder::BuildCommand;
     use crate::vm::local_qemu::Placement;
@@ -219,6 +224,8 @@ async fn a_new_runtime_starts_every_known_twin_which_recovers_on_its_own() {
     // The start is building when the runtime goes away.
     let pending = tokio::spawn(async move { client.request(request).await });
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // No fork may pin daemon.lock between this stop and the next start.
+    let forks = crate::testing::forks();
     first.stop();
     first.wait().await;
     drop(pending);
@@ -226,6 +233,7 @@ async fn a_new_runtime_starts_every_known_twin_which_recovers_on_its_own() {
     let second = start_with(&fixture.paths, Persistence::Sqlite, slow_build)
         .await
         .unwrap();
+    drop(forks);
     // Asked at once: requests wait for the registry, so the VM is already listed.
     let mut client = Client::connect(&fixture.paths).await.unwrap();
     let reply = client
@@ -439,7 +447,13 @@ async fn an_unreplayable_vm_is_quarantined_recorded_once_and_refused() {
 }
 
 #[tokio::test]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "drops and retakes daemon.lock: no fork may pin it meanwhile; these runtimes spawn \
+              nothing, so the guard can't deadlock"
+)]
 async fn a_recorded_quarantine_is_known_from_the_start_and_recorded_once() {
+    let _forks = crate::testing::forks();
     let fixture = fixture();
     plant_unreplayable(&fixture.paths, "broken").await;
     let first = start_with(
@@ -482,4 +496,165 @@ async fn a_recorded_quarantine_is_known_from_the_start_and_recorded_once() {
         return assert_eq!("a replay", "something else");
     };
     assert_eq!(replay.events.len(), 1);
+}
+
+fn vm_name(name: &str) -> crate::domain::vm_name::VmName {
+    crate::domain::vm_name::VmName::parse(name.into()).unwrap()
+}
+
+async fn vacuum(client: &mut Client, name: &str) -> ReplyBody {
+    client
+        .request(RequestBody::Vm(crate::protocol::VmRequest::Vacuum {
+            name: vm_name(name),
+        }))
+        .await
+        .unwrap()
+}
+
+async fn replay(paths: &RuntimePaths, id: &'static str) -> crate::journal::Replay {
+    let answers = journal_exchange(
+        paths,
+        vec![Box::new(|reply_to| {
+            crate::journal::JournalMessage::Replay {
+                id: persistence_id(id),
+                reply_to,
+            }
+        })],
+    )
+    .await;
+    match answers.into_iter().next() {
+        Some(crate::journal::JournalReply::Replayed { replay, .. }) => replay,
+        _ => crate::journal::Replay::empty(),
+    }
+}
+
+#[tokio::test]
+async fn vacuuming_a_quarantined_vm_ends_its_processes_removes_its_files_and_retires_it() {
+    use crate::adapters::process::{self, Containment, Output, SpawnRequest};
+    let fixture = fixture();
+    plant_unreplayable(&fixture.paths, "broken").await;
+    let vm = fixture.paths.vm(&vm_name("broken")).unwrap();
+    std::fs::create_dir_all(vm.guest().as_path()).unwrap();
+    // A directory of a VM the runtime doesn't know (the Python launcher's, say): untouched.
+    let stranger = fixture.paths.data().as_path().join("stranger");
+    std::fs::create_dir_all(&stranger).unwrap();
+    let runtime = start_with(
+        &fixture.paths,
+        Persistence::Sqlite,
+        root::VmDefaults::production(),
+    )
+    .await
+    .unwrap();
+    let mut client = Client::connect(&fixture.paths).await.unwrap();
+    until_quarantined(&mut client, "broken").await.unwrap();
+    let mut leftover = process::spawn(&SpawnRequest {
+        argv: crate::plan::argv::Argv::for_tests(&["sleep", "60"]),
+        containment: Containment::Direct,
+        nonce: Some(crate::domain::process::Nonce::of(
+            vm.name(),
+            crate::domain::lifecycle::Incarnation::mint(),
+            crate::domain::lifecycle::Generation::FIRST,
+            &crate::domain::process::ProcessRole::Local(crate::domain::process::LocalRole::Qemu),
+        )),
+        directory: AbsolutePath::parse("/".into()).unwrap(),
+        output: Output::Discard,
+    })
+    .unwrap();
+
+    let reply = vacuum(&mut client, "broken").await;
+    assert!(
+        matches!(&reply, ReplyBody::Vm(crate::protocol::VmReply::Vacuumed { name }) if name.as_str() == "broken"),
+        "{reply:?}"
+    );
+    assert!(leftover.child.try_wait().unwrap().is_some());
+    assert!(!vm.state().as_path().exists());
+    assert!(stranger.exists());
+    assert_eq!(status_of(&mut client, "broken").await, None);
+    let reply = vacuum(&mut client, "stranger").await;
+    assert!(matches!(reply, ReplyBody::Failed(report) if report.code == "runtime.vm.unknown"));
+    runtime.stop();
+    runtime.wait().await;
+
+    // Retired, not deleted: nothing live, positions kept.
+    let vm_stream = replay(&fixture.paths, "vm/broken").await;
+    assert_eq!(
+        (
+            vm_stream.events.len(),
+            vm_stream.last.map(crate::journal::Sequence::get)
+        ),
+        (0, Some(1))
+    );
+    let record = replay(&fixture.paths, "quarantine/broken").await;
+    assert_eq!(
+        (
+            record.events.len(),
+            record.last.map(crate::journal::Sequence::get)
+        ),
+        (0, Some(1))
+    );
+}
+
+#[tokio::test]
+#[allow(
+    clippy::await_holding_lock,
+    reason = "drops and retakes daemon.lock: no fork may pin it meanwhile; nothing spawns while \
+              the guard is held"
+)]
+async fn a_vacuumed_name_starts_as_a_new_vm_after_the_tombstone() {
+    use crate::protocol::{VmReply, VmRequest};
+    use crate::vm::builder::BuildCommand;
+    use crate::vm::local_qemu::Placement;
+    let fixture = fixture();
+    let defaults = |seconds: &'static str| root::VmDefaults {
+        build: BuildCommand::Scripted(crate::plan::argv::Argv::for_tests(&["sleep", seconds])),
+        placement: Placement::Direct,
+    };
+    let runtime = start_with(&fixture.paths, Persistence::Sqlite, defaults("3"))
+        .await
+        .unwrap();
+    let mut client = Client::connect(&fixture.paths).await.unwrap();
+    let start = RequestBody::Vm(VmRequest::Start {
+        name: vm_name("reused"),
+        shares: Vec::new(),
+        nix_config: None,
+    });
+    // Vacuumed while building: the stop cancels the start.
+    let mut starter = Client::connect(&fixture.paths).await.unwrap();
+    let first = start.clone();
+    let pending = tokio::spawn(async move { starter.request(first).await });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let reply = vacuum(&mut client, "reused").await;
+    assert!(
+        matches!(reply, ReplyBody::Vm(VmReply::Vacuumed { .. })),
+        "{reply:?}"
+    );
+    let cancelled = pending.await.unwrap().unwrap();
+    assert!(
+        matches!(&cancelled, ReplyBody::Failed(report) if report.code == "vm.cancelled"),
+        "{cancelled:?}"
+    );
+    // No fork may pin daemon.lock between this stop and the next start.
+    let forks = crate::testing::forks();
+    runtime.stop();
+    runtime.wait().await;
+    let retired = replay(&fixture.paths, "vm/reused").await;
+    assert_eq!(retired.events, Vec::new());
+    let tombstone = retired.last.unwrap().get();
+
+    let runtime = start_with(&fixture.paths, Persistence::Sqlite, defaults("3"))
+        .await
+        .unwrap();
+    drop(forks);
+    let mut client = Client::connect(&fixture.paths).await.unwrap();
+    assert_eq!(status_of(&mut client, "reused").await, None);
+    let mut starter = Client::connect(&fixture.paths).await.unwrap();
+    let pending = tokio::spawn(async move { starter.request(start).await });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    runtime.stop();
+    runtime.wait().await;
+    drop(pending);
+    let reused = replay(&fixture.paths, "vm/reused").await;
+    let first = reused.events.first().unwrap();
+    assert_eq!(first.sequence.get(), tombstone + 1);
+    assert!(first.payload.as_str().contains("\"created\""), "{first:?}");
 }

@@ -99,6 +99,13 @@ impl Nonce {
         Self(format!("{vm}/{incarnation}/{generation}/{}", role.name()))
     }
 
+    /// The start of every environment entry carrying a nonce of `vm`: `AMOEBOID_NONCE=<vm>/`.
+    /// VM names hold no `/`, so no other VM's nonce shares it.
+    #[must_use]
+    pub fn vm_entry_prefix(vm: &VmName) -> String {
+        format!("{}={vm}/", Self::VARIABLE)
+    }
+
     /// The environment entry, `AMOEBOID_NONCE=<nonce>`.
     #[must_use]
     pub fn environment_entry(&self) -> String {
