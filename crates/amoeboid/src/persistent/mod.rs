@@ -13,7 +13,7 @@ use ractor::{Actor, ActorProcessingErr, ActorRef};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::journal::{BatchId, JournalMsg, JournalReply, PersistenceId, Seq};
+use crate::journal::{BatchId, JournalMessage, JournalReply, PersistenceId, Sequence};
 use crate::nonempty::NonEmpty;
 use machine::{Action, Core, Input};
 
@@ -84,46 +84,46 @@ pub enum Effect<E, O> {
 
 /// Why a stream can never be replayed by this binary. Terminal: the actor stays alive, refuses
 /// every command, reports once to its parent, and touches nothing in the world (processes,
-/// scope, runtime dir and stream are kept for forensics until `amoeboid vacuum_vm NAME`).
+/// scope, runtime directory and stream are kept for forensics until `amoeboid vacuum_vm NAME`).
 #[derive(Clone, PartialEq, Eq, Debug, thiserror::Error)]
 pub enum Unrecoverable {
     #[error("event at position {} doesn't decode: {error}", at.get())]
-    UndecodableEvent { at: Seq, error: String },
+    UndecodableEvent { at: Sequence, error: String },
     #[error("event at position {} has unknown version {found}", at.get())]
-    UnknownEventVersion { at: Seq, found: u16 },
+    UnknownEventVersion { at: Sequence, found: u16 },
 }
 
 /// Mailbox type of every persistent actor. One wrapper variant per derived type keeps
 /// `TryFrom` total (ractor's `get_derived` panics otherwise).
 #[derive(Debug)]
-pub enum PersistentMsg<C, O> {
+pub enum PersistentMessage<C, O> {
     Command(C),
     Observation(O),
     Journal(JournalReply),
     PersistTimeout(BatchId),
 }
 
-impl<C, O> From<JournalReply> for PersistentMsg<C, O> {
+impl<C, O> From<JournalReply> for PersistentMessage<C, O> {
     fn from(reply: JournalReply) -> Self {
         Self::Journal(reply)
     }
 }
 
-impl<C, O> TryFrom<PersistentMsg<C, O>> for JournalReply {
-    type Error = PersistentMsg<C, O>;
-    fn try_from(msg: PersistentMsg<C, O>) -> Result<Self, Self::Error> {
-        match msg {
-            PersistentMsg::Journal(reply) => Ok(reply),
-            other @ (PersistentMsg::Command(_)
-            | PersistentMsg::Observation(_)
-            | PersistentMsg::PersistTimeout(_)) => Err(other),
+impl<C, O> TryFrom<PersistentMessage<C, O>> for JournalReply {
+    type Error = PersistentMessage<C, O>;
+    fn try_from(message: PersistentMessage<C, O>) -> Result<Self, Self::Error> {
+        match message {
+            PersistentMessage::Journal(reply) => Ok(reply),
+            other @ (PersistentMessage::Command(_)
+            | PersistentMessage::Observation(_)
+            | PersistentMessage::PersistTimeout(_)) => Err(other),
         }
     }
 }
 
 pub struct PersistentArgs<B: Behaviour> {
     pub id: PersistenceId,
-    pub journal: ActorRef<JournalMsg>,
+    pub journal: ActorRef<JournalMessage>,
     pub peers: B::Peers,
     /// No `Persisted` within this: the actor stops and is restarted.
     pub persist_timeout: Duration,
@@ -156,7 +156,7 @@ impl<B> Default for Persistent<B> {
 struct CoreMissing;
 
 impl<B: Behaviour> Actor for Persistent<B> {
-    type Msg = PersistentMsg<B::Command, B::Observation>;
+    type Msg = PersistentMessage<B::Command, B::Observation>;
     type State = PersistentState<B>;
     type Arguments = PersistentArgs<B>;
 
@@ -171,25 +171,25 @@ impl<B: Behaviour> Actor for Persistent<B> {
     fn handle(
         &self,
         myself: ActorRef<Self::Msg>,
-        msg: Self::Msg,
-        st: &mut PersistentState<B>,
+        message: Self::Msg,
+        state: &mut PersistentState<B>,
     ) -> impl Future<Output = Result<(), ActorProcessingErr>> + Send {
-        std::future::ready(run(&myself, msg, st))
+        std::future::ready(run(&myself, message, state))
     }
 }
 
 /// Asks the journal for this actor's stream; recovery continues when `Replayed` arrives.
 fn start<B: Behaviour>(
-    myself: &ActorRef<PersistentMsg<B::Command, B::Observation>>,
+    myself: &ActorRef<PersistentMessage<B::Command, B::Observation>>,
     args: PersistentArgs<B>,
 ) -> Result<PersistentState<B>, ActorProcessingErr> {
     tracing::info!(id = args.id.as_str(), "recovering");
     args.journal
-        .cast(JournalMsg::Replay {
+        .cast(JournalMessage::Replay {
             id: args.id.clone(),
             reply_to: myself.get_derived(),
         })
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| error.to_string())?;
     Ok(PersistentState {
         args,
         core: Some(Core::recovering()),
@@ -198,48 +198,48 @@ fn start<B: Behaviour>(
 
 /// One step of the machine, then its actions in order. `Stop` ends the actor with `Err`.
 fn run<B: Behaviour>(
-    myself: &ActorRef<PersistentMsg<B::Command, B::Observation>>,
-    msg: PersistentMsg<B::Command, B::Observation>,
-    st: &mut PersistentState<B>,
+    myself: &ActorRef<PersistentMessage<B::Command, B::Observation>>,
+    message: PersistentMessage<B::Command, B::Observation>,
+    state: &mut PersistentState<B>,
 ) -> Result<(), ActorProcessingErr> {
-    let input = match msg {
-        PersistentMsg::Command(c) => Input::Command(c),
-        PersistentMsg::Observation(o) => Input::Observation(o),
-        PersistentMsg::PersistTimeout(batch) => Input::PersistTimeout(batch),
-        PersistentMsg::Journal(reply) => match reply {
+    let input = match message {
+        PersistentMessage::Command(command) => Input::Command(command),
+        PersistentMessage::Observation(observation) => Input::Observation(observation),
+        PersistentMessage::PersistTimeout(batch) => Input::PersistTimeout(batch),
+        PersistentMessage::Journal(reply) => match reply {
             JournalReply::Replayed { events, .. } => Input::Replayed(events),
             JournalReply::ReplayFailed { reason, .. } => Input::ReplayFailed(reason),
             JournalReply::Persisted { batch, last } => Input::Persisted { batch, last },
             JournalReply::PersistFailed { batch, reason } => Input::PersistFailed { batch, reason },
         },
     };
-    let core = st.core.take().ok_or(CoreMissing)?;
+    let core = state.core.take().ok_or(CoreMissing)?;
     let (core, actions) = machine::step(core, input);
-    st.core = Some(core);
-    let id = st.args.id.as_str();
+    state.core = Some(core);
+    let id = state.args.id.as_str();
     for action in actions {
         match action {
             Action::Persist {
                 batch,
                 first,
                 events,
-            } => st
+            } => state
                 .args
                 .journal
-                .cast(JournalMsg::Persist {
+                .cast(JournalMessage::Persist {
                     batch,
-                    id: st.args.id.clone(),
+                    id: state.args.id.clone(),
                     first,
                     events,
                     reply_to: myself.get_derived(),
                 })
-                .map_err(|e| e.to_string())?,
+                .map_err(|error| error.to_string())?,
             Action::ArmTimeout(batch) => {
-                myself.send_after(st.args.persist_timeout, move || {
-                    PersistentMsg::PersistTimeout(batch)
+                myself.send_after(state.args.persist_timeout, move || {
+                    PersistentMessage::PersistTimeout(batch)
                 });
             }
-            Action::Send(out) => B::send(&st.args.peers, out),
+            Action::Send(out) => B::send(&state.args.peers, out),
             Action::Entered(mode) => tracing::info!(id, ?mode, "entered"),
             Action::Ignored(why) => tracing::debug!(id, why, "input ignored"),
             Action::Stop(fatal) => {

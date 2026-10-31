@@ -9,8 +9,8 @@ pub const MAX_FRAME: u32 = 1 << 20;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
-    #[error("frame of {len} bytes exceeds {MAX_FRAME}")]
-    TooLarge { len: u64 },
+    #[error("frame of {length} bytes exceeds {MAX_FRAME}")]
+    TooLarge { length: u64 },
     #[error("can't decode frame: {0}")]
     Decode(serde_json::Error),
     #[error("can't encode frame: {0}")]
@@ -38,11 +38,13 @@ where
     if let Some(rest) = header.get_mut(first..) {
         reader.read_exact(rest).await.map_err(FrameError::Io)?;
     }
-    let len = u32::from_be_bytes(header);
-    if len > MAX_FRAME {
-        return Err(FrameError::TooLarge { len: len.into() });
+    let length = u32::from_be_bytes(header);
+    if length > MAX_FRAME {
+        return Err(FrameError::TooLarge {
+            length: length.into(),
+        });
     }
-    let mut payload = vec![0_u8; usize::try_from(len).unwrap_or(usize::MAX)];
+    let mut payload = vec![0_u8; usize::try_from(length).unwrap_or(usize::MAX)];
     reader
         .read_exact(&mut payload)
         .await
@@ -59,14 +61,14 @@ where
 /// `Encode`, or `TooLarge` when the payload exceeds [`MAX_FRAME`].
 pub fn encode<T: Serialize>(frame: &T) -> Result<Vec<u8>, FrameError> {
     let payload = serde_json::to_vec(frame).map_err(FrameError::Encode)?;
-    let len = u32::try_from(payload.len())
+    let length = u32::try_from(payload.len())
         .ok()
-        .filter(|len| *len <= MAX_FRAME)
+        .filter(|length| *length <= MAX_FRAME)
         .ok_or(FrameError::TooLarge {
-            len: u64::try_from(payload.len()).unwrap_or(u64::MAX),
+            length: u64::try_from(payload.len()).unwrap_or(u64::MAX),
         })?;
     let mut bytes = Vec::with_capacity(payload.len() + 4);
-    bytes.extend_from_slice(&len.to_be_bytes());
+    bytes.extend_from_slice(&length.to_be_bytes());
     bytes.extend_from_slice(&payload);
     Ok(bytes)
 }

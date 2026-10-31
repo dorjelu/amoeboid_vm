@@ -13,16 +13,19 @@ use crate::protocol::{Refusal, ReplyBody, RequestBody, RuntimeReply, RuntimeRequ
 use paths::AbsDir;
 
 struct Fixture {
-    _dir: tempfile::TempDir,
+    _temporary: tempfile::TempDir,
     paths: RuntimePaths,
 }
 
 fn fixture() -> Fixture {
-    let dir = tempfile::tempdir().unwrap();
-    let data = AbsDir::parse(dir.path().join("data")).unwrap();
-    let run = AbsDir::parse(dir.path().join("run")).unwrap();
+    let temporary = tempfile::tempdir().unwrap();
+    let data = AbsDir::parse(temporary.path().join("data")).unwrap();
+    let run = AbsDir::parse(temporary.path().join("run")).unwrap();
     let paths = RuntimePaths::under(data, run).unwrap();
-    Fixture { _dir: dir, paths }
+    Fixture {
+        _temporary: temporary,
+        paths,
+    }
 }
 
 async fn start(paths: &RuntimePaths) -> Result<Runtime, StartError> {
@@ -44,7 +47,7 @@ async fn exchange(paths: &RuntimePaths, frames: &[serde_json::Value]) -> ServerF
     let mut last = None;
     while let Ok(Some(frame)) = codec::read::<ServerFrame, _>(&mut stream).await {
         last = Some(frame);
-        if !matches!(last, Some(ServerFrame::HandshakeAck { .. })) {
+        if !matches!(last, Some(ServerFrame::HandshakeAccepted { .. })) {
             break;
         }
     }
@@ -53,9 +56,9 @@ async fn exchange(paths: &RuntimePaths, frames: &[serde_json::Value]) -> ServerF
 
 #[tokio::test]
 async fn a_client_pings_the_runtime_and_learns_its_id() {
-    let fx = fixture();
-    let runtime = start(&fx.paths).await.unwrap();
-    let mut client = Client::connect(&fx.paths).await.unwrap();
+    let fixture = fixture();
+    let runtime = start(&fixture.paths).await.unwrap();
+    let mut client = Client::connect(&fixture.paths).await.unwrap();
     assert_eq!(client.runtime(), runtime.id());
     let reply = client
         .request(RequestBody::Runtime(RuntimeRequest::Ping))
@@ -68,12 +71,12 @@ async fn a_client_pings_the_runtime_and_learns_its_id() {
 
 #[tokio::test]
 async fn a_second_runtime_is_refused_while_the_first_holds_the_lock() {
-    let fx = fixture();
-    let first = start(&fx.paths).await.unwrap();
-    let second = start(&fx.paths).await;
+    let fixture = fixture();
+    let first = start(&fixture.paths).await.unwrap();
+    let second = start(&fixture.paths).await;
     assert!(matches!(
         second,
-        Err(StartError::AlreadyRunning { holder: Some(h) }) if h.pid == std::process::id()
+        Err(StartError::AlreadyRunning { holder: Some(holder) }) if holder.process_id == std::process::id()
     ));
     first.stop();
     first.wait().await;
@@ -81,12 +84,12 @@ async fn a_second_runtime_is_refused_while_the_first_holds_the_lock() {
 
 #[tokio::test]
 async fn a_stopped_runtime_releases_the_lock_and_socket_for_the_next() {
-    let fx = fixture();
-    let first = start(&fx.paths).await.unwrap();
+    let fixture = fixture();
+    let first = start(&fixture.paths).await.unwrap();
     first.stop();
     first.wait().await;
-    let second = start(&fx.paths).await.unwrap();
-    let mut client = Client::connect(&fx.paths).await.unwrap();
+    let second = start(&fixture.paths).await.unwrap();
+    let mut client = Client::connect(&fixture.paths).await.unwrap();
     assert_eq!(client.runtime(), second.id());
     client
         .request(RequestBody::Runtime(RuntimeRequest::Ping))
@@ -98,10 +101,10 @@ async fn a_stopped_runtime_releases_the_lock_and_socket_for_the_next() {
 
 #[tokio::test]
 async fn another_protocol_version_is_rejected_with_both_versions() {
-    let fx = fixture();
-    let runtime = start(&fx.paths).await.unwrap();
+    let fixture = fixture();
+    let runtime = start(&fixture.paths).await.unwrap();
     let answer = exchange(
-        &fx.paths,
+        &fixture.paths,
         &[json!({"type": "handshake_start", "body": {"protocol": 999}})],
     )
     .await;
@@ -115,19 +118,21 @@ async fn another_protocol_version_is_rejected_with_both_versions() {
 
 #[tokio::test]
 async fn a_request_before_the_handshake_is_refused() {
-    let fx = fixture();
-    let runtime = start(&fx.paths).await.unwrap();
-    let op = crate::protocol::OpId::mint();
+    let fixture = fixture();
+    let runtime = start(&fixture.paths).await.unwrap();
+    let operation = crate::protocol::OperationId::mint();
     let answer = exchange(
-        &fx.paths,
-        &[json!({"type": "request", "body": {"op": op.to_string(),
-                 "body": {"domain": "runtime", "request": "ping"}}})],
+        &fixture.paths,
+        &[
+            json!({"type": "request", "body": {"operation": operation.to_string(),
+                 "body": {"domain": "runtime", "request": "ping"}}}),
+        ],
     )
     .await;
     assert_eq!(
         answer,
         ServerFrame::Refused {
-            op: Some(op),
+            operation: Some(operation),
             reason: Refusal::HandshakeRequired
         }
     );
@@ -137,10 +142,10 @@ async fn a_request_before_the_handshake_is_refused() {
 
 #[tokio::test]
 async fn an_undecodable_frame_is_refused_as_malformed() {
-    let fx = fixture();
-    let runtime = start(&fx.paths).await.unwrap();
+    let fixture = fixture();
+    let runtime = start(&fixture.paths).await.unwrap();
     let answer = exchange(
-        &fx.paths,
+        &fixture.paths,
         &[
             json!({"type": "handshake_start", "body": {"protocol": 1}}),
             json!({"type": "subscribe", "body": {}}),
@@ -150,7 +155,7 @@ async fn an_undecodable_frame_is_refused_as_malformed() {
     assert_eq!(
         answer,
         ServerFrame::Refused {
-            op: None,
+            operation: None,
             reason: Refusal::MalformedFrame
         }
     );
@@ -160,9 +165,11 @@ async fn an_undecodable_frame_is_refused_as_malformed() {
 
 #[tokio::test]
 async fn connecting_without_a_runtime_is_unreachable_with_a_hint() {
-    let fx = fixture();
-    let result = Client::connect(&fx.paths).await;
-    assert!(matches!(result, Err(ref e @ ClientError::Unreachable { .. }) if e.hint().is_some()));
+    let fixture = fixture();
+    let result = Client::connect(&fixture.paths).await;
+    assert!(
+        matches!(result, Err(ref error @ ClientError::Unreachable { .. }) if error.hint().is_some())
+    );
 }
 
 use crate::protocol::ProtocolVersion;

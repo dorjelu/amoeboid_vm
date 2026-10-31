@@ -4,19 +4,19 @@
 use ractor::{Actor, ActorProcessingErr, ActorRef};
 use tokio::task::JoinHandle;
 
-use super::root::RootMsg;
+use super::root::RootMessage;
 use super::session::{Session, SessionArgs};
 use crate::protocol::RuntimeId;
 
 #[derive(Debug)]
-pub enum ListenerMsg {
+pub enum ListenerMessage {
     /// `accept` failed; the listener ends and the runtime with it.
     AcceptFailed(String),
 }
 
 pub struct ListenerArgs {
     pub listener: tokio::net::UnixListener,
-    pub root: ActorRef<RootMsg>,
+    pub root: ActorRef<RootMessage>,
     pub runtime: RuntimeId,
 }
 
@@ -27,13 +27,13 @@ pub struct ListenerState {
 }
 
 impl Actor for Listener {
-    type Msg = ListenerMsg;
+    type Msg = ListenerMessage;
     type State = ListenerState;
     type Arguments = ListenerArgs;
 
     fn pre_start(
         &self,
-        myself: ActorRef<ListenerMsg>,
+        myself: ActorRef<ListenerMessage>,
         args: ListenerArgs,
     ) -> impl Future<Output = Result<ListenerState, ActorProcessingErr>> + Send {
         let accept = tokio::spawn(accept_loop(myself, args));
@@ -42,17 +42,17 @@ impl Actor for Listener {
 
     fn handle(
         &self,
-        _myself: ActorRef<ListenerMsg>,
-        msg: ListenerMsg,
+        _myself: ActorRef<ListenerMessage>,
+        message: ListenerMessage,
         _state: &mut ListenerState,
     ) -> impl Future<Output = Result<(), ActorProcessingErr>> + Send {
-        let ListenerMsg::AcceptFailed(error) = msg;
+        let ListenerMessage::AcceptFailed(error) = message;
         std::future::ready(Err(format!("can't accept connections: {error}").into()))
     }
 
     fn post_stop(
         &self,
-        _myself: ActorRef<ListenerMsg>,
+        _myself: ActorRef<ListenerMessage>,
         state: &mut ListenerState,
     ) -> impl Future<Output = Result<(), ActorProcessingErr>> + Send {
         state.accept.abort();
@@ -60,28 +60,28 @@ impl Actor for Listener {
     }
 }
 
-async fn accept_loop(myself: ActorRef<ListenerMsg>, args: ListenerArgs) {
-    let uid = rustix::process::getuid().as_raw();
+async fn accept_loop(myself: ActorRef<ListenerMessage>, args: ListenerArgs) {
+    let user_id = rustix::process::getuid().as_raw();
     loop {
         let stream = match args.listener.accept().await {
             Ok((stream, _)) => stream,
-            Err(e) => {
-                let _ = myself.cast(ListenerMsg::AcceptFailed(e.to_string()));
+            Err(error) => {
+                let _ = myself.cast(ListenerMessage::AcceptFailed(error.to_string()));
                 return;
             }
         };
-        // The run directory is 0700; this is the second line: same uid only.
+        // The run directory is 0700; this is the second line: same user_id only.
         match stream.peer_cred() {
-            Ok(cred) if cred.uid() == uid => {}
-            Ok(cred) => {
+            Ok(credentials) if credentials.uid() == user_id => {}
+            Ok(credentials) => {
                 tracing::warn!(
-                    peer_uid = cred.uid(),
-                    "refused a connection from another uid"
+                    peer_user_id = credentials.uid(),
+                    "refused a connection from another user"
                 );
                 continue;
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "refused a connection without peer credentials");
+            Err(error) => {
+                tracing::warn!(error = %error, "refused a connection without peer credentials");
                 continue;
             }
         }
@@ -90,8 +90,8 @@ async fn accept_loop(myself: ActorRef<ListenerMsg>, args: ListenerArgs) {
             root: args.root.clone(),
             runtime: args.runtime,
         };
-        if let Err(e) = Actor::spawn(None, Session, session).await {
-            tracing::warn!(error = %e, "can't start a session");
+        if let Err(error) = Actor::spawn(None, Session, session).await {
+            tracing::warn!(error = %error, "can't start a session");
         }
     }
 }

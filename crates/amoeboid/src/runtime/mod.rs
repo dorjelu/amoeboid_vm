@@ -24,7 +24,7 @@ use crate::journal::Persistence;
 use crate::protocol::RuntimeId;
 use lock::{Acquire, DaemonLock, LockError, LockRecord};
 use paths::RuntimePaths;
-use root::{Root, RootArgs, RootMsg};
+use root::{Root, RootArgs, RootMessage};
 
 /// Where the listening socket comes from and who restarts the process.
 #[derive(Debug)]
@@ -44,7 +44,7 @@ impl ActivatedSocket {
     ///
     /// # Errors
     ///
-    /// The passed fd is not a Unix stream socket.
+    /// The passed descriptor is not a Unix stream socket.
     pub fn from_env() -> std::io::Result<Option<Self>> {
         listenfd::ListenFd::from_env()
             .take_unix_listener(0)
@@ -63,10 +63,13 @@ pub struct RuntimeConfig {
 
 #[derive(Debug, thiserror::Error)]
 pub enum StartError {
-    #[error("a runtime is already running{}", holder.as_ref().map_or(String::new(), |h| format!(" (pid {}, version {})", h.pid, h.version)))]
+    #[error("a runtime is already running{}", holder.as_ref().map_or(String::new(), |holder| format!(" (process {}, version {})", holder.process_id, holder.version)))]
     AlreadyRunning { holder: Option<LockRecord> },
-    #[error("can't create {dir}: {source}")]
-    Dir { dir: String, source: std::io::Error },
+    #[error("can't create {directory}: {source}")]
+    Dir {
+        directory: String,
+        source: std::io::Error,
+    },
     #[error(transparent)]
     Lock(#[from] LockError),
     #[error("can't listen on {socket}: {source}")]
@@ -81,7 +84,7 @@ pub enum StartError {
 /// A running runtime. Dropping it does not stop it; call [`Runtime::stop`].
 pub struct Runtime {
     id: RuntimeId,
-    root: ActorRef<RootMsg>,
+    root: ActorRef<RootMessage>,
     join: JoinHandle<()>,
     _lock: DaemonLock,
 }
@@ -99,18 +102,18 @@ impl Runtime {
             persistence,
             version,
         } = config;
-        for dir in [paths.data(), paths.run()] {
+        for directory in [paths.data(), paths.run()] {
             std::fs::DirBuilder::new()
                 .recursive(true)
                 .mode(0o700)
-                .create(dir.as_path())
+                .create(directory.as_path())
                 .map_err(|source| StartError::Dir {
-                    dir: dir.as_path().display().to_string(),
+                    directory: directory.as_path().display().to_string(),
                     source,
                 })?;
         }
         let record = LockRecord {
-            pid: std::process::id(),
+            process_id: std::process::id(),
             version,
         };
         let lock = match lock::acquire(&paths, &record)? {
@@ -134,7 +137,7 @@ impl Runtime {
             },
         )
         .await
-        .map_err(|e| StartError::Spawn(e.to_string()))?;
+        .map_err(|error| StartError::Spawn(error.to_string()))?;
         Ok(Self {
             id,
             root,
@@ -161,14 +164,14 @@ impl Runtime {
 
     /// Waits for the actor tree to end, then releases `daemon.lock`.
     pub async fn wait(self) {
-        if let Err(e) = self.join.await {
-            tracing::error!(error = %e, "root actor task failed");
+        if let Err(error) = self.join.await {
+            tracing::error!(error = %error, "root actor task failed");
         }
     }
 }
 
 #[derive(Clone)]
-pub struct Stopper(ActorRef<RootMsg>);
+pub struct Stopper(ActorRef<RootMessage>);
 
 impl Stopper {
     pub fn stop(&self) {
@@ -183,8 +186,8 @@ fn listen(paths: &RuntimePaths, hosting: Hosting) -> std::io::Result<tokio::net:
         Hosting::InProcess => {
             match std::fs::remove_file(paths.socket()) {
                 Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
             }
             std::os::unix::net::UnixListener::bind(paths.socket())?
         }

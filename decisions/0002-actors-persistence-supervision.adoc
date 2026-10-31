@@ -75,7 +75,7 @@ The Vm actor is the VM's digital twin: everything that belongs to that VM is own
 
 Shares belong to the Hypervisor, not to the Vm: the Vm asks for `Boot { spec }`, where `spec` lists shares by what they are (host directory, read-only or not), and LocalQemu realises them as virtiofsd children. A remote hypervisor would realise them its own way.
 
-The Vm knows clients only by `OpId`. Root keeps an in-memory table of which session waits on which operation and routes the Vm's `OpDone { op, result }` to it; a client reference never enters persisted state. If the runtime restarts mid-operation the waiting connection ends with it; `Subscribe { op, from }` is how a client re-attaches.
+The Vm knows clients only by `OperationId`. Root keeps an in-memory table of which session waits on which operation and routes the Vm's `OperationDone { operation, result }` to it; a client reference never enters persisted state. If the runtime restarts mid-operation the waiting connection ends with it; `Subscribe { operation, from }` is how a client re-attaches.
 
 Every process a VM runs is spawned inside a transient user scope (`systemd-run --user --scope --unit=amoeboid-vm-NAME`), with a per-spawn nonce in its environment, so a spawn whose `Spawned` event was lost is found by searching the scope.
 
@@ -153,17 +153,17 @@ vm/work/7/share/d0       Share d0, generation 7
 [source,sql]
 ----
 CREATE TABLE events (
-  pid     TEXT NOT NULL,      -- persistence id
-  seq     INTEGER NOT NULL,   -- 1, 2, ... per stream
+  persistence_id TEXT NOT NULL,
+  sequence       INTEGER NOT NULL,   -- 1, 2, ... per stream
   payload TEXT NOT NULL,      -- versioned JSON event
   at      INTEGER NOT NULL,   -- stamped by the journal
-  PRIMARY KEY (pid, seq)
+  PRIMARY KEY (persistence_id, sequence)
 ) STRICT;
 ----
 
 An append writes the batch at `last_seq + 1 ..`; a primary-key conflict means another incarnation wrote to the stream, and the writer is stale (`PersistFailed { reason: Conflict }`). This is the writer fence: a writer appends only to a stream at the position it holds.
 
-0001's `vms`, `steps`, `snapshots` and `intake` tables are replaced. Snapshots are deferred: streams are short and are trimmed when a generation ends. Client idempotency is the client-minted `op_id`, recorded in the events that carry it.
+0001's `vms`, `steps`, `snapshots` and `intake` tables are replaced. Snapshots are deferred: streams are short and are trimmed when a generation ends. Client idempotency is the client-minted `operation`, recorded in the events that carry it.
 
 === Generation rules
 
@@ -177,7 +177,7 @@ Replay restores what the actor believed. Reconcile checks it against the world a
 
 [source]
 ----
-share/d0  replay → Spawned{pid 812, starttime X, scope amoeboid-vm-work}
+share/d0  replay → Spawned{process 812, start time X, scope amoeboid-vm-work}
           pidfd_open(812) + starttime == X + in scope → persist Adopted → tell parent ChildReady
           otherwise                                    → persist Lost   → respawn or report
 share/d1  replay → Spawning{nonce N} without Spawned   (crash between spawn and append)
@@ -210,7 +210,7 @@ The runtime is started by systemd socket activation (`amoeboid.socket`, `amoeboi
 * `flock(LOCK_EX | LOCK_NB)` on an open file. The kernel releases it when the last fd to that open file closes, including on `SIGKILL`; it cannot go stale.
 * The file is never deleted. Deleting a held lock file lets a second process create a new file and lock that one.
 * Opened `O_CLOEXEC`, so qemu never inherits it and keeps the lock past the runtime's death. Opened `O_NOFOLLOW`, so it cannot be redirected through a symlink.
-* Contents (pid, starttime, boot id, version) are diagnostics only.
+* Contents (process id, start time, boot id, version) are diagnostics only.
 
 Order on start: take the lock, unlink the stale socket, bind (or receive the activated socket), hold incoming frames until recovery completes. A client never sees `RuntimeUnreachable` during a normal start.
 
@@ -243,14 +243,14 @@ Frames are separate enums per direction, so a client cannot construct a server f
 
 [source,rust]
 ----
-enum ClientFrame { HandshakeStart { .. }, Request { op_id, body }, Cancel { op_id }, Subscribe { op_id, from } }
-enum ServerFrame { HandshakeAck { .. }, HandshakeRejected { .. }, Reply { op_id, result }, Event { op_id, seq, event }, Refused { .. } }
+enum ClientFrame { HandshakeStart { .. }, Request { operation, body }, Cancel { operation }, Subscribe { operation, from } }
+enum ServerFrame { HandshakeAccepted { .. }, HandshakeRejected { .. }, Reply { operation, body }, Event { operation, sequence, event }, Refused { .. } }
 ----
 
 Variants are added with the slice that handles them.
 
 * Request bodies, replies and events are further split per domain (VM lifecycle, configuration, runtime).
-* `op_id` is minted by the client (UUIDv7) and is the idempotency key; a retry returns the original reply.
+* `operation` (an `OperationId`) is minted by the client (UUIDv7) and is the idempotency key; a retry returns the original reply.
 * The protocol version must match exactly; a mismatch is answered with `HandshakeRejected` naming `amoeboid daemon restart`. The CLI and runtime ship in one binary; upgrades go through restart and adoption.
 * Unknown variants are refused. Refined types decode through `#[serde(try_from = "Raw…")]`, so no frame bypasses refinement.
 * Framing: 4-byte big-endian length prefix, JSON payload, 1 MiB maximum.
@@ -263,13 +263,13 @@ A transport only turns bytes into frames; Root and VM actors never see it. A new
 [cols="1,1,1"]
 |===
 |Frame |Unix socket |HTTP
-|`HandshakeStart`/`HandshakeAck` |first frames on the connection |version header on every request; mismatch is 409
+|`HandshakeStart`/`HandshakeAccepted` |first frames on the connection |version header on every request; mismatch is 409
 |`Request` |frame |`POST /ops`
 |`Cancel` |frame |`DELETE /ops/{id}`
 |`Subscribe { from }` |frame, then `Event` frames |`GET /ops/{id}/events?from=N` as server-sent events
 |===
 
-Requirements that keep this cheap: no per-connection state beyond the version check, client-minted `op_id`, and peer authentication through `SO_PEERCRED` on the Unix socket (HTTP over TCP would need tokens or mTLS). gRPC is not used for client to runtime: its generated types are not the ADTs, it is built for independent version evolution, and it is request/response. It is a candidate for a remote hypervisor backend, where it stays inside that backend's actor.
+Requirements that keep this cheap: no per-connection state beyond the version check, client-minted `operation`, and peer authentication through `SO_PEERCRED` on the Unix socket (HTTP over TCP would need tokens or mTLS). gRPC is not used for client to runtime: its generated types are not the ADTs, it is built for independent version evolution, and it is request/response. It is a candidate for a remote hypervisor backend, where it stays inside that backend's actor.
 
 == Console
 

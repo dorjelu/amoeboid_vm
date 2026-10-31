@@ -41,14 +41,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     })
     .await?;
     let stopper = runtime.stopper();
-    let mut term = signal(SignalKind::terminate())?;
-    let mut int = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    let mut interrupt = signal(SignalKind::interrupt())?;
     let wait = runtime.wait();
     tokio::pin!(wait);
     tokio::select! {
         () = &mut wait => return Err("the runtime ended by itself".into()),
-        _ = term.recv() => tracing::info!("SIGTERM: stopping"),
-        _ = int.recv() => tracing::info!("SIGINT: stopping"),
+        _ = terminate.recv() => tracing::info!("SIGTERM: stopping"),
+        _ = interrupt.recv() => tracing::info!("SIGINT: stopping"),
     }
     stopper.stop();
     wait.await;

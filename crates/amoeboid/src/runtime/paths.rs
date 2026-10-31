@@ -80,14 +80,16 @@ impl RuntimePaths {
     /// # Errors
     ///
     /// See [`PathError`].
-    pub fn from_env(env: impl Fn(&'static str) -> Option<OsString>) -> Result<Self, PathError> {
-        let data = match env("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
+    pub fn from_env(
+        environment: impl Fn(&'static str) -> Option<OsString>,
+    ) -> Result<Self, PathError> {
+        let data = match environment("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
             Some(xdg) => PathBuf::from(xdg).join("amoeboid"),
-            None => PathBuf::from(env("HOME").ok_or(PathError::MissingEnv("HOME"))?)
+            None => PathBuf::from(environment("HOME").ok_or(PathError::MissingEnv("HOME"))?)
                 .join(".local/share/amoeboid"),
         };
         let run = PathBuf::from(
-            env("XDG_RUNTIME_DIR")
+            environment("XDG_RUNTIME_DIR")
                 .filter(|v| !v.is_empty())
                 .ok_or(PathError::MissingEnv("XDG_RUNTIME_DIR"))?,
         )
@@ -127,14 +129,14 @@ mod tests {
 
     use super::*;
 
-    fn env(vars: &[(&'static str, &str)]) -> impl Fn(&'static str) -> Option<OsString> {
+    fn environment(vars: &[(&'static str, &str)]) -> impl Fn(&'static str) -> Option<OsString> {
         let vars: BTreeMap<_, _> = vars.iter().map(|(k, v)| (*k, OsString::from(v))).collect();
         move |k| vars.get(k).cloned()
     }
 
     #[test]
     fn xdg_data_home_wins_over_home() {
-        let paths = RuntimePaths::from_env(env(&[
+        let paths = RuntimePaths::from_env(environment(&[
             ("XDG_DATA_HOME", "/x/data"),
             ("HOME", "/home/u"),
             ("XDG_RUNTIME_DIR", "/run/user/1"),
@@ -149,7 +151,7 @@ mod tests {
 
     #[test]
     fn home_is_the_fallback_for_data() {
-        let paths = RuntimePaths::from_env(env(&[
+        let paths = RuntimePaths::from_env(environment(&[
             ("XDG_DATA_HOME", ""),
             ("HOME", "/home/u"),
             ("XDG_RUNTIME_DIR", "/run/user/1"),
@@ -163,7 +165,7 @@ mod tests {
 
     #[test]
     fn a_missing_runtime_dir_is_refused() {
-        let result = RuntimePaths::from_env(env(&[("HOME", "/home/u")]));
+        let result = RuntimePaths::from_env(environment(&[("HOME", "/home/u")]));
         assert!(matches!(
             result,
             Err(PathError::MissingEnv("XDG_RUNTIME_DIR"))

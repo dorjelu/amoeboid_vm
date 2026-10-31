@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use serde::{Deserialize, Serialize};
 
 use super::{Behaviour, Effect, Unrecoverable};
-use crate::journal::{BatchId, EventPayload, PersistFailure, Seq, StoreError, StoredEvent};
+use crate::journal::{BatchId, EventPayload, PersistFailure, Sequence, StoreError, StoredEvent};
 use crate::nonempty::NonEmpty;
 
 /// ```text
@@ -49,7 +49,7 @@ pub enum Input<B: Behaviour> {
     ReplayFailed(StoreError),
     Persisted {
         batch: BatchId,
-        last: Seq,
+        last: Sequence,
     },
     PersistFailed {
         batch: BatchId,
@@ -61,7 +61,7 @@ pub enum Input<B: Behaviour> {
 pub enum Action<B: Behaviour> {
     Persist {
         batch: BatchId,
-        first: Seq,
+        first: Sequence,
         events: NonEmpty<EventPayload>,
     },
     /// Deliver `PersistTimeout(batch)` after the configured timeout.
@@ -99,7 +99,7 @@ pub enum Fatal {
 pub struct Core<B: Behaviour> {
     pub state: B::State,
     /// Last durable position; `None` for an empty stream.
-    pub last: Option<Seq>,
+    pub last: Option<Sequence>,
     pub next_batch: BatchId,
     pub mode: Mode<B>,
 }
@@ -118,17 +118,17 @@ impl<B: Behaviour> Core<B> {
     }
 }
 
-/// Persisted form of every event; `v` is [`Behaviour::EVENT_VERSION`] at write time.
+/// Persisted form of every event; `version` is [`Behaviour::EVENT_VERSION`] at write time.
 #[derive(Serialize)]
 struct Envelope<'a, E> {
-    v: u16,
+    version: u16,
     event: &'a E,
 }
 
 /// Read in two steps so an unknown version is reported as such, not as a decode error.
 #[derive(Deserialize)]
 struct RawEnvelope {
-    v: u16,
+    version: u16,
     event: serde_json::Value,
 }
 
@@ -150,7 +150,7 @@ pub fn step<B: Behaviour>(core: Core<B>, input: Input<B>) -> (Core<B>, Vec<Actio
 /// The core without its mode: what every transition carries over.
 struct Parts<B: Behaviour> {
     state: B::State,
-    last: Option<Seq>,
+    last: Option<Sequence>,
     next_batch: BatchId,
 }
 
@@ -207,7 +207,7 @@ fn recovering<B: Behaviour>(
                 out.extend(
                     stash
                         .into_iter()
-                        .filter_map(|c| B::refuse(c, &reason))
+                        .filter_map(|command| B::refuse(command, &reason))
                         .map(Action::Send),
                 );
                 parts.with(Mode::Unrecoverable { reason })
@@ -215,7 +215,7 @@ fn recovering<B: Behaviour>(
             Ok(decoded) => {
                 let parts = Parts {
                     state: decoded.iter().fold(parts.state, B::on_event),
-                    last: events.last().map(|e| e.seq),
+                    last: events.last().map(|event| event.sequence),
                     next_batch: parts.next_batch,
                 };
                 out.push(Action::Entered(ModeName::Reconciling));
@@ -377,7 +377,7 @@ fn apply<B: Behaviour>(
                 .iter()
                 .map(encode::<B>)
                 .collect::<Result<Vec<_>, _>>();
-            match (encoded.map(NonEmpty::from_vec), Seq::after(parts.last)) {
+            match (encoded.map(NonEmpty::from_vec), Sequence::after(parts.last)) {
                 (Ok(Some(payloads)), Some(first)) => {
                     let batch = parts.next_batch;
                     out.push(Action::Persist {
@@ -440,7 +440,7 @@ fn resume_mode<B: Behaviour>(resume: Resume<B>) -> Mode<B> {
 
 fn encode<B: Behaviour>(event: &B::Event) -> Result<EventPayload, serde_json::Error> {
     EventPayload::encode(&Envelope {
-        v: B::EVENT_VERSION,
+        version: B::EVENT_VERSION,
         event,
     })
 }
@@ -449,19 +449,23 @@ fn decode<B: Behaviour>(events: &[StoredEvent]) -> Result<Vec<B::Event>, Unrecov
     events
         .iter()
         .map(|stored| {
-            let at = stored.seq;
-            let raw: RawEnvelope = serde_json::from_str(stored.payload.as_str()).map_err(|e| {
-                Unrecoverable::UndecodableEvent {
+            let at = stored.sequence;
+            let raw: RawEnvelope =
+                serde_json::from_str(stored.payload.as_str()).map_err(|error| {
+                    Unrecoverable::UndecodableEvent {
+                        at,
+                        error: error.to_string(),
+                    }
+                })?;
+            if raw.version != B::EVENT_VERSION {
+                return Err(Unrecoverable::UnknownEventVersion {
                     at,
-                    error: e.to_string(),
-                }
-            })?;
-            if raw.v != B::EVENT_VERSION {
-                return Err(Unrecoverable::UnknownEventVersion { at, found: raw.v });
+                    found: raw.version,
+                });
             }
-            serde_json::from_value(raw.event).map_err(|e| Unrecoverable::UndecodableEvent {
+            serde_json::from_value(raw.event).map_err(|error| Unrecoverable::UndecodableEvent {
                 at,
-                error: e.to_string(),
+                error: error.to_string(),
             })
         })
         .collect()

@@ -11,12 +11,12 @@ use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::task::JoinHandle;
 
-use super::root::RootMsg;
+use super::root::RootMessage;
 use crate::protocol::codec::{self, FrameError, MAX_FRAME};
 use crate::protocol::{ClientFrame, ProtocolVersion, Refusal, RuntimeId, ServerFrame};
 
 #[derive(Debug)]
-pub enum SessionMsg {
+pub enum SessionMessage {
     /// Decoded by the connection's reader task.
     Inbound(ClientFrame),
     /// From the root, written to the client.
@@ -27,20 +27,20 @@ pub enum SessionMsg {
     Closed,
 }
 
-impl From<ServerFrame> for SessionMsg {
+impl From<ServerFrame> for SessionMessage {
     fn from(frame: ServerFrame) -> Self {
         Self::Outbound(frame)
     }
 }
 
-impl TryFrom<SessionMsg> for ServerFrame {
-    type Error = SessionMsg;
-    fn try_from(msg: SessionMsg) -> Result<Self, Self::Error> {
-        match msg {
-            SessionMsg::Outbound(frame) => Ok(frame),
-            other @ (SessionMsg::Inbound(_) | SessionMsg::ReadFailed(_) | SessionMsg::Closed) => {
-                Err(other)
-            }
+impl TryFrom<SessionMessage> for ServerFrame {
+    type Error = SessionMessage;
+    fn try_from(message: SessionMessage) -> Result<Self, Self::Error> {
+        match message {
+            SessionMessage::Outbound(frame) => Ok(frame),
+            other @ (SessionMessage::Inbound(_)
+            | SessionMessage::ReadFailed(_)
+            | SessionMessage::Closed) => Err(other),
         }
     }
 }
@@ -53,7 +53,7 @@ pub enum Phase {
 
 pub struct SessionArgs {
     pub stream: UnixStream,
-    pub root: ActorRef<RootMsg>,
+    pub root: ActorRef<RootMessage>,
     pub runtime: RuntimeId,
 }
 
@@ -63,18 +63,18 @@ pub struct SessionState {
     writer: OwnedWriteHalf,
     reader: JoinHandle<()>,
     phase: Phase,
-    root: ActorRef<RootMsg>,
+    root: ActorRef<RootMessage>,
     runtime: RuntimeId,
 }
 
 impl Actor for Session {
-    type Msg = SessionMsg;
+    type Msg = SessionMessage;
     type State = SessionState;
     type Arguments = SessionArgs;
 
     fn pre_start(
         &self,
-        myself: ActorRef<SessionMsg>,
+        myself: ActorRef<SessionMessage>,
         args: SessionArgs,
     ) -> impl Future<Output = Result<SessionState, ActorProcessingErr>> + Send {
         let (read, writer) = args.stream.into_split();
@@ -90,17 +90,17 @@ impl Actor for Session {
 
     async fn handle(
         &self,
-        myself: ActorRef<SessionMsg>,
-        msg: SessionMsg,
+        myself: ActorRef<SessionMessage>,
+        message: SessionMessage,
         state: &mut SessionState,
     ) -> Result<(), ActorProcessingErr> {
-        let (reply, end) = match (state.phase, msg) {
+        let (reply, end) = match (state.phase, message) {
             (
                 Phase::AwaitingHandshake,
-                SessionMsg::Inbound(ClientFrame::HandshakeStart { protocol }),
+                SessionMessage::Inbound(ClientFrame::HandshakeStart { protocol }),
             ) if protocol == ProtocolVersion::CURRENT => {
                 state.phase = Phase::Open;
-                let ack = ServerFrame::HandshakeAck {
+                let ack = ServerFrame::HandshakeAccepted {
                     protocol,
                     runtime: state.runtime,
                 };
@@ -108,7 +108,7 @@ impl Actor for Session {
             }
             (
                 Phase::AwaitingHandshake,
-                SessionMsg::Inbound(ClientFrame::HandshakeStart { protocol }),
+                SessionMessage::Inbound(ClientFrame::HandshakeStart { protocol }),
             ) => {
                 let rejected = ServerFrame::HandshakeRejected {
                     runtime: ProtocolVersion::CURRENT,
@@ -116,31 +116,35 @@ impl Actor for Session {
                 };
                 (Some(rejected), true)
             }
-            (Phase::AwaitingHandshake, SessionMsg::Inbound(ClientFrame::Request { op, .. })) => {
-                (Some(refused(Some(op), Refusal::HandshakeRequired)), true)
-            }
-            (Phase::Open, SessionMsg::Inbound(ClientFrame::HandshakeStart { .. })) => {
+            (
+                Phase::AwaitingHandshake,
+                SessionMessage::Inbound(ClientFrame::Request { operation, .. }),
+            ) => (
+                Some(refused(Some(operation), Refusal::HandshakeRequired)),
+                true,
+            ),
+            (Phase::Open, SessionMessage::Inbound(ClientFrame::HandshakeStart { .. })) => {
                 (Some(refused(None, Refusal::HandshakeRepeated)), true)
             }
-            (Phase::Open, SessionMsg::Inbound(ClientFrame::Request { op, body })) => {
-                let request = RootMsg::Request {
-                    op,
+            (Phase::Open, SessionMessage::Inbound(ClientFrame::Request { operation, body })) => {
+                let request = RootMessage::Request {
+                    operation,
                     body,
                     reply_to: myself.get_derived(),
                 };
                 if state.root.cast(request).is_err() {
-                    tracing::warn!(%op, "request dropped: root stopped");
+                    tracing::warn!(%operation, "request dropped: root stopped");
                 }
                 (None, false)
             }
-            (_, SessionMsg::Outbound(frame)) => (Some(frame), false),
-            (_, SessionMsg::ReadFailed(reason)) => (Some(refused(None, reason)), true),
-            (_, SessionMsg::Closed) => (None, true),
+            (_, SessionMessage::Outbound(frame)) => (Some(frame), false),
+            (_, SessionMessage::ReadFailed(reason)) => (Some(refused(None, reason)), true),
+            (_, SessionMessage::Closed) => (None, true),
         };
         if let Some(frame) = reply
-            && let Err(e) = codec::write(&mut state.writer, &frame).await
+            && let Err(error) = codec::write(&mut state.writer, &frame).await
         {
-            tracing::debug!(error = %e, "can't write to client; closing");
+            tracing::debug!(error = %error, "can't write to client; closing");
             myself.stop(None);
             return Ok(());
         }
@@ -152,7 +156,7 @@ impl Actor for Session {
 
     fn post_stop(
         &self,
-        _myself: ActorRef<SessionMsg>,
+        _myself: ActorRef<SessionMessage>,
         state: &mut SessionState,
     ) -> impl Future<Output = Result<(), ActorProcessingErr>> + Send {
         state.reader.abort();
@@ -160,24 +164,27 @@ impl Actor for Session {
     }
 }
 
-fn refused(op: Option<crate::protocol::OpId>, reason: Refusal) -> ServerFrame {
-    ServerFrame::Refused { op, reason }
+fn refused(operation: Option<crate::protocol::OperationId>, reason: Refusal) -> ServerFrame {
+    ServerFrame::Refused { operation, reason }
 }
 
-async fn read_loop(mut read: OwnedReadHalf, session: ActorRef<SessionMsg>) {
+async fn read_loop(mut read: OwnedReadHalf, session: ActorRef<SessionMessage>) {
     loop {
-        let msg = match codec::read::<ClientFrame, _>(&mut read).await {
-            Ok(Some(frame)) => SessionMsg::Inbound(frame),
-            Ok(None) | Err(FrameError::Io(_)) => SessionMsg::Closed,
+        let message = match codec::read::<ClientFrame, _>(&mut read).await {
+            Ok(Some(frame)) => SessionMessage::Inbound(frame),
+            Ok(None) | Err(FrameError::Io(_)) => SessionMessage::Closed,
             Err(FrameError::TooLarge { .. }) => {
-                SessionMsg::ReadFailed(Refusal::FrameTooLarge { max: MAX_FRAME })
+                SessionMessage::ReadFailed(Refusal::FrameTooLarge { max: MAX_FRAME })
             }
             Err(FrameError::Decode(_) | FrameError::Encode(_)) => {
-                SessionMsg::ReadFailed(Refusal::MalformedFrame)
+                SessionMessage::ReadFailed(Refusal::MalformedFrame)
             }
         };
-        let last = matches!(msg, SessionMsg::Closed | SessionMsg::ReadFailed(_));
-        if session.cast(msg).is_err() || last {
+        let last = matches!(
+            message,
+            SessionMessage::Closed | SessionMessage::ReadFailed(_)
+        );
+        if session.cast(message).is_err() || last {
             return;
         }
     }

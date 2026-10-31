@@ -25,26 +25,33 @@ fn payloads(items: &[&str]) -> NonEmpty<EventPayload> {
     .unwrap()
 }
 
-fn seq(n: u64) -> Seq {
-    Seq(NonZeroU64::new(n).unwrap())
+fn sequence(n: u64) -> Sequence {
+    Sequence(NonZeroU64::new(n).unwrap())
 }
 
 struct Fixture {
-    _dir: tempfile::TempDir,
+    _temporary: tempfile::TempDir,
     paths: RuntimePaths,
 }
 
 fn fixture() -> Fixture {
-    let dir = tempfile::tempdir().unwrap();
-    let abs = AbsDir::parse(dir.path().to_path_buf()).unwrap();
-    let paths = RuntimePaths::under(abs.clone(), abs).unwrap();
-    Fixture { _dir: dir, paths }
+    let temporary = tempfile::tempdir().unwrap();
+    let directory = AbsDir::parse(temporary.path().to_path_buf()).unwrap();
+    let paths = RuntimePaths::under(directory.clone(), directory).unwrap();
+    Fixture {
+        _temporary: temporary,
+        paths,
+    }
 }
 
 async fn each_store(test: impl AsyncFn(Store, &Fixture)) {
     for persistence in [Persistence::Memory, Persistence::Sqlite] {
-        let fx = fixture();
-        test(Store::open(persistence, &fx.paths).await.unwrap(), &fx).await;
+        let fixture = fixture();
+        test(
+            Store::open(persistence, &fixture.paths).await.unwrap(),
+            &fixture,
+        )
+        .await;
     }
 }
 
@@ -52,18 +59,21 @@ async fn each_store(test: impl AsyncFn(Store, &Fixture)) {
 async fn appended_events_replay_in_order_with_positions_from_one() {
     each_store(async |mut store, _| {
         store
-            .append(&id("vm/a"), Seq::FIRST, payloads(&["x", "y"]))
+            .append(&id("vm/a"), Sequence::FIRST, payloads(&["x", "y"]))
             .await
             .unwrap();
         let last = store
-            .append(&id("vm/a"), seq(3), payloads(&["z"]))
+            .append(&id("vm/a"), sequence(3), payloads(&["z"]))
             .await
             .unwrap();
-        assert_eq!(last, seq(3));
+        assert_eq!(last, sequence(3));
         let replayed = store.replay(&id("vm/a")).await.unwrap();
-        let seqs: Vec<u64> = replayed.iter().map(|e| e.seq.get()).collect();
-        let bodies: Vec<&str> = replayed.iter().map(|e| e.payload.as_str()).collect();
-        assert_eq!(seqs, [1, 2, 3]);
+        let sequences: Vec<u64> = replayed.iter().map(|event| event.sequence.get()).collect();
+        let bodies: Vec<&str> = replayed
+            .iter()
+            .map(|event| event.payload.as_str())
+            .collect();
+        assert_eq!(sequences, [1, 2, 3]);
         assert_eq!(bodies, [r#""x""#, r#""y""#, r#""z""#]);
     })
     .await;
@@ -81,11 +91,11 @@ async fn an_unknown_stream_replays_empty() {
 async fn appending_at_a_taken_position_is_a_conflict_and_writes_nothing() {
     each_store(async |mut store, _| {
         store
-            .append(&id("vm/a"), Seq::FIRST, payloads(&["x"]))
+            .append(&id("vm/a"), Sequence::FIRST, payloads(&["x"]))
             .await
             .unwrap();
         let stale = store
-            .append(&id("vm/a"), Seq::FIRST, payloads(&["stale"]))
+            .append(&id("vm/a"), Sequence::FIRST, payloads(&["stale"]))
             .await;
         assert!(matches!(
             stale,
@@ -99,7 +109,9 @@ async fn appending_at_a_taken_position_is_a_conflict_and_writes_nothing() {
 #[tokio::test]
 async fn appending_past_the_next_position_is_a_conflict() {
     each_store(async |mut store, _| {
-        let gap = store.append(&id("vm/a"), seq(2), payloads(&["x"])).await;
+        let gap = store
+            .append(&id("vm/a"), sequence(2), payloads(&["x"]))
+            .await;
         assert!(matches!(
             gap,
             Err(PersistFailure::Conflict { first: 2, next: 1 })
@@ -112,11 +124,11 @@ async fn appending_past_the_next_position_is_a_conflict() {
 async fn streams_are_independent() {
     each_store(async |mut store, _| {
         store
-            .append(&id("vm/a"), Seq::FIRST, payloads(&["a"]))
+            .append(&id("vm/a"), Sequence::FIRST, payloads(&["a"]))
             .await
             .unwrap();
         store
-            .append(&id("vm/b"), Seq::FIRST, payloads(&["b"]))
+            .append(&id("vm/b"), Sequence::FIRST, payloads(&["b"]))
             .await
             .unwrap();
         assert_eq!(store.replay(&id("vm/a")).await.unwrap().len(), 1);
@@ -127,22 +139,28 @@ async fn streams_are_independent() {
 
 #[tokio::test]
 async fn sqlite_events_survive_reopening() {
-    let fx = fixture();
-    let mut store = Store::open(Persistence::Sqlite, &fx.paths).await.unwrap();
+    let fixture = fixture();
+    let mut store = Store::open(Persistence::Sqlite, &fixture.paths)
+        .await
+        .unwrap();
     store
-        .append(&id("vm/a"), Seq::FIRST, payloads(&["x"]))
+        .append(&id("vm/a"), Sequence::FIRST, payloads(&["x"]))
         .await
         .unwrap();
     drop(store);
-    let mut reopened = Store::open(Persistence::Sqlite, &fx.paths).await.unwrap();
+    let mut reopened = Store::open(Persistence::Sqlite, &fixture.paths)
+        .await
+        .unwrap();
     assert_eq!(reopened.replay(&id("vm/a")).await.unwrap().len(), 1);
 }
 
 #[tokio::test]
 async fn the_sqlite_file_is_created_owner_only() {
-    let fx = fixture();
-    Store::open(Persistence::Sqlite, &fx.paths).await.unwrap();
-    let mode = std::fs::metadata(fx.paths.journal())
+    let fixture = fixture();
+    Store::open(Persistence::Sqlite, &fixture.paths)
+        .await
+        .unwrap();
+    let mode = std::fs::metadata(fixture.paths.journal())
         .unwrap()
         .permissions()
         .mode();
@@ -151,10 +169,14 @@ async fn the_sqlite_file_is_created_owner_only() {
 
 #[tokio::test]
 async fn a_symlink_at_the_journal_path_is_refused() {
-    let fx = fixture();
-    let target = fx.paths.data().as_path().join("elsewhere");
-    std::os::unix::fs::symlink(&target, fx.paths.journal()).unwrap();
-    assert!(Store::open(Persistence::Sqlite, &fx.paths).await.is_err());
+    let fixture = fixture();
+    let target = fixture.paths.data().as_path().join("elsewhere");
+    std::os::unix::fs::symlink(&target, fixture.paths.journal()).unwrap();
+    assert!(
+        Store::open(Persistence::Sqlite, &fixture.paths)
+            .await
+            .is_err()
+    );
     assert!(!target.exists());
 }
 
@@ -171,9 +193,9 @@ fn persistence_ids_are_slash_joined_lowercase_segments() {
 
 #[test]
 fn seq_after_an_empty_stream_is_the_first_position() {
-    assert_eq!(Seq::after(None), Some(Seq::FIRST));
-    assert_eq!(Seq::after(Some(seq(4))), Some(seq(5)));
-    assert_eq!(Seq::after(Some(seq(u64::MAX))), None);
+    assert_eq!(Sequence::after(None), Some(Sequence::FIRST));
+    assert_eq!(Sequence::after(Some(sequence(4))), Some(sequence(5)));
+    assert_eq!(Sequence::after(Some(sequence(u64::MAX))), None);
 }
 
 #[tokio::test]
@@ -187,57 +209,57 @@ async fn the_journal_actor_answers_persist_and_replay_through_derived_refs() {
         fn pre_start(
             &self,
             _: ActorRef<JournalReply>,
-            tx: Self::Arguments,
+            sender: Self::Arguments,
         ) -> impl Future<Output = Result<Self::State, ActorProcessingErr>> + Send {
-            std::future::ready(Ok(tx))
+            std::future::ready(Ok(sender))
         }
         fn handle(
             &self,
             _: ActorRef<JournalReply>,
-            msg: JournalReply,
-            tx: &mut Self::State,
+            message: JournalReply,
+            sender: &mut Self::State,
         ) -> impl Future<Output = Result<(), ActorProcessingErr>> + Send {
-            std::future::ready(tx.send(msg).map_err(Into::into))
+            std::future::ready(sender.send(message).map_err(Into::into))
         }
     }
 
-    let fx = fixture();
+    let fixture = fixture();
     let (journal, _) = Actor::spawn(
         None,
         Journal,
         JournalArgs {
             persistence: Persistence::Memory,
-            paths: fx.paths.clone(),
+            paths: fixture.paths.clone(),
         },
     )
     .await
     .unwrap();
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let (probe, _) = Actor::spawn(None, Probe, tx).await.unwrap();
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (probe, _) = Actor::spawn(None, Probe, sender).await.unwrap();
     let reply_to: DerivedActorRef<JournalReply> = probe.get_derived();
 
     journal
-        .cast(JournalMsg::Persist {
+        .cast(JournalMessage::Persist {
             batch: BatchId::FIRST,
             id: id("vm/a"),
-            first: Seq::FIRST,
+            first: Sequence::FIRST,
             events: payloads(&["x"]),
             reply_to: reply_to.clone(),
         })
         .unwrap();
     assert!(matches!(
-        rx.recv().await,
-        Some(JournalReply::Persisted { batch: BatchId::FIRST, last }) if last == Seq::FIRST
+        receiver.recv().await,
+        Some(JournalReply::Persisted { batch: BatchId::FIRST, last }) if last == Sequence::FIRST
     ));
 
     journal
-        .cast(JournalMsg::Replay {
+        .cast(JournalMessage::Replay {
             id: id("vm/a"),
             reply_to,
         })
         .unwrap();
     assert!(matches!(
-        rx.recv().await,
+        receiver.recv().await,
         Some(JournalReply::Replayed { events, .. }) if events.len() == 1
     ));
 }

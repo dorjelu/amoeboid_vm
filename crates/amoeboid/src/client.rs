@@ -5,7 +5,8 @@ use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
 use crate::protocol::codec::{self, FrameError};
 use crate::protocol::{
-    ClientFrame, OpId, ProtocolVersion, Refusal, ReplyBody, RequestBody, RuntimeId, ServerFrame,
+    ClientFrame, OperationId, ProtocolVersion, Refusal, ReplyBody, RequestBody, RuntimeId,
+    ServerFrame,
 };
 use crate::runtime::paths::RuntimePaths;
 
@@ -71,7 +72,7 @@ impl Client {
         )
         .await?;
         match next(&mut reader).await? {
-            ServerFrame::HandshakeAck { runtime, .. } => Ok(Self {
+            ServerFrame::HandshakeAccepted { runtime, .. } => Ok(Self {
                 reader,
                 writer,
                 runtime,
@@ -89,19 +90,22 @@ impl Client {
         self.runtime
     }
 
-    /// Sends one request under a fresh [`OpId`] and waits for its reply.
+    /// Sends one request under a fresh [`OperationId`] and waits for its reply.
     ///
     /// # Errors
     ///
     /// See [`ClientError`].
     pub async fn request(&mut self, body: RequestBody) -> Result<ReplyBody, ClientError> {
-        let op = OpId::mint();
-        codec::write(&mut self.writer, &ClientFrame::Request { op, body }).await?;
+        let operation = OperationId::mint();
+        codec::write(&mut self.writer, &ClientFrame::Request { operation, body }).await?;
         match next(&mut self.reader).await? {
-            ServerFrame::Reply { op: answered, body } if answered == op => Ok(body),
+            ServerFrame::Reply {
+                operation: answered,
+                body,
+            } if answered == operation => Ok(body),
             ServerFrame::Refused { reason, .. } => Err(ClientError::Refused(reason)),
             other @ (ServerFrame::Reply { .. }
-            | ServerFrame::HandshakeAck { .. }
+            | ServerFrame::HandshakeAccepted { .. }
             | ServerFrame::HandshakeRejected { .. }) => {
                 Err(ClientError::Unexpected(Box::new(other)))
             }

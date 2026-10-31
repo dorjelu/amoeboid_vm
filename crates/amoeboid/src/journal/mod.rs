@@ -31,7 +31,7 @@ impl PersistenceId {
             !segment.is_empty()
                 && segment
                     .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
         });
         if valid {
             Ok(Self(id))
@@ -48,9 +48,9 @@ impl PersistenceId {
 
 /// Position in one stream, from 1.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct Seq(NonZeroU64);
+pub struct Sequence(NonZeroU64);
 
-impl Seq {
+impl Sequence {
     pub const FIRST: Self = Self(NonZeroU64::MIN);
 
     /// `None` past `u64::MAX`.
@@ -59,7 +59,7 @@ impl Seq {
         self.0.checked_add(1).map(Self)
     }
 
-    /// The position after `last`, or [`Seq::FIRST`] for an empty stream.
+    /// The position after `last`, or [`Sequence::FIRST`] for an empty stream.
     #[must_use]
     pub fn after(last: Option<Self>) -> Option<Self> {
         last.map_or(Some(Self::FIRST), Self::next)
@@ -91,7 +91,7 @@ impl EventPayload {
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct StoredEvent {
-    pub seq: Seq,
+    pub sequence: Sequence,
     pub payload: EventPayload,
 }
 
@@ -109,7 +109,7 @@ impl BatchId {
 }
 
 #[derive(Debug)]
-pub enum JournalMsg {
+pub enum JournalMessage {
     Replay {
         id: PersistenceId,
         reply_to: DerivedActorRef<JournalReply>,
@@ -118,7 +118,7 @@ pub enum JournalMsg {
     Persist {
         batch: BatchId,
         id: PersistenceId,
-        first: Seq,
+        first: Sequence,
         events: NonEmpty<EventPayload>,
         reply_to: DerivedActorRef<JournalReply>,
     },
@@ -136,7 +136,7 @@ pub enum JournalReply {
     },
     Persisted {
         batch: BatchId,
-        last: Seq,
+        last: Sequence,
     },
     PersistFailed {
         batch: BatchId,
@@ -180,13 +180,13 @@ pub struct JournalState {
 }
 
 impl Actor for Journal {
-    type Msg = JournalMsg;
+    type Msg = JournalMessage;
     type State = JournalState;
     type Arguments = JournalArgs;
 
     async fn pre_start(
         &self,
-        _myself: ActorRef<JournalMsg>,
+        _myself: ActorRef<JournalMessage>,
         args: JournalArgs,
     ) -> Result<JournalState, ActorProcessingErr> {
         let store = Store::open(args.persistence, &args.paths).await?;
@@ -195,20 +195,20 @@ impl Actor for Journal {
 
     async fn handle(
         &self,
-        _myself: ActorRef<JournalMsg>,
-        msg: JournalMsg,
+        _myself: ActorRef<JournalMessage>,
+        message: JournalMessage,
         state: &mut JournalState,
     ) -> Result<(), ActorProcessingErr> {
         // Store failures are answers, not journal failures: the requester decides.
-        let (reply, reply_to) = match msg {
-            JournalMsg::Replay { id, reply_to } => {
+        let (reply, reply_to) = match message {
+            JournalMessage::Replay { id, reply_to } => {
                 let reply = match state.store.replay(&id).await {
                     Ok(events) => JournalReply::Replayed { id, events },
                     Err(reason) => JournalReply::ReplayFailed { id, reason },
                 };
                 (reply, reply_to)
             }
-            JournalMsg::Persist {
+            JournalMessage::Persist {
                 batch,
                 id,
                 first,

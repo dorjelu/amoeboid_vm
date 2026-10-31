@@ -4,24 +4,24 @@ use serde_json::json;
 use super::codec::{self, FrameError, MAX_FRAME};
 use super::*;
 
-fn ops() -> impl Strategy<Value = OpId> {
+fn operations() -> impl Strategy<Value = OperationId> {
     any::<u128>().prop_map(|bits| {
         let id = uuid::Builder::from_random_bytes(bits.to_le_bytes()).into_uuid();
         // Re-stamp as v7: only the version and variant bits differ.
         let mut bytes = *id.as_bytes();
         bytes[6] = (bytes[6] & 0x0f) | 0x70;
         bytes[8] = (bytes[8] & 0x3f) | 0x80;
-        OpId::try_from(Uuid::from_bytes(bytes)).unwrap()
+        OperationId::try_from(Uuid::from_bytes(bytes)).unwrap()
     })
 }
 
 fn client_frames() -> impl Strategy<Value = ClientFrame> {
     prop_oneof![
-        any::<u32>().prop_map(|v| ClientFrame::HandshakeStart {
-            protocol: ProtocolVersion(v)
+        any::<u32>().prop_map(|version| ClientFrame::HandshakeStart {
+            protocol: ProtocolVersion(version)
         }),
-        ops().prop_map(|op| ClientFrame::Request {
-            op,
+        operations().prop_map(|operation| ClientFrame::Request {
+            operation,
             body: RequestBody::Runtime(RuntimeRequest::Ping)
         }),
     ]
@@ -35,20 +35,22 @@ fn server_frames() -> impl Strategy<Value = ServerFrame> {
         any::<u32>().prop_map(|max| Refusal::FrameTooLarge { max }),
     ];
     prop_oneof![
-        (any::<u32>(), ops()).prop_map(|(v, op)| ServerFrame::HandshakeAck {
-            protocol: ProtocolVersion(v),
-            runtime: RuntimeId(Uuid::from(op)),
+        (any::<u32>(), operations()).prop_map(|(version, operation)| {
+            ServerFrame::HandshakeAccepted {
+                protocol: ProtocolVersion(version),
+                runtime: RuntimeId(Uuid::from(operation)),
+            }
         }),
-        (any::<u32>(), any::<u32>()).prop_map(|(r, c)| ServerFrame::HandshakeRejected {
-            runtime: ProtocolVersion(r),
-            client: ProtocolVersion(c),
+        (any::<u32>(), any::<u32>()).prop_map(|(runtime, client)| ServerFrame::HandshakeRejected {
+            runtime: ProtocolVersion(runtime),
+            client: ProtocolVersion(client),
         }),
-        ops().prop_map(|op| ServerFrame::Reply {
-            op,
+        operations().prop_map(|operation| ServerFrame::Reply {
+            operation,
             body: ReplyBody::Runtime(RuntimeReply::Pong)
         }),
-        (proptest::option::of(ops()), refusals)
-            .prop_map(|(op, reason)| ServerFrame::Refused { op, reason }),
+        (proptest::option::of(operations()), refusals)
+            .prop_map(|(operation, reason)| ServerFrame::Refused { operation, reason }),
     ]
 }
 
@@ -84,20 +86,20 @@ proptest! {
         let bytes = codec::encode(&frame).unwrap();
         let cut = cut.min(bytes.len() - 1);
         let result = block_on(codec::read::<ClientFrame, _>(&mut &bytes[..cut]));
-        prop_assert!(matches!(result, Err(FrameError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof));
+        prop_assert!(matches!(result, Err(FrameError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof));
     }
 }
 
 #[test]
 fn a_request_has_the_documented_wire_shape() {
-    let op = OpId::mint();
+    let operation = OperationId::mint();
     let frame = ClientFrame::Request {
-        op,
+        operation,
         body: RequestBody::Runtime(RuntimeRequest::Ping),
     };
     assert_eq!(
         serde_json::to_value(&frame).unwrap(),
-        json!({"type": "request", "body": {"op": op.to_string(),
+        json!({"type": "request", "body": {"operation": operation.to_string(),
                "body": {"domain": "runtime", "request": "ping"}}})
     );
 }
@@ -113,7 +115,9 @@ fn an_oversized_length_is_refused_before_the_payload_is_read() {
     let mut bytes = (MAX_FRAME + 1).to_be_bytes().to_vec();
     bytes.extend_from_slice(b"{}");
     let result = block_on(codec::read::<ClientFrame, _>(&mut bytes.as_slice()));
-    assert!(matches!(result, Err(FrameError::TooLarge { len }) if len == u64::from(MAX_FRAME) + 1));
+    assert!(
+        matches!(result, Err(FrameError::TooLarge { length }) if length == u64::from(MAX_FRAME) + 1)
+    );
 }
 
 #[test]
@@ -142,7 +146,7 @@ fn an_unknown_field_is_refused() {
 #[test]
 fn an_op_id_that_is_not_v7_is_refused() {
     let v4 = "8c5b6f0e-2f5a-4b8e-9c3d-1a2b3c4d5e6f";
-    let result = decode::<ClientFrame>(&json!({"type": "request", "body": {"op": v4,
+    let result = decode::<ClientFrame>(&json!({"type": "request", "body": {"operation": v4,
         "body": {"domain": "runtime", "request": "ping"}}}));
     assert!(matches!(result, Err(FrameError::Decode(_))));
 }

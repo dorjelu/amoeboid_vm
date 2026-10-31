@@ -24,7 +24,7 @@ impl std::fmt::Display for ProtocolVersion {
 /// Client-minted operation id, `UUIDv7`; the idempotency key of a request.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 #[serde(try_from = "Uuid", into = "Uuid")]
-pub struct OpId(Uuid);
+pub struct OperationId(Uuid);
 
 /// Runtime instance id, `UUIDv7`, minted once per runtime start.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
@@ -66,7 +66,7 @@ macro_rules! uuid_v7 {
         }
     };
 }
-uuid_v7!(OpId);
+uuid_v7!(OperationId);
 uuid_v7!(RuntimeId);
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -78,11 +78,9 @@ uuid_v7!(RuntimeId);
 )]
 pub enum ClientFrame {
     /// First frame on every connection; anything else first is `Refused { HandshakeRequired }`.
-    HandshakeStart {
-        protocol: ProtocolVersion,
-    },
+    HandshakeStart { protocol: ProtocolVersion },
     Request {
-        op: OpId,
+        operation: OperationId,
         body: RequestBody,
     },
 }
@@ -95,12 +93,12 @@ pub enum ClientFrame {
     deny_unknown_fields
 )]
 pub enum ServerFrame {
-    HandshakeAck {
+    HandshakeAccepted {
         protocol: ProtocolVersion,
         runtime: RuntimeId,
     },
     Reply {
-        op: OpId,
+        operation: OperationId,
         body: ReplyBody,
     },
     /// Answer to a `HandshakeStart` with another protocol version; ends the connection.
@@ -111,7 +109,7 @@ pub enum ServerFrame {
     },
     /// Ends the connection.
     Refused {
-        op: Option<OpId>,
+        operation: Option<OperationId>,
         reason: Refusal,
     },
 }

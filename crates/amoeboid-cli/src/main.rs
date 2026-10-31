@@ -47,7 +47,7 @@ impl CliError {
     fn hint(&self) -> Option<&'static str> {
         match self {
             Self::Paths(_) => None,
-            Self::Client(e) => e.hint(),
+            Self::Client(error) => error.hint(),
         }
     }
 }

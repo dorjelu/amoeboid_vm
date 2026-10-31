@@ -8,14 +8,14 @@ use super::listener::{Listener, ListenerArgs};
 use super::paths::RuntimePaths;
 use crate::journal::{Journal, JournalArgs, Persistence};
 use crate::protocol::{
-    OpId, ReplyBody, RequestBody, RuntimeId, RuntimeReply, RuntimeRequest, ServerFrame,
+    OperationId, ReplyBody, RequestBody, RuntimeId, RuntimeReply, RuntimeRequest, ServerFrame,
 };
 
 #[derive(Debug)]
-pub enum RootMsg {
+pub enum RootMessage {
     /// A request from a session past its handshake; the reply goes to `reply_to`.
     Request {
-        op: OpId,
+        operation: OperationId,
         body: RequestBody,
         reply_to: DerivedActorRef<ServerFrame>,
     },
@@ -42,13 +42,13 @@ struct EssentialEnded {
 }
 
 impl Actor for Root {
-    type Msg = RootMsg;
+    type Msg = RootMessage;
     type State = RootState;
     type Arguments = RootArgs;
 
     async fn pre_start(
         &self,
-        myself: ActorRef<RootMsg>,
+        myself: ActorRef<RootMessage>,
         args: RootArgs,
     ) -> Result<RootState, ActorProcessingErr> {
         Actor::spawn_linked(
@@ -77,22 +77,26 @@ impl Actor for Root {
 
     fn handle(
         &self,
-        _myself: ActorRef<RootMsg>,
-        msg: RootMsg,
+        _myself: ActorRef<RootMessage>,
+        message: RootMessage,
         _state: &mut RootState,
     ) -> impl Future<Output = Result<(), ActorProcessingErr>> + Send {
-        match msg {
-            RootMsg::Request { op, body, reply_to } => {
+        match message {
+            RootMessage::Request {
+                operation,
+                body,
+                reply_to,
+            } => {
                 let body = match body {
                     RequestBody::Runtime(RuntimeRequest::Ping) => {
                         ReplyBody::Runtime(RuntimeReply::Pong)
                     }
                 };
                 if reply_to
-                    .send_message(ServerFrame::Reply { op, body })
+                    .send_message(ServerFrame::Reply { operation, body })
                     .is_err()
                 {
-                    tracing::debug!(%op, "reply undeliverable: session ended");
+                    tracing::debug!(%operation, "reply undeliverable: session ended");
                 }
             }
         }
@@ -101,7 +105,7 @@ impl Actor for Root {
 
     fn handle_supervisor_evt(
         &self,
-        _myself: ActorRef<RootMsg>,
+        _myself: ActorRef<RootMessage>,
         event: SupervisionEvent,
         state: &mut RootState,
     ) -> impl Future<Output = Result<(), ActorProcessingErr>> + Send {
