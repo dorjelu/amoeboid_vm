@@ -289,12 +289,22 @@ impl LocalQemuState {
                 self.stopped(generation, reason);
             }
             (ProcessRole::Local(LocalRole::Virtiofsd(_)), Machine::Running) => {
-                let reason = Report::of(&LocalQemuError::ShareExited {
-                    role: role.name(),
-                    exit,
+                // Exits are observed in no particular order: virtiofsd also exits when qemu,
+                // its only client, goes away. Only a share that dies under a living qemu is
+                // the cause.
+                let qemu_alive = self.processes.get(&qemu).is_some_and(|identity| {
+                    matches!(process::liveness(identity), Ok(process::Liveness::Alive))
                 });
+                let reason = if qemu_alive {
+                    LocalQemuError::ShareExited {
+                        role: role.name(),
+                        exit,
+                    }
+                } else {
+                    LocalQemuError::QemuExited(Exit::Unknown)
+                };
                 self.machine = Machine::Stopping {
-                    reason: Some(reason),
+                    reason: Some(Report::of(&reason)),
                 };
                 self.terminate(&qemu);
             }
@@ -635,6 +645,42 @@ mod tests {
         assert_eq!(
             reason.map(|reason| reason.code),
             Some("hypervisor.share_exited".into())
+        );
+        kill_all(&started);
+    }
+
+    #[tokio::test]
+    async fn qemu_going_first_is_blamed_even_when_a_share_exit_is_seen_first() {
+        let mut fixture = fixture(FAKE_VIRTIOFSD).await;
+        let hypervisor = spawn(&fixture).await;
+        hypervisor
+            .send_message(HypervisorCommand::Boot {
+                generation: Generation::FIRST,
+                plan: plan(&fixture, Incarnation::mint()),
+            })
+            .unwrap();
+        let started = until_running(&mut fixture.observations).await;
+        // Kill qemu and a share at once, as when qemu stops and its shares follow.
+        process::signal(&started[&ProcessRole::Local(LocalRole::Qemu)], Signal::Kill).unwrap();
+        process::signal(
+            &started[&virtiofsd(SharedDirectory::Requested(0))],
+            Signal::Kill,
+        )
+        .unwrap();
+        let reason = loop {
+            match next(&mut fixture.observations).await {
+                HypervisorObservation::ProcessExited { .. } => {}
+                HypervisorObservation::MachineStopped { reason, .. } => break reason,
+                other @ (HypervisorObservation::ProcessStarted { .. }
+                | HypervisorObservation::MachineRunning { .. }
+                | HypervisorObservation::BootFailed { .. }
+                | HypervisorObservation::Adopted { .. }
+                | HypervisorObservation::Lost { .. }) => unexpected(&format!("{other:?}")),
+            }
+        };
+        assert_eq!(
+            reason.map(|reason| reason.code),
+            Some("hypervisor.qemu_exited".into())
         );
         kill_all(&started);
     }
