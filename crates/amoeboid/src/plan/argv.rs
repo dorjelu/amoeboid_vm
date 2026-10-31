@@ -24,6 +24,12 @@ impl Argv {
         self.0.iter().map(OsString::as_os_str)
     }
 
+    /// Any command, for tests that need a real process.
+    #[cfg(test)]
+    pub(crate) fn for_tests(words: &[&str]) -> Self {
+        Self(words.iter().map(OsString::from).collect())
+    }
+
     /// A line to paste into a POSIX shell, quoted like Python's `shlex.join`. Non-UTF-8 bytes
     /// are replaced, so this is for display, never for running.
     #[must_use]

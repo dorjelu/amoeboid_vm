@@ -1,0 +1,518 @@
+//! Processes: spawn (each in its own scope), identify, check liveness, signal and watch by
+//! verified identity. A process is only signalled through a pidfd opened and then checked
+//! against the identity, so a reused process id is never hit.
+
+#![allow(clippy::disallowed_types, reason = "boundary: reads /proc by raw path")]
+
+use std::fs::File;
+use std::num::NonZeroU32;
+use std::os::fd::OwnedFd;
+use std::os::unix::process::ExitStatusExt as _;
+use std::path::PathBuf;
+use std::process::Stdio;
+
+use rustix::fs::{Mode, OFlags};
+use rustix::process::{Pid, PidfdFlags, Signal as KernelSignal};
+
+use crate::domain::path::AbsolutePath;
+use crate::domain::process::{BootId, Nonce, ProcessId, ProcessIdentity, SLICE, ScopeName};
+use crate::plan::argv::Argv;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ProcessError {
+    #[error("can't read the boot id: {0}")]
+    BootId(std::io::Error),
+    #[error("can't read /proc/{process}/{file}: {source}")]
+    Read {
+        process: ProcessId,
+        file: &'static str,
+        source: std::io::Error,
+    },
+    #[error("can't make sense of /proc/{process}/{file}")]
+    Parse {
+        process: ProcessId,
+        file: &'static str,
+    },
+    #[error("can't start {program}: {source}")]
+    Spawn {
+        program: String,
+        source: std::io::Error,
+    },
+    #[error("can't open the log {path}: {source}")]
+    Output {
+        path: String,
+        source: std::io::Error,
+    },
+    #[error("can't signal process {process}: {source}")]
+    Signal {
+        process: ProcessId,
+        source: std::io::Error,
+    },
+    #[error("can't list processes: {0}")]
+    List(std::io::Error),
+}
+
+/// Where a spawned process lives.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Containment {
+    /// Its own transient user scope under `amoeboid.slice`: outlives the runtime.
+    Scope(ScopeName),
+    /// A plain child of the runtime; tests only.
+    Direct,
+}
+
+/// Where a spawned process's stdout and stderr go.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Output {
+    Discard,
+    /// Appended to this file, created `0600`.
+    Append(AbsolutePath),
+}
+
+pub struct SpawnRequest {
+    pub argv: Argv,
+    pub containment: Containment,
+    pub nonce: Nonce,
+    pub directory: AbsolutePath,
+    pub output: Output,
+}
+
+/// A process this runtime started; `child` reaps it and reports its exit status.
+pub struct Spawned {
+    pub identity: ProcessIdentity,
+    pub child: tokio::process::Child,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Liveness {
+    Alive,
+    /// Exited, or its id now belongs to another process, or the host rebooted.
+    Gone,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Signal {
+    Terminate,
+    Kill,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Signalled {
+    Sent,
+    /// The identified process no longer exists; nothing was signalled.
+    Gone,
+}
+
+/// A process being watched for its exit.
+pub enum Watched {
+    /// Started by this runtime: waiting reaps it and yields its status.
+    Child(tokio::process::Child),
+    /// Adopted after a runtime restart: not our child, so only "it exited" is knowable.
+    Adopted(OwnedFd),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Exit {
+    Code(i32),
+    Signal(i32),
+    /// An adopted process exited; its status went to its real parent.
+    Unknown,
+}
+
+/// # Errors
+///
+/// `BootId`.
+pub fn boot_id() -> Result<BootId, ProcessError> {
+    let text =
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id").map_err(ProcessError::BootId)?;
+    BootId::parse(text.trim_end().to_owned())
+        .map_err(|error| ProcessError::BootId(std::io::Error::other(error)))
+}
+
+/// The identity of `process` now; `None` when no such process exists.
+///
+/// # Errors
+///
+/// `/proc` is unreadable or malformed.
+pub fn identify(process: ProcessId) -> Result<Option<ProcessIdentity>, ProcessError> {
+    let stat = match std::fs::read_to_string(format!("/proc/{process}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(ProcessError::Read {
+                process,
+                file: "stat",
+                source,
+            });
+        }
+    };
+    let start_time = start_time(&stat).ok_or(ProcessError::Parse {
+        process,
+        file: "stat",
+    })?;
+    Ok(Some(ProcessIdentity {
+        process,
+        start_time,
+        boot: boot_id()?,
+    }))
+}
+
+/// Field 22 of `/proc/PID/stat`. The command name (field 2) may hold spaces and `)`, so fields
+/// are counted after its last `)`: field 3 is the first there, so field 22 is the 20th.
+fn start_time(stat: &str) -> Option<u64> {
+    let (_, after_name) = stat.rsplit_once(')')?;
+    after_name.split_ascii_whitespace().nth(19)?.parse().ok()
+}
+
+/// # Errors
+///
+/// `/proc` is unreadable or malformed.
+pub fn liveness(identity: &ProcessIdentity) -> Result<Liveness, ProcessError> {
+    Ok(match identify(identity.process)? {
+        Some(now) if now == *identity => Liveness::Alive,
+        Some(_) | None => Liveness::Gone,
+    })
+}
+
+/// A pidfd for exactly `identity`, or `None` when that process is gone. Opened first and checked
+/// after: the pidfd pins whichever process had the id, and the start time says if it is ours.
+fn pidfd(identity: &ProcessIdentity) -> Result<Option<OwnedFd>, ProcessError> {
+    let Some(pid) = i32::try_from(identity.process.get())
+        .ok()
+        .and_then(Pid::from_raw)
+    else {
+        return Ok(None);
+    };
+    let descriptor = match rustix::process::pidfd_open(pid, PidfdFlags::NONBLOCK) {
+        Ok(descriptor) => descriptor,
+        Err(rustix::io::Errno::SRCH) => return Ok(None),
+        Err(error) => {
+            return Err(ProcessError::Signal {
+                process: identity.process,
+                source: error.into(),
+            });
+        }
+    };
+    Ok(match liveness(identity)? {
+        Liveness::Alive => Some(descriptor),
+        Liveness::Gone => None,
+    })
+}
+
+/// # Errors
+///
+/// `/proc` is unreadable, or the kernel refused the signal.
+pub fn signal(identity: &ProcessIdentity, signal: Signal) -> Result<Signalled, ProcessError> {
+    let Some(descriptor) = pidfd(identity)? else {
+        return Ok(Signalled::Gone);
+    };
+    let kernel = match signal {
+        Signal::Terminate => KernelSignal::TERM,
+        Signal::Kill => KernelSignal::KILL,
+    };
+    match rustix::process::pidfd_send_signal(&descriptor, kernel) {
+        Ok(()) => Ok(Signalled::Sent),
+        Err(rustix::io::Errno::SRCH) => Ok(Signalled::Gone),
+        Err(error) => Err(ProcessError::Signal {
+            process: identity.process,
+            source: error.into(),
+        }),
+    }
+}
+
+/// Watches a process this runtime did not start (or no longer holds the child of).
+///
+/// # Errors
+///
+/// `/proc` is unreadable.
+pub fn adopt(identity: &ProcessIdentity) -> Result<Option<Watched>, ProcessError> {
+    Ok(pidfd(identity)?.map(Watched::Adopted))
+}
+
+/// Resolves when the process exits.
+pub async fn exited(watched: Watched) -> Exit {
+    match watched {
+        Watched::Child(mut child) => match child.wait().await {
+            Ok(status) => status
+                .code()
+                .map(Exit::Code)
+                .or_else(|| status.signal().map(Exit::Signal))
+                .unwrap_or(Exit::Unknown),
+            Err(_) => Exit::Unknown,
+        },
+        Watched::Adopted(descriptor) => {
+            // A pidfd turns readable when its process exits. Registering it with the reactor
+            // needs `unsafe`, so it is polled on a blocking thread instead.
+            let _ = tokio::task::spawn_blocking(move || {
+                let mut watch = [rustix::event::PollFd::new(
+                    &descriptor,
+                    rustix::event::PollFlags::IN,
+                )];
+                loop {
+                    match rustix::event::poll(&mut watch, None) {
+                        Err(rustix::io::Errno::INTR) => {}
+                        Ok(_) | Err(_) => return,
+                    }
+                }
+            })
+            .await;
+            Exit::Unknown
+        }
+    }
+}
+
+/// Starts `request.argv` with the nonce in its environment, stdin closed, in its own process
+/// group, inside its containment.
+///
+/// # Errors
+///
+/// `Output`, `Spawn`, or reading its identity.
+pub fn spawn(request: &SpawnRequest) -> Result<Spawned, ProcessError> {
+    let mut words = request.argv.words();
+    let program = words
+        .next()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let mut command = match &request.containment {
+        Containment::Scope(scope) => {
+            let mut command = tokio::process::Command::new("systemd-run");
+            command
+                .args(["--user", "--scope", "--quiet", "--collect"])
+                .arg(format!("--slice={SLICE}"))
+                .arg(format!("--unit={}", scope.as_str()))
+                .arg("--")
+                .arg(&program)
+                .args(words);
+            command
+        }
+        Containment::Direct => {
+            let mut command = tokio::process::Command::new(&program);
+            command.args(words);
+            command
+        }
+    };
+    command
+        .env(Nonce::VARIABLE, request.nonce.value())
+        .current_dir(request.directory.as_path())
+        .stdin(Stdio::null())
+        .process_group(0)
+        .kill_on_drop(false);
+    match &request.output {
+        Output::Discard => {
+            command.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+        Output::Append(path) => {
+            let output = |error: std::io::Error| ProcessError::Output {
+                path: path.display().to_string(),
+                source: error,
+            };
+            let file = File::from(
+                rustix::fs::open(
+                    path.as_path(),
+                    OFlags::WRONLY
+                        | OFlags::APPEND
+                        | OFlags::CREATE
+                        | OFlags::NOFOLLOW
+                        | OFlags::CLOEXEC,
+                    Mode::from_raw_mode(0o600),
+                )
+                .map_err(|error| output(error.into()))?,
+            );
+            let error_file = file.try_clone().map_err(output)?;
+            command.stdout(file).stderr(error_file);
+        }
+    }
+    let child = command.spawn().map_err(|source| ProcessError::Spawn {
+        program: program.clone(),
+        source,
+    })?;
+    let process = child
+        .id()
+        .and_then(NonZeroU32::new)
+        .map(ProcessId::new)
+        .ok_or_else(|| ProcessError::Spawn {
+            program: program.clone(),
+            source: std::io::Error::other("exited before it could be identified"),
+        })?;
+    // The start time survives exec, so this identifies the process whatever it execs into.
+    let identity = identify(process)?.ok_or(ProcessError::Spawn {
+        program,
+        source: std::io::Error::other("exited before it could be identified"),
+    })?;
+    Ok(Spawned { identity, child })
+}
+
+/// The process carrying `nonce` in its environment, among those this user may inspect.
+///
+/// # Errors
+///
+/// `/proc` can't be listed.
+pub fn find_by_nonce(nonce: &Nonce) -> Result<Option<ProcessIdentity>, ProcessError> {
+    let wanted = nonce.environment_entry();
+    for entry in std::fs::read_dir("/proc").map_err(ProcessError::List)? {
+        let Some(process) = entry
+            .ok()
+            .and_then(|entry| entry.file_name().to_str()?.parse::<NonZeroU32>().ok())
+            .map(ProcessId::new)
+        else {
+            continue;
+        };
+        // Other users' environments are unreadable; that is fine, ours are not.
+        let Ok(environment) = std::fs::read(PathBuf::from(format!("/proc/{process}/environ")))
+        else {
+            continue;
+        };
+        if environment
+            .split(|byte| *byte == 0)
+            .any(|entry| entry == wanted.as_bytes())
+        {
+            return identify(process);
+        }
+    }
+    Ok(None)
+}
+
+impl crate::diagnostic::Diagnostic for ProcessError {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::BootId(_) => "process.boot_id",
+            Self::Read { .. } => "process.read",
+            Self::Parse { .. } => "process.parse",
+            Self::Spawn { .. } => "process.spawn",
+            Self::Output { .. } => "process.output",
+            Self::Signal { .. } => "process.signal",
+            Self::List(_) => "process.list",
+        }
+    }
+    fn hint(&self) -> Option<String> {
+        match self {
+            Self::Spawn { program, .. } if program == "systemd-run" => {
+                Some("VMs run in user scopes: run inside a systemd user session".into())
+            }
+            Self::BootId(_)
+            | Self::Read { .. }
+            | Self::Parse { .. }
+            | Self::Spawn { .. }
+            | Self::Output { .. }
+            | Self::Signal { .. }
+            | Self::List(_) => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    /// Holds the fork guard only while forking.
+    fn sleeper(nonce: &Nonce, containment: Containment) -> Spawned {
+        let _forks = crate::testing::forks();
+        spawn(&SpawnRequest {
+            argv: Argv::for_tests(&["sleep", "30"]),
+            containment,
+            nonce: nonce.clone(),
+            directory: AbsolutePath::parse("/".into()).unwrap(),
+            output: Output::Discard,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn start_time_is_read_past_a_command_name_with_spaces_and_parens() {
+        let stat = "42 (a) b (c) S 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 777 23 24";
+        assert_eq!(start_time(stat), Some(777));
+    }
+
+    #[tokio::test]
+    async fn a_spawned_process_is_alive_until_killed_then_its_exit_is_seen() {
+        let spawned = sleeper(&Nonce::mint(), Containment::Direct);
+        let identity = spawned.identity.clone();
+        assert_eq!(liveness(&identity).unwrap(), Liveness::Alive);
+        assert_eq!(signal(&identity, Signal::Kill).unwrap(), Signalled::Sent);
+        let exit = tokio::time::timeout(
+            Duration::from_secs(5),
+            exited(Watched::Child(spawned.child)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(exit, Exit::Signal(9));
+        assert_eq!(liveness(&identity).unwrap(), Liveness::Gone);
+    }
+
+    #[tokio::test]
+    async fn a_mismatched_identity_is_never_signalled() {
+        let spawned = sleeper(&Nonce::mint(), Containment::Direct);
+        let impostor = ProcessIdentity {
+            start_time: spawned.identity.start_time + 1,
+            ..spawned.identity.clone()
+        };
+        assert_eq!(signal(&impostor, Signal::Kill).unwrap(), Signalled::Gone);
+        assert_eq!(liveness(&spawned.identity).unwrap(), Liveness::Alive);
+        signal(&spawned.identity, Signal::Kill).unwrap();
+        exited(Watched::Child(spawned.child)).await;
+    }
+
+    #[tokio::test]
+    async fn an_adopted_process_is_watched_through_its_pidfd() {
+        let spawned = sleeper(&Nonce::mint(), Containment::Direct);
+        let watched = adopt(&spawned.identity).unwrap().unwrap();
+        signal(&spawned.identity, Signal::Terminate).unwrap();
+        let exit = tokio::time::timeout(Duration::from_secs(5), exited(watched))
+            .await
+            .unwrap();
+        assert_eq!(exit, Exit::Unknown);
+        exited(Watched::Child(spawned.child)).await;
+    }
+
+    #[tokio::test]
+    async fn a_process_is_found_by_its_nonce() {
+        let nonce = Nonce::mint();
+        let spawned = sleeper(&nonce, Containment::Direct);
+        assert_eq!(
+            find_by_nonce(&nonce).unwrap(),
+            Some(spawned.identity.clone())
+        );
+        assert_eq!(find_by_nonce(&Nonce::mint()).unwrap(), None);
+        signal(&spawned.identity, Signal::Kill).unwrap();
+        exited(Watched::Child(spawned.child)).await;
+    }
+
+    /// Needs a systemd user session; runs only with `AMOEBOID_TEST_SYSTEMD=1`.
+    #[tokio::test]
+    async fn a_scoped_process_runs_in_its_scope_and_a_duplicate_scope_fails() {
+        if std::env::var_os("AMOEBOID_TEST_SYSTEMD").is_none() {
+            return;
+        }
+        let vm =
+            crate::domain::vm_name::VmName::parse(format!("test{}", std::process::id())).unwrap();
+        let scope = ScopeName::of(&vm, &crate::domain::process::Role::Qemu);
+        let nonce = Nonce::mint();
+        let first = sleeper(&nonce, Containment::Scope(scope.clone()));
+        // systemd-run execs the command once the scope exists; wait for that.
+        let mut found = None;
+        for _ in 0..50 {
+            found = find_by_nonce(&nonce).unwrap();
+            let cgroup =
+                std::fs::read_to_string(format!("/proc/{}/cgroup", first.identity.process))
+                    .unwrap_or_default();
+            if cgroup.contains(&format!("{}.scope", scope.as_str())) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(found, Some(first.identity.clone()));
+        let second = sleeper(&Nonce::mint(), Containment::Scope(scope));
+        let exit = tokio::time::timeout(
+            Duration::from_secs(10),
+            exited(Watched::Child(second.child)),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(exit, Exit::Code(code) if code != 0));
+        signal(&first.identity, Signal::Kill).unwrap();
+        exited(Watched::Child(first.child)).await;
+    }
+}
