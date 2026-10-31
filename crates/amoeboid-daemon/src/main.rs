@@ -4,7 +4,9 @@ use std::process::ExitCode;
 
 use amoeboid::journal::Persistence;
 use amoeboid::runtime::paths::RuntimePaths;
+use amoeboid::runtime::root::VmDefaults;
 use amoeboid::runtime::{ActivatedSocket, Hosting, Runtime, RuntimeConfig};
+use amoeboid::vm::Account;
 use tokio::signal::unix::{SignalKind, signal};
 
 #[tokio::main]
@@ -33,11 +35,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let listener = ActivatedSocket::from_env()?.ok_or(
         "not socket-activated: start amoeboid.socket, or run under systemd-socket-activate",
     )?;
+    let account = Account::of_this_process(std::env::var_os)?;
     let runtime = Runtime::start(RuntimeConfig {
         paths,
         hosting: Hosting::SystemdUser { listener },
         persistence: Persistence::Sqlite,
         version: env!("CARGO_PKG_VERSION").to_owned(),
+        account,
+        vm_defaults: VmDefaults::production(),
     })
     .await?;
     let stopper = runtime.stopper();

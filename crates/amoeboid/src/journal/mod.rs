@@ -14,24 +14,25 @@ use crate::nonempty::NonEmpty;
 use crate::runtime::paths::RuntimePaths;
 use store::Store;
 
-/// `vm/work`, `vm/work/7/share/d0`: `/`-joined, non-empty segments of `[a-z0-9-]`.
+/// `vm/work`, `runtime`: `/`-joined, non-empty segments of `[A-Za-z0-9-]` (VM names are
+/// case-sensitive, so their streams are too).
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct PersistenceId(String);
 
 #[derive(Debug, thiserror::Error)]
-#[error("{0:?} is not a persistence id: `/`-joined segments of [a-z0-9-]")]
+#[error("{0:?} is not a persistence id: `/`-joined segments of [A-Za-z0-9-]")]
 pub struct BadPersistenceId(String);
 
 impl PersistenceId {
     /// # Errors
     ///
-    /// Empty, an empty segment, or a character outside `[a-z0-9-/]`.
+    /// Empty, an empty segment, or a character outside `[A-Za-z0-9-/]`.
     pub fn parse(id: String) -> Result<Self, BadPersistenceId> {
         let valid = id.split('/').all(|segment| {
             !segment.is_empty()
                 && segment
                     .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
         });
         if valid {
             Ok(Self(id))

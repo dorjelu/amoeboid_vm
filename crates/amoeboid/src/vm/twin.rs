@@ -238,6 +238,13 @@ pub enum VmReport {
     },
 }
 
+/// A report and the VM it is about; `send` adds the name.
+#[derive(Debug)]
+pub struct FromVm {
+    pub vm: crate::domain::vm_name::VmName,
+    pub report: VmReport,
+}
+
 /// A started VM, as the twin knows it; Root adds the paths to make the reply.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct VmStarted {
@@ -248,7 +255,7 @@ pub struct VmStarted {
 /// What Root gives the twin; its `start` hook spawns the children from it.
 pub struct VmSetup {
     pub vm: VmPaths,
-    pub root: DerivedActorRef<VmReport>,
+    pub root: DerivedActorRef<FromVm>,
     pub build: BuildCommand,
     pub placement: Placement,
 }
@@ -260,7 +267,7 @@ pub struct VmPeers {
     pub guest_vm: DerivedActorRef<GuestVmCommand>,
     /// Whichever backend runs this VM: anything that accepts `HypervisorCommand`.
     pub hypervisor: DerivedActorRef<HypervisorCommand>,
-    pub root: DerivedActorRef<VmReport>,
+    pub root: DerivedActorRef<FromVm>,
 }
 
 /// Why a twin refuses or fails something; becomes the `Report` in an `OperationDone`.
@@ -551,7 +558,13 @@ impl Behaviour for VmTwin {
                     processes,
                 })
                 .is_ok(),
-            VmOut::Root(report) => peers.root.send_message(report).is_ok(),
+            VmOut::Root(report) => peers
+                .root
+                .send_message(FromVm {
+                    vm: peers.vm.name().clone(),
+                    report,
+                })
+                .is_ok(),
         };
         if !sent {
             tracing::warn!(vm = %peers.vm.name(), "a message from the twin was undeliverable");

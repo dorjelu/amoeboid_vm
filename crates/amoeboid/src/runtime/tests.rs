@@ -34,6 +34,13 @@ async fn start(paths: &RuntimePaths) -> Result<Runtime, StartError> {
         hosting: Hosting::InProcess,
         persistence: Persistence::Memory,
         version: "test".into(),
+        account: crate::vm::Account {
+            user: crate::domain::account::UserName::parse("alice".into()).unwrap(),
+            user_id: crate::domain::account::UserId::new(1000),
+            group_id: crate::domain::account::GroupId::new(100),
+            home: crate::domain::account::GuestHome::parse("/home/alice".into()).unwrap(),
+        },
+        vm_defaults: root::VmDefaults::production(),
     })
     .await
 }

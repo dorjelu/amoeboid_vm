@@ -59,6 +59,9 @@ pub struct RuntimeConfig {
     pub persistence: Persistence,
     /// Recorded in `daemon.lock` for diagnostics.
     pub version: String,
+    /// The guest account of every VM: the user the runtime runs as.
+    pub account: crate::vm::Account,
+    pub vm_defaults: root::VmDefaults,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -122,6 +125,8 @@ impl Runtime {
             hosting,
             persistence,
             version,
+            account,
+            vm_defaults,
         } = config;
         for directory in [paths.data(), paths.run()] {
             std::fs::DirBuilder::new()
@@ -155,6 +160,8 @@ impl Runtime {
                 persistence,
                 paths,
                 listener,
+                account,
+                vm_defaults,
             },
         )
         .await

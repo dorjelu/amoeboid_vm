@@ -35,6 +35,58 @@ pub struct Account {
     pub home: GuestHome,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum AccountSourceError {
+    #[error("environment variable {0} is not set")]
+    Missing(&'static str),
+    #[error(transparent)]
+    Invalid(#[from] crate::domain::account::AccountError),
+}
+
+impl Account {
+    /// The user this process runs as: `USER`, `HOME`, and the process's own ids. Read once, at
+    /// the boundary (the daemon's start).
+    ///
+    /// # Errors
+    ///
+    /// A variable is missing or not valid for a guest account.
+    #[allow(
+        clippy::disallowed_types,
+        reason = "boundary: reads the process environment"
+    )]
+    pub fn of_this_process(
+        environment: impl Fn(&'static str) -> Option<std::ffi::OsString>,
+    ) -> Result<Self, AccountSourceError> {
+        let text = |name: &'static str| {
+            environment(name)
+                .and_then(|value| value.into_string().ok())
+                .filter(|value| !value.is_empty())
+                .ok_or(AccountSourceError::Missing(name))
+        };
+        Ok(Self {
+            user: UserName::parse(text("USER")?)?,
+            user_id: UserId::new(rustix::process::getuid().as_raw()),
+            group_id: GroupId::new(rustix::process::getgid().as_raw()),
+            home: GuestHome::parse(text("HOME")?)?,
+        })
+    }
+}
+
+impl crate::diagnostic::Diagnostic for AccountSourceError {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::Missing(_) => "account.missing_environment",
+            Self::Invalid(inner) => inner.code(),
+        }
+    }
+    fn hint(&self) -> Option<String> {
+        match self {
+            Self::Missing(_) => Some("run the runtime in a login session".into()),
+            Self::Invalid(inner) => inner.hint(),
+        }
+    }
+}
+
 /// Where the VM's NixOS configuration comes from on this start.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum NixConfig {

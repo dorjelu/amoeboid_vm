@@ -79,7 +79,7 @@ mod tests {
             Box::new(Refusal::HandshakeRepeated),
             Box::new(Refusal::MalformedFrame),
             Box::new(Refusal::FrameTooLarge { max: 1 }),
-            Box::new(PersistenceId::parse("X".into()).unwrap_err()),
+            Box::new(PersistenceId::parse("x y".into()).unwrap_err()),
             Box::new(PersistFailure::Conflict { first: 1, next: 2 }),
             Box::new(PersistFailure::Store(
                 crate::journal::tests_support::store_error("x"),
@@ -161,6 +161,7 @@ mod tests {
                 vec![],
             ))),
             Box::new(HostPublicKeyError),
+            Box::new(crate::vm::AccountSourceError::Missing("USER")),
         ]
     }
 
@@ -216,6 +217,25 @@ mod tests {
             )),
             Box::new(crate::adapters::ssh::SshError::Port(io())),
             Box::new(crate::vm::builder::BuilderError::MissingFlake { path: "/p".into() }),
+            Box::new(crate::vm::twin::TwinError::AlreadyStarting),
+            Box::new(crate::vm::twin::TwinError::AlreadyRunning),
+            Box::new(crate::vm::twin::TwinError::Leftovers),
+            Box::new(crate::vm::twin::TwinError::SshTimedOut(1)),
+            Box::new(crate::vm::twin::TwinError::StoppedWhileStarting),
+            Box::new(crate::vm::twin::TwinError::RestartedWhileStarting),
+            Box::new(crate::vm::twin::TwinError::ChildEnded("x".into())),
+            Box::new(crate::vm::twin::TwinError::GenerationsExhausted),
+            Box::new(crate::vm::local_qemu::LocalQemuError::SocketsMissing(
+                "d1.sock".into(),
+            )),
+            Box::new(crate::vm::local_qemu::LocalQemuError::QemuExited(
+                crate::adapters::process::Exit::Code(1),
+            )),
+            Box::new(crate::vm::local_qemu::LocalQemuError::ShareExited {
+                role: "virtiofsd-d1".into(),
+                exit: crate::adapters::process::Exit::Code(1),
+            }),
+            Box::new(crate::vm::local_qemu::LocalQemuError::Lost("qemu".into())),
             Box::new(crate::adapters::nix::NixError::Failed {
                 exit: crate::adapters::process::Exit::Code(1),
                 tail: "x".into(),

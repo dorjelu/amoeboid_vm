@@ -181,9 +181,9 @@ async fn a_symlink_at_the_journal_path_is_refused() {
 }
 
 #[test]
-fn persistence_ids_are_slash_joined_lowercase_segments() {
+fn persistence_ids_are_slash_joined_alphanumeric_segments() {
     assert!(PersistenceId::parse("vm/work/7/share/d0".into()).is_ok());
-    for bad in ["", "vm//a", "/vm", "vm/", "VM/a", "vm/a b", "vm/ä"] {
+    for bad in ["", "vm//a", "/vm", "vm/", "vm/a.b", "vm/a b", "vm/ä"] {
         assert!(
             PersistenceId::parse(bad.into()).is_err(),
             "{bad:?} accepted"
