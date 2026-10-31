@@ -6,6 +6,7 @@ pub mod domain;
 pub mod journal;
 pub mod nonempty;
 pub mod persistent;
+pub mod plan;
 pub mod protocol;
 pub mod runtime;
 #[cfg(test)]
