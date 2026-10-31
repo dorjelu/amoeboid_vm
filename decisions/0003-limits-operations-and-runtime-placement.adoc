@@ -46,9 +46,11 @@ Status is collected tell-only: Root asks every twin and gathers answers for 5 s.
 
 0002's quarantine is implemented as follows:
 
-* A twin that becomes `Unrecoverable` reports `VmReport::Unrecoverable { reason }` to Root.
-* Root is not a persistent actor. It appends `Quarantined { reason }` to `quarantine/<name>` at sequence 1 through a plain `JournalMessage::Persist`, and the journal's answer reaches it as `RootMessage::Journal`. A conflict at sequence 1 means the VM is already quarantined and is not an error.
-* At start Root lists `quarantine/*` as well as `vm/*` and spawns no twin for a quarantined name.
+* A twin that becomes `Unrecoverable` reports `VmReport::Unrecoverable { reason }` to Root. Root marks the VM quarantined in memory at once; the twin stays alive refusing commands, and Root routes nothing to it from then on.
+* Root is not a persistent actor. It replays `quarantine/<name>` first: a live event means the VM is already recorded. Otherwise it appends `Quarantined { reason }` after the stream's last position (position 1 unless an earlier record was retired by `vacuum_vm`) through a plain `JournalMessage::Persist`; the journal's answers reach it as `RootMessage::Journal`. Root is the only writer, so a conflict means already recorded and is not an error. A store failure leaves the quarantine in memory only, logged.
+* At start Root lists `quarantine/*` and `vm/*`, and replays every listed quarantine stream for its reason. Requests are held until both listings and every reason are in; then a twin is spawned for every `vm/*` name that is not quarantined. A record that can't be read counts as quarantined: its twin would otherwise replay a stream that may be broken.
+* `start` and `stop` on a quarantined VM are refused (`runtime.vm.quarantined`, hint: `amoeboid vacuum_vm NAME`); `status` shows `Quarantined { reason }` without asking any twin.
+* Envelope: `{"version": 1, "event": {"quarantined": {"reason": Report}}}`, the persistent actors' envelope.
 
 === Vacuum
 

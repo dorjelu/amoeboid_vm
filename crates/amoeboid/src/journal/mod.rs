@@ -139,7 +139,7 @@ impl Replay {
 }
 
 /// Correlates a `Persist` with its reply; unique per persistent-actor incarnation.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct BatchId(u64);
 
 impl BatchId {

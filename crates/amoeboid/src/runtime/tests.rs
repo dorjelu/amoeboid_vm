@@ -295,3 +295,191 @@ async fn status_without_vms_is_an_empty_list_and_stopping_an_unknown_vm_is_refus
     runtime.stop();
     runtime.wait().await;
 }
+
+/// Runs `messages` against the fixture's SQLite journal outside any runtime and returns the
+/// replies, one per message.
+async fn journal_exchange(
+    paths: &RuntimePaths,
+    messages: Vec<
+        Box<
+            dyn FnOnce(
+                ractor::DerivedActorRef<crate::journal::JournalReply>,
+            ) -> crate::journal::JournalMessage,
+        >,
+    >,
+) -> Vec<crate::journal::JournalReply> {
+    let (journal, handle) = ractor::Actor::spawn(
+        None,
+        crate::journal::Journal,
+        crate::journal::JournalArgs {
+            persistence: Persistence::Sqlite,
+            paths: paths.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let (reader, mut replies) = crate::testing::probe::<crate::journal::JournalReply>().await;
+    let mut answers = Vec::new();
+    for message in messages {
+        journal.cast(message(reader.get_derived())).unwrap();
+        answers.push(crate::testing::next(&mut replies).await);
+    }
+    journal.stop(None);
+    handle.await.unwrap();
+    answers
+}
+
+fn persistence_id(id: &str) -> crate::journal::PersistenceId {
+    crate::journal::PersistenceId::parse(id.into()).unwrap()
+}
+
+/// A `vm/<name>` stream this binary can't replay (an unknown event version).
+async fn plant_unreplayable(paths: &RuntimePaths, name: &str) {
+    std::fs::create_dir_all(paths.data().as_path()).unwrap();
+    let id = persistence_id(&format!("vm/{name}"));
+    let event =
+        crate::journal::EventPayload::encode(&json!({"version": 999, "event": {}})).unwrap();
+    let answers = journal_exchange(
+        paths,
+        vec![Box::new(move |reply_to| {
+            crate::journal::JournalMessage::Persist {
+                batch: crate::journal::BatchId::FIRST,
+                id,
+                first: crate::journal::Sequence::FIRST,
+                events: crate::nonempty::NonEmpty::new(event, Vec::new()),
+                reply_to,
+            }
+        })],
+    )
+    .await;
+    assert!(matches!(
+        answers.as_slice(),
+        [crate::journal::JournalReply::Persisted { .. }]
+    ));
+}
+
+async fn status_of(client: &mut Client, name: &str) -> Option<crate::vm::VmCondition> {
+    use crate::protocol::{VmReply, VmRequest};
+    let reply = client
+        .request(RequestBody::Vm(VmRequest::Status { name: None }))
+        .await
+        .unwrap();
+    let ReplyBody::Vm(VmReply::Status { vms }) = reply else {
+        return None;
+    };
+    vms.into_iter()
+        .find(|vm| vm.name.as_str() == name)
+        .map(|vm| vm.condition)
+}
+
+/// Polls status until `name` is quarantined (its twin reports after replaying); `None` if it
+/// isn't within 5 s.
+async fn until_quarantined(client: &mut Client, name: &str) -> Option<crate::diagnostic::Report> {
+    for _ in 0..50 {
+        if let Some(crate::vm::VmCondition::Quarantined { reason }) = status_of(client, name).await
+        {
+            return Some(reason);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    None
+}
+
+#[tokio::test]
+async fn an_unreplayable_vm_is_quarantined_recorded_once_and_refused() {
+    use crate::protocol::VmRequest;
+    let fixture = fixture();
+    plant_unreplayable(&fixture.paths, "broken").await;
+    let runtime = start_with(
+        &fixture.paths,
+        Persistence::Sqlite,
+        root::VmDefaults::production(),
+    )
+    .await
+    .unwrap();
+    let mut client = Client::connect(&fixture.paths).await.unwrap();
+    let reason = until_quarantined(&mut client, "broken").await.unwrap();
+    assert_eq!(
+        reason.code,
+        "persistent.unrecoverable.unknown_event_version"
+    );
+    let name = crate::domain::vm_name::VmName::parse("broken".into()).unwrap();
+    for request in [
+        VmRequest::Start {
+            name: name.clone(),
+            shares: Vec::new(),
+            nix_config: None,
+        },
+        VmRequest::Stop { name: name.clone() },
+    ] {
+        let reply = client.request(RequestBody::Vm(request)).await.unwrap();
+        assert!(
+            matches!(&reply, ReplyBody::Failed(report) if report.code == "runtime.vm.quarantined"),
+            "{reply:?}"
+        );
+    }
+    runtime.stop();
+    runtime.wait().await;
+
+    let answers = journal_exchange(
+        &fixture.paths,
+        vec![Box::new(|reply_to| {
+            crate::journal::JournalMessage::Replay {
+                id: persistence_id("quarantine/broken"),
+                reply_to,
+            }
+        })],
+    )
+    .await;
+    let [crate::journal::JournalReply::Replayed { replay, .. }] = answers.as_slice() else {
+        return assert_eq!("a replay", "something else");
+    };
+    assert_eq!(replay.events.len(), 1);
+    assert_eq!(super::quarantine::reason(&replay.events), Some(reason));
+}
+
+#[tokio::test]
+async fn a_recorded_quarantine_is_known_from_the_start_and_recorded_once() {
+    let fixture = fixture();
+    plant_unreplayable(&fixture.paths, "broken").await;
+    let first = start_with(
+        &fixture.paths,
+        Persistence::Sqlite,
+        root::VmDefaults::production(),
+    )
+    .await
+    .unwrap();
+    let mut client = Client::connect(&fixture.paths).await.unwrap();
+    until_quarantined(&mut client, "broken").await.unwrap();
+    first.stop();
+    first.wait().await;
+    let second = start_with(
+        &fixture.paths,
+        Persistence::Sqlite,
+        root::VmDefaults::production(),
+    )
+    .await
+    .unwrap();
+    let mut client = Client::connect(&fixture.paths).await.unwrap();
+    // Asked at once: the registry is loaded with the record, before any twin could report.
+    assert!(matches!(
+        status_of(&mut client, "broken").await,
+        Some(crate::vm::VmCondition::Quarantined { .. })
+    ));
+    second.stop();
+    second.wait().await;
+    let answers = journal_exchange(
+        &fixture.paths,
+        vec![Box::new(|reply_to| {
+            crate::journal::JournalMessage::Replay {
+                id: persistence_id("quarantine/broken"),
+                reply_to,
+            }
+        })],
+    )
+    .await;
+    let [crate::journal::JournalReply::Replayed { replay, .. }] = answers.as_slice() else {
+        return assert_eq!("a replay", "something else");
+    };
+    assert_eq!(replay.events.len(), 1);
+}

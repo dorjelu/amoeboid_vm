@@ -128,6 +128,11 @@ pub enum VmCondition {
     },
     /// Its twin didn't answer in time (Root's view, never the twin's).
     Unknown,
+    /// Its history can't be replayed; nothing runs for it until `amoeboid vacuum_vm` removes
+    /// it (Root's view, from the VM's quarantine record).
+    Quarantined {
+        reason: crate::diagnostic::Report,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]

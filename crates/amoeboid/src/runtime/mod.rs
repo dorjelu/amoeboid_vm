@@ -10,6 +10,7 @@
 pub mod listener;
 pub mod lock;
 pub mod paths;
+pub mod quarantine;
 pub mod root;
 pub mod session;
 #[cfg(test)]

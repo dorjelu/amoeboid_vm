@@ -240,6 +240,10 @@ fn describe(condition: &VmCondition) -> String {
             reason.message
         ),
         VmCondition::Unknown => "unknown: its twin didn't answer".into(),
+        VmCondition::Quarantined { reason } => format!(
+            "quarantined: {}; kept for inspection (amoeboid vacuum_vm removes it)",
+            reason.message
+        ),
     }
 }
 

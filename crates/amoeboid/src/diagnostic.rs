@@ -103,6 +103,14 @@ mod tests {
             Box::new(LockError::Open(io())),
             Box::new(LockError::Lock(io())),
             Box::new(LockError::Record(io())),
+            // Uppercase names: messages must stay lowercase whatever the VM is called.
+            Box::new(crate::runtime::root::RegistryError::Unknown(
+                crate::domain::vm_name::VmName::parse("Work".into()).unwrap(),
+            )),
+            Box::new(crate::runtime::root::RegistryError::Quarantined {
+                name: crate::domain::vm_name::VmName::parse("Work".into()).unwrap(),
+                reason: "x".into(),
+            }),
             Box::new(StartError::AlreadyRunning { holder: None }),
             Box::new(StartError::Directory {
                 directory: "/d".into(),

@@ -7,22 +7,33 @@
 //!
 //! Root knows clients only through the in-memory `waiters` table: which session waits on which
 //! operation. A twin answers by operation id; a client reference never enters persisted state.
+//!
+//! ```text
+//! pre_start ─▶ Streams{quarantine} ─▶ Replay quarantine/<name> × listed ─┐
+//!           └▶ Streams{vm} ──────────────────────────────────────────────┴▶ loaded: twins for
+//!              requests held until loaded                                  vm/* not quarantined
+//! twin Unrecoverable ─▶ quarantined (in memory) ─▶ Replay quarantine/<name>
+//!                       ─▶ no live event: Persist Quarantined at last + 1 (conflict: recorded)
+//! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use ractor::{Actor, ActorProcessingErr, ActorRef, DerivedActorRef, SupervisionEvent};
 
 use super::listener::{Listener, ListenerArgs};
 use super::paths::RuntimePaths;
+use super::quarantine::{self, QuarantineEvent};
 use crate::diagnostic::Report;
 use crate::domain::lifecycle::Incarnation;
 use crate::domain::path::AbsolutePath;
 use crate::domain::share::{ShareRequest, Shares};
 use crate::domain::vm_name::VmName;
 use crate::journal::{
-    Journal, JournalArgs, JournalMessage, JournalReply, Persistence, PersistenceId,
+    BatchId, Journal, JournalArgs, JournalMessage, JournalReply, PersistFailure, Persistence,
+    PersistenceId, Replay, Sequence, StoreError,
 };
+use crate::nonempty::NonEmpty;
 use crate::persistent::{Persistent, PersistentArgs, PersistentMessage};
 use crate::protocol::{
     OperationId, ReplyBody, RequestBody, RuntimeId, RuntimeReply, RuntimeRequest, ServerFrame,
@@ -52,7 +63,7 @@ pub enum RootMessage {
     },
     /// A twin's report.
     FromVm(FromVm),
-    /// The journal's answer to Root's own questions (the stream listing at start).
+    /// The journal's answer to Root's own questions: stream listings and quarantine records.
     Journal(JournalReply),
     /// A status collection's time is up: answer with what has arrived.
     StatusTimeout { operation: OperationId },
@@ -127,6 +138,8 @@ pub struct RootState {
     id: RuntimeId,
     /// `vm`: the parent of every twin's stream, `vm/<name>`.
     vm_streams: PersistenceId,
+    /// `quarantine`: the parent of every quarantine record, `quarantine/<name>`.
+    quarantine_streams: PersistenceId,
     paths: RuntimePaths,
     account: Account,
     vm_defaults: VmDefaults,
@@ -134,9 +147,60 @@ pub struct RootState {
     twins: BTreeMap<VmName, ActorRef<TwinMessage>>,
     waiters: BTreeMap<OperationId, (VmName, DerivedActorRef<ServerFrame>)>,
     statuses: BTreeMap<OperationId, StatusCollection>,
-    /// Requests that arrived before the journal listed the known VMs: held, then handled in
-    /// order, so no request sees a registry that is still being filled.
-    held: Option<Vec<RootMessage>>,
+    /// Quarantined VMs and why: recorded in the journal, or reported since start. No twin is
+    /// spawned for them and no request reaches one.
+    quarantined: BTreeMap<VmName, Report>,
+    /// Quarantines reported since start whose record is being looked up before the append.
+    recording: BTreeSet<VmName>,
+    /// Quarantine appends in flight.
+    appending: BTreeMap<BatchId, VmName>,
+    next_batch: BatchId,
+    /// `Some` until the registry is known.
+    loading: Option<Loading>,
+}
+
+/// Start-up: the registry is known once both listings and every quarantine reason are in.
+/// Requests that arrive meanwhile are held, then handled in order, so no request sees a
+/// registry that is still being filled.
+#[derive(Default)]
+struct Loading {
+    held: Vec<RootMessage>,
+    /// `None` until the `vm` listing arrives.
+    vms: Option<Vec<VmName>>,
+    /// `None` until the `quarantine` listing arrives; then the names whose reason is pending.
+    quarantines: Option<BTreeSet<VmName>>,
+}
+
+impl Loading {
+    fn complete(&self) -> bool {
+        self.vms.is_some() && self.quarantines.as_ref().is_some_and(BTreeSet::is_empty)
+    }
+}
+
+/// Requests Root refuses before any twin sees them.
+#[derive(Debug, thiserror::Error)]
+pub enum RegistryError {
+    #[error("there is no VM named {0}")]
+    Unknown(VmName),
+    #[error("the VM {name} is quarantined: {reason}")]
+    Quarantined { name: VmName, reason: String },
+}
+
+impl crate::diagnostic::Diagnostic for RegistryError {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::Unknown(_) => "runtime.vm.unknown",
+            Self::Quarantined { .. } => "runtime.vm.quarantined",
+        }
+    }
+    fn hint(&self) -> Option<String> {
+        match self {
+            Self::Unknown(_) => Some("see the VMs with amoeboid status".into()),
+            Self::Quarantined { name, .. } => Some(format!(
+                "its history is kept for inspection; remove the VM with amoeboid vacuum_vm {name}"
+            )),
+        }
+    }
 }
 
 /// A status question to several twins, answered when all have replied or time is up.
@@ -204,15 +268,20 @@ impl Actor for Root {
             myself.get_cell(),
         )
         .await?;
-        // Every VM the journal knows gets its twin now, so adoption starts with the runtime.
+        // Every VM the journal knows gets its twin once loaded, so adoption starts with the
+        // runtime; quarantined ones don't.
         let vm_streams = PersistenceId::parse("vm".into())?;
-        journal.cast(JournalMessage::Streams {
-            under: vm_streams.clone(),
-            reply_to: myself.get_derived(),
-        })?;
+        let quarantine_streams = PersistenceId::parse("quarantine".into())?;
+        for under in [&quarantine_streams, &vm_streams] {
+            journal.cast(JournalMessage::Streams {
+                under: under.clone(),
+                reply_to: myself.get_derived(),
+            })?;
+        }
         Ok(RootState {
             id: args.id,
             vm_streams,
+            quarantine_streams,
             paths: args.paths,
             account: args.account,
             vm_defaults: args.vm_defaults,
@@ -220,7 +289,11 @@ impl Actor for Root {
             twins: BTreeMap::new(),
             waiters: BTreeMap::new(),
             statuses: BTreeMap::new(),
-            held: Some(Vec::new()),
+            quarantined: BTreeMap::new(),
+            recording: BTreeSet::new(),
+            appending: BTreeMap::new(),
+            next_batch: BatchId::FIRST,
+            loading: Some(Loading::default()),
         })
     }
 
@@ -230,17 +303,16 @@ impl Actor for Root {
         message: RootMessage,
         state: &mut RootState,
     ) -> Result<(), ActorProcessingErr> {
-        if let (Some(held), RootMessage::Request { .. }) = (&mut state.held, &message) {
-            held.push(message);
+        if let (Some(loading), RootMessage::Request { .. }) = (&mut state.loading, &message) {
+            loading.held.push(message);
             return Ok(());
         }
-        let listed = matches!(
-            message,
-            RootMessage::Journal(JournalReply::Streams { .. } | JournalReply::StreamsFailed { .. })
-        );
         handle(&myself, message, state).await;
-        if listed && let Some(held) = state.held.take() {
-            for message in held {
+        if state.loading.as_ref().is_some_and(Loading::complete)
+            && let Some(loading) = state.loading.take()
+        {
+            loaded(&myself, state, loading.vms.unwrap_or_default()).await;
+            for message in loading.held {
                 handle(&myself, message, state).await;
             }
         }
@@ -338,36 +410,200 @@ async fn handle(myself: &ActorRef<RootMessage>, message: RootMessage, state: &mu
                 collection.reply(operation);
             }
         }
-        RootMessage::FromVm(FromVm { vm, report }) => from_vm(state, &vm, report),
-        RootMessage::Journal(JournalReply::Streams { ids, .. }) => {
-            for id in ids {
-                match id
-                    .below(&state.vm_streams)
-                    .map(|name| VmName::parse(name.to_owned()))
-                {
-                    Some(Ok(name)) => {
-                        if let Err(failure) = twin(myself, state, &name).await {
-                            tracing::error!(vm = %name, message = failure.message, "can't start its twin");
-                        }
+        RootMessage::FromVm(FromVm { vm, report }) => from_vm(myself, state, &vm, report),
+        RootMessage::Journal(reply) => journal(myself, state, reply),
+    }
+}
+
+/// The registry is known: a twin for every VM that isn't quarantined.
+async fn loaded(myself: &ActorRef<RootMessage>, state: &mut RootState, vms: Vec<VmName>) {
+    for name in vms {
+        if state.quarantined.contains_key(&name) {
+            tracing::warn!(vm = %name, "quarantined; its twin is not started");
+            continue;
+        }
+        if let Err(failure) = twin(myself, state, &name).await {
+            tracing::error!(vm = %name, message = failure.message, "can't start its twin");
+        }
+    }
+}
+
+/// The VM names among `ids` below `parent`; anything else is logged and skipped.
+fn names_below(ids: Vec<PersistenceId>, parent: &PersistenceId) -> Vec<VmName> {
+    ids.into_iter()
+        .filter_map(|id| {
+            let name = id
+                .below(parent)
+                .and_then(|name| VmName::parse(name.to_owned()).ok());
+            if name.is_none() {
+                tracing::warn!(id = id.as_str(), "a stream that names no VM");
+            }
+            name
+        })
+        .collect()
+}
+
+fn journal(myself: &ActorRef<RootMessage>, state: &mut RootState, reply: JournalReply) {
+    match reply {
+        JournalReply::Streams { under, ids } => listed(myself, state, &under, ids),
+        JournalReply::StreamsFailed { under, reason } => {
+            tracing::error!(under = under.as_str(), %reason, "can't list streams; treated as none");
+            listed(myself, state, &under, Vec::new());
+        }
+        JournalReply::Replayed { id, replay } => quarantine_replayed(myself, state, &id, &replay),
+        JournalReply::ReplayFailed { id, reason } => quarantine_unreadable(state, &id, &reason),
+        JournalReply::Persisted { batch, .. } => {
+            if let Some(vm) = state.appending.remove(&batch) {
+                tracing::info!(%vm, "quarantine recorded");
+            }
+        }
+        JournalReply::PersistFailed { batch, reason } => {
+            if let Some(vm) = state.appending.remove(&batch) {
+                match reason {
+                    // Root is the only writer of quarantine streams: someone was first.
+                    PersistFailure::Conflict { .. } => {
+                        tracing::debug!(%vm, "quarantine already recorded");
                     }
-                    Some(Err(_)) | None => {
-                        tracing::warn!(id = id.as_str(), "a stream under vm/ that names no VM");
+                    PersistFailure::Store(reason) => {
+                        tracing::error!(%vm, %reason, "can't record the quarantine; held in memory");
                     }
                 }
             }
         }
-        RootMessage::Journal(JournalReply::StreamsFailed { reason, .. }) => {
-            tracing::error!(%reason, "can't list the VMs; their twins start on first request");
+        JournalReply::Retired { .. } | JournalReply::RetireFailed { .. } => {
+            tracing::debug!("journal reply Root didn't ask for; ignored");
         }
-        RootMessage::Journal(
-            JournalReply::Replayed { .. }
-            | JournalReply::ReplayFailed { .. }
-            | JournalReply::Persisted { .. }
-            | JournalReply::PersistFailed { .. }
-            | JournalReply::Retired { .. }
-            | JournalReply::RetireFailed { .. },
-        ) => tracing::debug!("journal reply Root didn't ask for; ignored"),
     }
+}
+
+fn listed(
+    myself: &ActorRef<RootMessage>,
+    state: &mut RootState,
+    under: &PersistenceId,
+    ids: Vec<PersistenceId>,
+) {
+    let Some(loading) = &mut state.loading else {
+        return tracing::debug!(under = under.as_str(), "listing after start; ignored");
+    };
+    if *under == state.vm_streams {
+        loading.vms = Some(names_below(ids, &state.vm_streams));
+    } else if *under == state.quarantine_streams {
+        let names = names_below(ids, &state.quarantine_streams);
+        for name in &names {
+            ask_record(myself, state, name);
+        }
+        if let Some(loading) = &mut state.loading {
+            loading.quarantines = Some(names.into_iter().collect());
+        }
+    }
+}
+
+/// Asks the journal for a VM's quarantine record.
+fn ask_record(myself: &ActorRef<RootMessage>, state: &RootState, name: &VmName) {
+    let asked = state
+        .quarantine_streams
+        .child(name.as_str())
+        .map_err(|error| error.to_string())
+        .and_then(|id| {
+            state
+                .journal
+                .cast(JournalMessage::Replay {
+                    id,
+                    reply_to: myself.get_derived(),
+                })
+                .map_err(|error| error.to_string())
+        });
+    if let Err(error) = asked {
+        tracing::error!(vm = %name, %error, "can't ask for the quarantine record");
+    }
+}
+
+/// A quarantine record: its reason at start, or, for a quarantine reported since, whether it
+/// still has to be appended.
+fn quarantine_replayed(
+    myself: &ActorRef<RootMessage>,
+    state: &mut RootState,
+    id: &PersistenceId,
+    replay: &Replay,
+) {
+    let Some(name) = id
+        .below(&state.quarantine_streams)
+        .and_then(|name| VmName::parse(name.to_owned()).ok())
+    else {
+        return tracing::debug!(id = id.as_str(), "replay Root didn't ask for; ignored");
+    };
+    if let Some(pending) = state
+        .loading
+        .as_mut()
+        .and_then(|loading| loading.quarantines.as_mut())
+        && pending.remove(&name)
+    {
+        if let Some(reason) = quarantine::reason(&replay.events) {
+            state.quarantined.insert(name, reason);
+        }
+        return;
+    }
+    if !state.recording.remove(&name) {
+        return;
+    }
+    if !replay.events.is_empty() {
+        return tracing::debug!(vm = %name, "quarantine already recorded");
+    }
+    let Some(reason) = state.quarantined.get(&name).cloned() else {
+        return;
+    };
+    let appended = Sequence::after(replay.last)
+        .ok_or_else(|| "stream position overflow".to_owned())
+        .and_then(|first| {
+            let event = quarantine::encode(QuarantineEvent::Quarantined { reason })
+                .map_err(|error| error.to_string())?;
+            let batch = state.next_batch;
+            state
+                .journal
+                .cast(JournalMessage::Persist {
+                    batch,
+                    id: id.clone(),
+                    first,
+                    events: NonEmpty::new(event, Vec::new()),
+                    reply_to: myself.get_derived(),
+                })
+                .map_err(|error| error.to_string())?;
+            state.next_batch = batch.next();
+            state.appending.insert(batch, name.clone());
+            Ok(())
+        });
+    if let Err(error) = appended {
+        tracing::error!(vm = %name, %error, "can't record the quarantine; held in memory");
+    }
+}
+
+/// A quarantine record that can't be read: at start the VM counts as quarantined (its twin
+/// would otherwise replay a stream that may be broken).
+fn quarantine_unreadable(state: &mut RootState, id: &PersistenceId, reason: &StoreError) {
+    let Some(name) = id
+        .below(&state.quarantine_streams)
+        .and_then(|name| VmName::parse(name.to_owned()).ok())
+    else {
+        return tracing::debug!(id = id.as_str(), "replay Root didn't ask for; ignored");
+    };
+    tracing::error!(vm = %name, %reason, "can't read the quarantine record");
+    if let Some(pending) = state
+        .loading
+        .as_mut()
+        .and_then(|loading| loading.quarantines.as_mut())
+        && pending.remove(&name)
+    {
+        state.quarantined.insert(
+            name,
+            Report {
+                code: "runtime.quarantine.unreadable".into(),
+                message: format!("can't read the quarantine record: {reason}"),
+                hint: None,
+            },
+        );
+        return;
+    }
+    state.recording.remove(&name);
 }
 
 fn reply(reply_to: &DerivedActorRef<ServerFrame>, operation: OperationId, body: ReplyBody) {
@@ -390,6 +626,9 @@ async fn start(
     nix_config: Option<AbsolutePath>,
     reply_to: &DerivedActorRef<ServerFrame>,
 ) -> Result<(), Report> {
+    if let Some(refusal) = quarantined(state, &name) {
+        return Err(refusal);
+    }
     let home = AbsolutePath::parse(state.account.home.as_str().into())
         .map_err(|error| Report::of(&error))?;
     let shares = Shares::validate(shares, &[home], |directory| {
@@ -452,7 +691,7 @@ async fn twin(
     Ok(twin)
 }
 
-fn from_vm(state: &mut RootState, vm: &VmName, report: VmReport) {
+fn from_vm(myself: &ActorRef<RootMessage>, state: &mut RootState, vm: &VmName, report: VmReport) {
     match report {
         VmReport::OperationDone { operation, result } => {
             if let Some(collection) = state.statuses.get_mut(&operation) {
@@ -492,17 +731,36 @@ fn from_vm(state: &mut RootState, vm: &VmName, report: VmReport) {
         }
         VmReport::Unrecoverable { reason } => {
             tracing::error!(%vm, code = reason.code, message = reason.message, "VM quarantined");
+            // The twin stays alive refusing commands; Root routes nothing to it from now on.
+            if state.quarantined.insert(vm.clone(), reason).is_none() {
+                state.recording.insert(vm.clone());
+                ask_record(myself, state, vm);
+            }
         }
     }
 }
 
-/// The twin of a VM the runtime knows (from the journal, or started since).
-fn known_twin(state: &RootState, name: &VmName) -> Result<ActorRef<TwinMessage>, Report> {
-    state.twins.get(name).cloned().ok_or_else(|| Report {
-        code: "runtime.vm.unknown".into(),
-        message: format!("there is no VM named {name}"),
-        hint: Some("see the VMs with amoeboid status".into()),
+/// The refusal for a quarantined VM, if it is one.
+fn quarantined(state: &RootState, name: &VmName) -> Option<Report> {
+    state.quarantined.get(name).map(|reason| {
+        Report::of(&RegistryError::Quarantined {
+            name: name.clone(),
+            reason: reason.message.clone(),
+        })
     })
+}
+
+/// The twin of a VM the runtime knows (from the journal, or started since) and that isn't
+/// quarantined.
+fn known_twin(state: &RootState, name: &VmName) -> Result<ActorRef<TwinMessage>, Report> {
+    if let Some(refusal) = quarantined(state, name) {
+        return Err(refusal);
+    }
+    state
+        .twins
+        .get(name)
+        .cloned()
+        .ok_or_else(|| Report::of(&RegistryError::Unknown(name.clone())))
 }
 
 fn unreachable_twin(error: &dyn std::fmt::Display) -> Report {
@@ -522,21 +780,42 @@ fn status(
     name: Option<VmName>,
     reply_to: DerivedActorRef<ServerFrame>,
 ) {
-    let asked: Vec<(VmName, ActorRef<TwinMessage>)> = match name {
-        Some(name) => match known_twin(state, &name) {
-            Ok(twin) => vec![(name, twin)],
-            Err(failure) => return reply(&reply_to, operation, ReplyBody::Failed(failure)),
+    let quarantined = |name: &VmName, reason: &Report| {
+        (
+            name.clone(),
+            VmCondition::Quarantined {
+                reason: reason.clone(),
+            },
+        )
+    };
+    let (asked, known): (Vec<(VmName, ActorRef<TwinMessage>)>, Vec<_>) = match name {
+        Some(name) => match (state.quarantined.get(&name), state.twins.get(&name)) {
+            (Some(reason), _) => (Vec::new(), vec![quarantined(&name, reason)]),
+            (None, Some(twin)) => (vec![(name, twin.clone())], Vec::new()),
+            (None, None) => {
+                let failure = Report::of(&RegistryError::Unknown(name));
+                return reply(&reply_to, operation, ReplyBody::Failed(failure));
+            }
         },
-        None => state
-            .twins
-            .iter()
-            .map(|(name, twin)| (name.clone(), twin.clone()))
-            .collect(),
+        None => (
+            state
+                .twins
+                .iter()
+                .filter(|(name, _)| !state.quarantined.contains_key(*name))
+                .map(|(name, twin)| (name.clone(), twin.clone()))
+                .collect(),
+            state
+                .quarantined
+                .iter()
+                .map(|(name, reason)| quarantined(name, reason))
+                .collect(),
+        ),
     };
     let collection = StatusCollection {
         collected: asked
             .iter()
             .map(|(name, _)| (name.clone(), VmCondition::Unknown))
+            .chain(known)
             .collect(),
         reply_to,
     };
