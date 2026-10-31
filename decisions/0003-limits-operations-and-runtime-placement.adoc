@@ -95,7 +95,50 @@ CREATE TABLE tombstones (
 
 == Supervision
 
-`ractor-supervisor` is a dependency with `default-features = false`: its default features turn on ractor's `async-trait` feature, which breaks actors written with native `async fn`. Root's twins go under a `DynamicSupervisor`. A twin's child (Builder, GuestVm, Hypervisor) that ends is respawned under a supervisor strategy rather than only reported as `ChildEnded`. The strategy and intensity per level stay open (0002).
+0002's framework choice is amended: VM-level supervision is a `MachineSupervisor` of our own over ractor's links and supervision events, with its restart policy as a pure function. `ractor-supervisor` is removed from the dependencies.
+
+Why not `ractor-supervisor`'s `DynamicSupervisor`: its intensity counts all children together and its only outcome is a meltdown that fails the supervisor. Linked to Root, one VM failing repeatedly (an invalid configuration, say) would end the runtime; the restarted runtime spawns the same twin and melts down again, until systemd stops restarting it and every VM loses its control plane. No VM-level fault becomes healthy by restarting the runtime. It also gives the parent no restarted child's reference and fails on a first spawn error sent without a reply port.
+
+=== Topology
+
+----
+Root ─┬─ Journal            linked, essential  ─┐
+      ├─ Listener           linked, essential   ├─ any ends → Root fails → runtime exits → systemd restarts
+      └─ MachineSupervisor  linked, essential  ─┘
+           └─ VmTwin × name  linked to MachineSupervisor; one-for-one: VMs never affect each other
+                └─ Builder, GuestVm, LocalQemu  linked to the twin; any ends → the twin fails
+----
+
+* Essential actors are systemic: their failure ends the runtime. Twins are not: a twin's failure never reaches past its own VM.
+* The twin and its children are one restart unit (OTP's one-for-all, carried out by recovery): a child that ends makes the twin fail, and the restarted twin replays and reconciles (adopts a running machine, fails a start in progress, carries a stop on). Children are named after their twin (`…/builder`, `…/guest_vm`, `…/hypervisor`).
+* Each persistent actor chooses per child whether its end is an observation or a reason to fail (`ChildPolicy`); the twin escalates for all three.
+
+=== Per-VM lifecycle in the supervisor
+
+----
+ Spawning ──spawned──▶ Up ──failed, budget left──▶ Restarting{attempt, reason} ──backoff──▶ Spawning
+    │ spawn error counts as a failure                │ budget exhausted
+    └────────────────────────────────────────────────┴──▶ Quarantined{SuspiciousHalt} (persisted)
+ Up ── stopped normally (vacuum) ─▶ removed
+ Up ── Unrecoverable (twin alive, refusing) ─▶ Quarantined{Unreplayable}, as before
+----
+
+* Budget: 5 restarts within 10 minutes per VM; backoff 1 s, doubling, at most 30 s. The first failure restarts; quarantine comes only once the budget is spent.
+* Twins fail with a typed failure, downcast by the supervisor; anything that doesn't downcast (a panic, an unknown error) is a bug. Reactions start as: persist conflict restarts at once without backoff; persist timeout, replay store error, an escalated child, a spawn failure and a bug restart after backoff. All count against the budget. Per-cause budgets and per-VM policy are room for later, inside the supervisor.
+* Quarantine records carry a cause: `Unreplayable` (only `vacuum_vm` removes it) or `SuspiciousHalt` (the restart budget is spent; the record keeps the restart count and the last failures). Nothing touches the world when a twin fails, so processes, journal and logs stay for debugging. An operator command lifts a `SuspiciousHalt` quarantine: a tombstone on the record, a fresh budget, the twin spawned again. Lifting an `Unreplayable` quarantine is refused with a hint to vacuum.
+
+=== Requests by state
+
+[cols="1,2,2"]
+|===
+|Twin state |`start`, `stop` |`status`
+|Spawning |held per VM until up |held
+|Up |to the twin |to the twin
+|Restarting |refused at once (`runtime.vm.restarting`, hint: see `amoeboid status`) |Root answers `Restarting { reason, attempt }`
+|Quarantined |refused |Root answers `Quarantined { cause, reason }`
+|===
+
+When a twin fails, Root answers every operation waiting on it with the failure. Root learns a twin's reference from the supervisor (`Up`), so it never awaits a spawn in its own handler.
 
 == Runtime placement
 
@@ -135,4 +178,4 @@ The CLI remainders (long options only, `amoeboid ssh`, a boot timeout option) an
 
 == Open questions
 
-* Supervision strategy and restart intensity for the VM level and below (from 0002).
+* The name of the command that lifts a `SuspiciousHalt` quarantine.
