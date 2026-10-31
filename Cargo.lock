@@ -36,7 +36,6 @@ version = "0.1.0"
 dependencies = [
  "amoeboid",
  "clap",
- "thiserror",
  "tokio",
 ]
 

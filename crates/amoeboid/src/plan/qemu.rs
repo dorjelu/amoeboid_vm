@@ -15,9 +15,9 @@ pub fn arguments(shares: &Shares, ssh_port: LoopbackPort) -> String {
         "-device".to_owned(),
         format!("virtio-net-pci,netdev=net0,mac={GUEST_MAC}"),
     ];
-    for index in 0..shares.len() {
+    for (index, _) in shares.indexed() {
         let tag = tag(index);
-        let number = index.saturating_add(1);
+        let number = u32::from(index) + 1;
         words.extend([
             "-chardev".to_owned(),
             format!("socket,id=amo{number},path={tag}.sock"),

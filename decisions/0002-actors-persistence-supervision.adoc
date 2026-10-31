@@ -189,6 +189,30 @@ Spawns are recorded by the twin as `Spawning { nonce }` before the process exist
 
 Nothing is killed during recovery unless its identity is verified and it is broken. Liveness comes from the OS; the journal holds claims (0001 invariant 5 stands).
 
+== The VM subtree
+
+[source]
+----
+Root ──VmCommand::Start{operation, spec, incarnation}──▶ VmTwin
+  ▲                                                        │ VmOut::{Builder, GuestVm, Hypervisor, Root}
+  └──VmReport::OperationDone{operation, result}────────────┘
+VmTwin ─▶ Builder     Build                 → Built | BuildFailed
+       ─▶ GuestVm     Prepare, AwaitSsh     → Prepared{port, host_key} | SshReady | SshTimedOut | …Failed
+       ─▶ Hypervisor  Boot{plan}, Adopt     → ProcessStarted{role, identity} | MachineRunning | MachineStopped{reason}
+                                              | Adopted | Lost | ProcessExited{role, identity, exit}
+----
+
+Every child message carries the VM's generation; the twin drops older ones.
+
+* **Children are the twin's own.** A persistent behaviour has a setup hook, `start(setup, myself) -> Peers`, run when its actor starts: the twin spawns Builder, GuestVm and its Hypervisor linked to itself, so it is their supervisor. A child that ends unexpectedly becomes an observation through `child_ended(name, reason)`, not a crash of the twin.
+* **The twin orchestrates; the Hypervisor executes.** The Hypervisor is the backend chosen per VM (`LocalQemu` first). virtiofsd and the qemu watchers are its children, never the twin's: a remote backend runs no virtiofsd. The twin decides on machine-level observations (`MachineRunning`, `MachineStopped { reason }`); how a helper's failure turns into a machine outcome (virtiofsd dies, qemu is powered off) is the backend's knowledge.
+* **Roles are typed per backend:** `ProcessRole::Local(LocalRole::{Qemu, Virtiofsd(SharedDirectory)})`. The twin stores roles as keys for adoption and never needs to look inside a backend's variant; adding a backend adds a variant, and every `match` on `ProcessRole` stops compiling until it is handled.
+* **Incarnation and nonce.** The first `Start` for a name carries an incarnation, a ULID minted by Root; the twin persists `Created { incarnation, backend }` as its first event. Every spawn's nonce is `Nonce::of(vm, incarnation, generation, role)`: deterministic from the twin's history, so nothing is persisted before a spawn, and unique across recreations of the same name. Children inherit the environment, so a nonce search takes the topmost process carrying it (its parent does not).
+* **Adoption.** After a restart the twin replays and sends `Adopt` with, per role, `Known(identity)` (checked through a pidfd and the start time) or `Expected(nonce)` (searched); the Hypervisor answers `Adopted`, `ProcessStarted` + `Adopted`, or `Lost`, and the twin persists the answers before deciding.
+* **Order of a start:** Builder (`host.nix`, the VM's Nix config, `nix build`), then GuestVm (host key, guest files, Nix config copies, port), then Hypervisor (`Boot`), then GuestVm (`AwaitSsh`). The Builder goes first because guest preparation copies the config the Builder creates.
+* **Root checks shares against the world** (each a directory, none hiding the home) before the twin sees them.
+* **`Failed` keeps leftovers:** processes started before a failure stay recorded until they are stopped or reaped (slice 3).
+
 == VMs outlive the runtime
 
 [cols="1,2"]

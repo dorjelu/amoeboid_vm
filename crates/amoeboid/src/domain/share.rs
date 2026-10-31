@@ -30,8 +30,22 @@ impl Mode {
 
 /// An absolute host directory path, valid UTF-8 without control characters: it is written into
 /// the tab-separated `mounts` table the guest reads line by line.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+#[serde(try_from = "AbsolutePath", into = "AbsolutePath")]
 pub struct HostDirectory(AbsolutePath);
+
+impl TryFrom<AbsolutePath> for HostDirectory {
+    type Error = HostDirectoryError;
+    fn try_from(path: AbsolutePath) -> Result<Self, HostDirectoryError> {
+        Self::parse(path)
+    }
+}
+
+impl From<HostDirectory> for AbsolutePath {
+    fn from(directory: HostDirectory) -> Self {
+        directory.0
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum HostDirectoryError {
@@ -67,15 +81,49 @@ impl HostDirectory {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ShareRequest {
     pub directory: HostDirectory,
     pub mode: Mode,
 }
 
+/// At most this many shares: each one takes a PCI slot in the guest, and the guest's bus has
+/// few; it also keeps a share's index within `u16`.
+pub const MAX_SHARES: usize = 24;
+
 /// Validated shares, parents first. Index `i` (from 0) is guest tag `d{i + 1}`.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+///
+/// Decoding (persisted events) re-checks what the value itself proves (each path, no
+/// duplicates, the order); whether each is a directory belongs to the world at start time and
+/// is not re-checked.
+#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(try_from = "Vec<ShareRequest>", into = "Vec<ShareRequest>")]
 pub struct Shares(Vec<ShareRequest>);
+
+impl TryFrom<Vec<ShareRequest>> for Shares {
+    type Error = SharesError;
+    fn try_from(requests: Vec<ShareRequest>) -> Result<Self, SharesError> {
+        let shares = Self::validate(requests.clone(), &[], |_| true)?;
+        if shares.0 == requests {
+            Ok(shares)
+        } else {
+            let first = requests.into_iter().next();
+            Err(SharesError(NonEmpty::new(
+                ShareProblem::NotInMountOrder {
+                    directory: first.map(|share| share.directory),
+                },
+                vec![],
+            )))
+        }
+    }
+}
+
+impl From<Shares> for Vec<ShareRequest> {
+    fn from(shares: Shares) -> Self {
+        shares.0
+    }
+}
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ShareProblem {
@@ -88,6 +136,13 @@ pub enum ShareProblem {
     HidesHome {
         directory: HostDirectory,
         home: AbsolutePath,
+    },
+    TooMany {
+        count: usize,
+    },
+    /// Decoded shares that are not parents-first; never produced by `validate`.
+    NotInMountOrder {
+        directory: Option<HostDirectory>,
     },
 }
 
@@ -110,6 +165,10 @@ fn list(problems: &NonEmpty<ShareProblem>) -> String {
                 directory.as_str(),
                 home.display()
             ),
+            ShareProblem::TooMany { count } => {
+                format!("\n  {count} shares, at most {MAX_SHARES} allowed")
+            }
+            ShareProblem::NotInMountOrder { .. } => "\n  shares are not in mount order".into(),
         })
         .collect()
 }
@@ -150,11 +209,19 @@ impl Shares {
                 valid.push(request);
             }
         }
+        if valid.len() > MAX_SHARES {
+            problems.push(ShareProblem::TooMany { count: valid.len() });
+        }
         if let Some(problems) = NonEmpty::from_vec(problems) {
             return Err(SharesError(problems));
         }
         valid.sort_by(|left, right| left.directory.cmp(&right.directory));
         Ok(Self(valid))
+    }
+
+    /// Each share with its index (from 0); the index fits `u16` by `MAX_SHARES`.
+    pub fn indexed(&self) -> impl Iterator<Item = (u16, &ShareRequest)> {
+        (0_u16..).zip(&self.0)
     }
 
     #[must_use]
@@ -226,6 +293,8 @@ mod tests {
             ShareProblem::HidesHome { directory, home } => {
                 json!({"path": directory.as_str(), "kind": "hides_home", "home": home.to_str()})
             }
+            ShareProblem::TooMany { .. } => json!({"kind": "too_many"}),
+            ShareProblem::NotInMountOrder { .. } => json!({"kind": "not_in_mount_order"}),
         }
     }
 

@@ -6,6 +6,7 @@ use ractor::{Actor, ActorProcessingErr, ActorRef, DerivedActorRef, SupervisionEv
 
 use super::listener::{Listener, ListenerArgs};
 use super::paths::RuntimePaths;
+use crate::diagnostic::Report;
 use crate::journal::{Journal, JournalArgs, Persistence};
 use crate::protocol::{
     OperationId, ReplyBody, RequestBody, RuntimeId, RuntimeReply, RuntimeRequest, ServerFrame,
@@ -91,6 +92,12 @@ impl Actor for Root {
                     RequestBody::Runtime(RuntimeRequest::Ping) => {
                         ReplyBody::Runtime(RuntimeReply::Pong)
                     }
+                    // Replaced by routing to the VM's twin (slice 2d).
+                    RequestBody::Vm(_) => ReplyBody::Failed(Report {
+                        code: "runtime.vm.not_available".into(),
+                        message: "this runtime can't run VMs yet".into(),
+                        hint: None,
+                    }),
                 };
                 if reply_to
                     .send_message(ServerFrame::Reply { operation, body })

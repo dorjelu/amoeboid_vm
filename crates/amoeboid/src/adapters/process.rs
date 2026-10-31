@@ -72,7 +72,8 @@ pub enum Output {
 pub struct SpawnRequest {
     pub argv: Argv,
     pub containment: Containment,
-    pub nonce: Nonce,
+    /// Set for VM processes, so they can be found again; `None` for one-off commands.
+    pub nonce: Option<Nonce>,
     pub directory: AbsolutePath,
     pub output: Output,
 }
@@ -111,7 +112,7 @@ pub enum Watched {
     Adopted(OwnedFd),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Exit {
     Code(i32),
     Signal(i32),
@@ -157,11 +158,25 @@ pub fn identify(process: ProcessId) -> Result<Option<ProcessIdentity>, ProcessEr
     }))
 }
 
-/// Field 22 of `/proc/PID/stat`. The command name (field 2) may hold spaces and `)`, so fields
-/// are counted after its last `)`: field 3 is the first there, so field 22 is the 20th.
-fn start_time(stat: &str) -> Option<u64> {
+/// Field `number` of `/proc/PID/stat`. The command name (field 2) may hold spaces and `)`, so
+/// fields are counted after its last `)`, where field 3 comes first.
+fn stat_field(stat: &str, number: usize) -> Option<u64> {
     let (_, after_name) = stat.rsplit_once(')')?;
-    after_name.split_ascii_whitespace().nth(19)?.parse().ok()
+    after_name
+        .split_ascii_whitespace()
+        .nth(number.checked_sub(3)?)?
+        .parse()
+        .ok()
+}
+
+/// Field 22: start time in clock ticks since boot.
+fn start_time(stat: &str) -> Option<u64> {
+    stat_field(stat, 22)
+}
+
+/// Field 4: the parent's process id.
+fn parent(stat: &str) -> Option<u64> {
+    stat_field(stat, 4)
 }
 
 /// # Errors
@@ -292,8 +307,10 @@ pub fn spawn(request: &SpawnRequest) -> Result<Spawned, ProcessError> {
             command
         }
     };
+    if let Some(nonce) = &request.nonce {
+        command.env(Nonce::VARIABLE, nonce.value());
+    }
     command
-        .env(Nonce::VARIABLE, request.nonce.value())
         .current_dir(request.directory.as_path())
         .stdin(Stdio::null())
         .process_group(0)
@@ -361,20 +378,23 @@ pub async fn run(
     let spawned = spawn(&SpawnRequest {
         argv: argv.clone(),
         containment: Containment::Direct,
-        nonce: Nonce::mint(),
+        nonce: None,
         directory: directory.clone(),
         output: output.clone(),
     })?;
     Ok(exited(Watched::Child(spawned.child)).await)
 }
 
-/// The process carrying `nonce` in its environment, among those this user may inspect.
+/// The process carrying `nonce` in its environment, among those this user may inspect. Children
+/// inherit the environment, so among several the topmost is taken: the one whose parent does
+/// not carry the nonce too.
 ///
 /// # Errors
 ///
 /// `/proc` can't be listed.
 pub fn find_by_nonce(nonce: &Nonce) -> Result<Option<ProcessIdentity>, ProcessError> {
     let wanted = nonce.environment_entry();
+    let mut carriers = Vec::new();
     for entry in std::fs::read_dir("/proc").map_err(ProcessError::List)? {
         let Some(process) = entry
             .ok()
@@ -388,14 +408,23 @@ pub fn find_by_nonce(nonce: &Nonce) -> Result<Option<ProcessIdentity>, ProcessEr
         else {
             continue;
         };
-        if environment
+        let has_nonce = environment
             .split(|byte| *byte == 0)
-            .any(|entry| entry == wanted.as_bytes())
-        {
-            return identify(process);
+            .any(|entry| entry == wanted.as_bytes());
+        let stat = std::fs::read_to_string(format!("/proc/{process}/stat")).ok();
+        if let (true, Some(parent)) = (has_nonce, stat.as_deref().and_then(parent)) {
+            carriers.push((process, parent));
         }
     }
-    Ok(None)
+    let topmost = carriers.iter().find(|(_, parent)| {
+        !carriers
+            .iter()
+            .any(|(process, _)| u64::from(process.get()) == *parent)
+    });
+    match topmost {
+        Some((process, _)) => identify(*process),
+        None => Ok(None),
+    }
 }
 
 impl crate::diagnostic::Diagnostic for ProcessError {
@@ -432,11 +461,21 @@ mod tests {
 
     use super::*;
 
+    fn fresh_nonce() -> Nonce {
+        let vm = crate::domain::vm_name::VmName::parse("test".into()).unwrap();
+        Nonce::of(
+            &vm,
+            crate::domain::lifecycle::Incarnation::mint(),
+            crate::domain::lifecycle::Generation::FIRST,
+            &crate::domain::process::ProcessRole::Local(crate::domain::process::LocalRole::Qemu),
+        )
+    }
+
     fn sleeper(nonce: &Nonce, containment: Containment) -> Spawned {
         spawn(&SpawnRequest {
             argv: Argv::for_tests(&["sleep", "30"]),
             containment,
-            nonce: nonce.clone(),
+            nonce: Some(nonce.clone()),
             directory: AbsolutePath::parse("/".into()).unwrap(),
             output: Output::Discard,
         })
@@ -447,11 +486,12 @@ mod tests {
     fn start_time_is_read_past_a_command_name_with_spaces_and_parens() {
         let stat = "42 (a) b (c) S 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 777 23 24";
         assert_eq!(start_time(stat), Some(777));
+        assert_eq!(parent(stat), Some(4));
     }
 
     #[tokio::test]
     async fn a_spawned_process_is_alive_until_killed_then_its_exit_is_seen() {
-        let spawned = sleeper(&Nonce::mint(), Containment::Direct);
+        let spawned = sleeper(&fresh_nonce(), Containment::Direct);
         let identity = spawned.identity.clone();
         assert_eq!(liveness(&identity).unwrap(), Liveness::Alive);
         assert_eq!(signal(&identity, Signal::Kill).unwrap(), Signalled::Sent);
@@ -467,7 +507,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_mismatched_identity_is_never_signalled() {
-        let spawned = sleeper(&Nonce::mint(), Containment::Direct);
+        let spawned = sleeper(&fresh_nonce(), Containment::Direct);
         let impostor = ProcessIdentity {
             start_time: spawned.identity.start_time + 1,
             ..spawned.identity.clone()
@@ -480,7 +520,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_adopted_process_is_watched_through_its_pidfd() {
-        let spawned = sleeper(&Nonce::mint(), Containment::Direct);
+        let spawned = sleeper(&fresh_nonce(), Containment::Direct);
         let watched = adopt(&spawned.identity).unwrap().unwrap();
         signal(&spawned.identity, Signal::Terminate).unwrap();
         let exit = tokio::time::timeout(Duration::from_secs(5), exited(watched))
@@ -491,14 +531,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_nonce_search_takes_the_topmost_carrier_not_its_children() {
+        let nonce = fresh_nonce();
+        let parent = spawn(&SpawnRequest {
+            argv: Argv::for_tests(&["sh", "-c", "sleep 30 & wait"]),
+            containment: Containment::Direct,
+            nonce: Some(nonce.clone()),
+            directory: AbsolutePath::parse("/".into()).unwrap(),
+            output: Output::Discard,
+        })
+        .unwrap();
+        // Let the shell fork its child, which inherits the nonce.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            find_by_nonce(&nonce).unwrap(),
+            Some(parent.identity.clone())
+        );
+        // The shell leads its own process group; take its child with it.
+        let group = i32::try_from(parent.identity.process.get())
+            .ok()
+            .and_then(Pid::from_raw)
+            .unwrap();
+        rustix::process::kill_process_group(group, KernelSignal::KILL).unwrap();
+        exited(Watched::Child(parent.child)).await;
+    }
+
+    #[tokio::test]
     async fn a_process_is_found_by_its_nonce() {
-        let nonce = Nonce::mint();
+        let nonce = fresh_nonce();
         let spawned = sleeper(&nonce, Containment::Direct);
         assert_eq!(
             find_by_nonce(&nonce).unwrap(),
             Some(spawned.identity.clone())
         );
-        assert_eq!(find_by_nonce(&Nonce::mint()).unwrap(), None);
+        assert_eq!(find_by_nonce(&fresh_nonce()).unwrap(), None);
         signal(&spawned.identity, Signal::Kill).unwrap();
         exited(Watched::Child(spawned.child)).await;
     }
@@ -511,8 +577,11 @@ mod tests {
         }
         let vm =
             crate::domain::vm_name::VmName::parse(format!("test{}", std::process::id())).unwrap();
-        let scope = ScopeName::of(&vm, &crate::domain::process::Role::Qemu);
-        let nonce = Nonce::mint();
+        let scope = ScopeName::of(
+            &vm,
+            &crate::domain::process::ProcessRole::Local(crate::domain::process::LocalRole::Qemu),
+        );
+        let nonce = fresh_nonce();
         let first = sleeper(&nonce, Containment::Scope(scope.clone()));
         // systemd-run execs the command once the scope exists; wait for that.
         let mut found = None;
@@ -527,7 +596,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert_eq!(found, Some(first.identity.clone()));
-        let second = sleeper(&Nonce::mint(), Containment::Scope(scope));
+        let second = sleeper(&fresh_nonce(), Containment::Scope(scope));
         let exit = tokio::time::timeout(
             Duration::from_secs(10),
             exited(Watched::Child(second.child)),

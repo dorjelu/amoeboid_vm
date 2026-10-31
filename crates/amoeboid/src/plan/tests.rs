@@ -121,7 +121,7 @@ fn shares_and_virtiofsd_argv_match_the_golden() {
             .iter()
             .map(|share| {
                 serde_json::json!({
-                    "role": share.role, "socket": share.socket,
+                    "role": share.role().name(), "socket": share.socket(),
                     "source": share.source.to_str(), "mode": share.mode.as_str(),
                 })
             })

@@ -12,3 +12,4 @@ pub mod protocol;
 pub mod runtime;
 #[cfg(test)]
 mod testing;
+pub mod vm;

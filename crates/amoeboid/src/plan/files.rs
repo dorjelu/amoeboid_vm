@@ -13,7 +13,7 @@ use crate::domain::vm_name::VmName;
 pub fn mounts_table(shares: &Shares) -> String {
     use std::fmt::Write as _;
     let mut table = String::new();
-    for (index, share) in shares.as_slice().iter().enumerate() {
+    for (index, share) in shares.indexed() {
         // Writing to a String can't fail.
         let _ = writeln!(
             table,

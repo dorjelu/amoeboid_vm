@@ -9,7 +9,7 @@ mod tests;
 use std::marker::PhantomData;
 use std::time::Duration;
 
-use ractor::{Actor, ActorProcessingErr, ActorRef};
+use ractor::{Actor, ActorCell, ActorProcessingErr, ActorRef, SupervisionEvent};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -29,7 +29,9 @@ pub trait Behaviour: Send + Sync + Sized + 'static {
     type State: Send + 'static;
     /// Messages to peers. Sent only via [`Effect`], after that effect's events are durable.
     type Out: Send + 'static;
-    /// Actor refs and settings from the spawner; never persisted.
+    /// What the spawner gives; [`Behaviour::start`] turns it into `Peers`.
+    type Setup: Send + 'static;
+    /// Actor refs and settings the behaviour sends to; never persisted.
     type Peers: Send + Sync + 'static;
 
     /// Bumped when `Event`'s encoding changes; stored in every envelope. A stream holding an
@@ -66,6 +68,32 @@ pub trait Behaviour: Send + Sync + Sized + 'static {
 
     /// The one effect: a tell, chosen by matching on `out`.
     fn send(peers: &Self::Peers, out: Self::Out);
+
+    /// Runs when the actor starts, before recovery: spawns the behaviour's children linked to
+    /// `myself` (so it supervises them) and returns the peers. The one effectful hook besides
+    /// `send`.
+    fn start(
+        setup: Self::Setup,
+        myself: ActorCell,
+    ) -> impl Future<Output = Result<Self::Peers, ActorProcessingErr>> + Send;
+
+    /// A linked child ended; the observation it means to this behaviour, if any. A child's
+    /// failure is a fact to decide on, not a reason for this actor to fail.
+    fn child_ended(child: ChildEnded) -> Option<Self::Observation>;
+}
+
+/// A linked child that stopped or failed, from a supervision event.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ChildEnded {
+    /// The name it was spawned under, if any.
+    pub name: Option<String>,
+    pub reason: ChildEndReason,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ChildEndReason {
+    Stopped(Option<String>),
+    Failed(String),
 }
 
 /// What a handler wants done. A handler never sends directly: a send that happened before its
@@ -124,13 +152,16 @@ impl<C, O> TryFrom<PersistentMessage<C, O>> for JournalReply {
 pub struct PersistentArgs<B: Behaviour> {
     pub id: PersistenceId,
     pub journal: ActorRef<JournalMessage>,
-    pub peers: B::Peers,
+    pub setup: B::Setup,
     /// No `Persisted` within this: the actor stops and is restarted.
     pub persist_timeout: Duration,
 }
 
 pub struct PersistentState<B: Behaviour> {
-    args: PersistentArgs<B>,
+    id: PersistenceId,
+    journal: ActorRef<JournalMessage>,
+    persist_timeout: Duration,
+    peers: B::Peers,
     /// `None` only during a step, which takes the core by value.
     core: Option<Core<B>>,
 }
@@ -160,12 +191,13 @@ impl<B: Behaviour> Actor for Persistent<B> {
     type State = PersistentState<B>;
     type Arguments = PersistentArgs<B>;
 
-    fn pre_start(
+    async fn pre_start(
         &self,
         myself: ActorRef<Self::Msg>,
         args: PersistentArgs<B>,
-    ) -> impl Future<Output = Result<PersistentState<B>, ActorProcessingErr>> + Send {
-        std::future::ready(start(&myself, args))
+    ) -> Result<PersistentState<B>, ActorProcessingErr> {
+        let peers = B::start(args.setup, myself.get_cell()).await?;
+        start(&myself, args.id, args.journal, args.persist_timeout, peers)
     }
 
     fn handle(
@@ -176,22 +208,51 @@ impl<B: Behaviour> Actor for Persistent<B> {
     ) -> impl Future<Output = Result<(), ActorProcessingErr>> + Send {
         std::future::ready(run(&myself, message, state))
     }
+
+    fn handle_supervisor_evt(
+        &self,
+        myself: ActorRef<Self::Msg>,
+        event: SupervisionEvent,
+        state: &mut PersistentState<B>,
+    ) -> impl Future<Output = Result<(), ActorProcessingErr>> + Send {
+        let ended = match event {
+            SupervisionEvent::ActorTerminated(cell, _, reason) => Some(ChildEnded {
+                name: cell.get_name(),
+                reason: ChildEndReason::Stopped(reason),
+            }),
+            SupervisionEvent::ActorFailed(cell, error) => Some(ChildEnded {
+                name: cell.get_name(),
+                reason: ChildEndReason::Failed(error.to_string()),
+            }),
+            SupervisionEvent::ActorStarted(_) | SupervisionEvent::ProcessGroupChanged(_) => None,
+        };
+        std::future::ready(match ended.and_then(B::child_ended) {
+            Some(observation) => run(&myself, PersistentMessage::Observation(observation), state),
+            None => Ok(()),
+        })
+    }
 }
 
 /// Asks the journal for this actor's stream; recovery continues when `Replayed` arrives.
 fn start<B: Behaviour>(
     myself: &ActorRef<PersistentMessage<B::Command, B::Observation>>,
-    args: PersistentArgs<B>,
+    id: PersistenceId,
+    journal: ActorRef<JournalMessage>,
+    persist_timeout: Duration,
+    peers: B::Peers,
 ) -> Result<PersistentState<B>, ActorProcessingErr> {
-    tracing::info!(id = args.id.as_str(), "recovering");
-    args.journal
+    tracing::info!(id = id.as_str(), "recovering");
+    journal
         .cast(JournalMessage::Replay {
-            id: args.id.clone(),
+            id: id.clone(),
             reply_to: myself.get_derived(),
         })
         .map_err(|error| error.to_string())?;
     Ok(PersistentState {
-        args,
+        id,
+        journal,
+        persist_timeout,
+        peers,
         core: Some(Core::recovering()),
     })
 }
@@ -216,7 +277,7 @@ fn run<B: Behaviour>(
     let core = state.core.take().ok_or(CoreMissing)?;
     let (core, actions) = machine::step(core, input);
     state.core = Some(core);
-    let id = state.args.id.as_str();
+    let id = state.id.as_str();
     for action in actions {
         match action {
             Action::Persist {
@@ -224,22 +285,21 @@ fn run<B: Behaviour>(
                 first,
                 events,
             } => state
-                .args
                 .journal
                 .cast(JournalMessage::Persist {
                     batch,
-                    id: state.args.id.clone(),
+                    id: state.id.clone(),
                     first,
                     events,
                     reply_to: myself.get_derived(),
                 })
                 .map_err(|error| error.to_string())?,
             Action::ArmTimeout(batch) => {
-                myself.send_after(state.args.persist_timeout, move || {
+                myself.send_after(state.persist_timeout, move || {
                     PersistentMessage::PersistTimeout(batch)
                 });
             }
-            Action::Send(out) => B::send(&state.args.peers, out),
+            Action::Send(out) => B::send(&state.peers, out),
             Action::Entered(mode) => tracing::info!(id, ?mode, "entered"),
             Action::Ignored(why) => tracing::debug!(id, why, "input ignored"),
             Action::Stop(fatal) => {

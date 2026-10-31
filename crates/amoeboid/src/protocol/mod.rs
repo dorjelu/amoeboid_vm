@@ -105,6 +105,7 @@ pub enum ServerFrame {
 )]
 pub enum RequestBody {
     Runtime(RuntimeRequest),
+    Vm(VmRequest),
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -116,6 +117,9 @@ pub enum RequestBody {
 )]
 pub enum ReplyBody {
     Runtime(RuntimeReply),
+    Vm(VmReply),
+    /// The operation failed; rendered by the client like a local error.
+    Failed(crate::diagnostic::Report),
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -128,6 +132,30 @@ pub enum RuntimeRequest {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum RuntimeReply {
     Pong,
+}
+
+/// Requests about one VM, routed by Root to its twin.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(tag = "request", rename_all = "snake_case", deny_unknown_fields)]
+pub enum VmRequest {
+    /// Start (creating the VM if new). Shares arrive syntactically valid; the runtime checks
+    /// them against the world (each a directory, none hiding the home) before the twin sees
+    /// them.
+    Start {
+        name: crate::domain::vm_name::VmName,
+        shares: Vec<crate::domain::share::ShareRequest>,
+        /// Create or rebase from this config directory; `None` keeps the VM's own.
+        nix_config: Option<crate::domain::path::AbsolutePath>,
+    },
+}
+
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(tag = "reply", rename_all = "snake_case", deny_unknown_fields)]
+pub enum VmReply {
+    Started {
+        name: crate::domain::vm_name::VmName,
+        ssh: crate::vm::SshEndpoint,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, thiserror::Error)]

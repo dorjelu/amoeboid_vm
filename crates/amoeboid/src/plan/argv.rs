@@ -101,7 +101,7 @@ pub fn virtiofsd(
 ) -> Argv {
     let mut argv = vec![
         binary.as_os_str().into(),
-        flag("--socket-path=", &runtime.join(&share.socket)),
+        flag("--socket-path=", &runtime.join(&share.socket())),
         flag("--shared-dir=", &share.source),
         "--sandbox=namespace".into(),
         format!(

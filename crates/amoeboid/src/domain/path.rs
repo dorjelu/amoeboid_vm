@@ -79,6 +79,22 @@ impl AbsolutePath {
     }
 }
 
+/// Persisted and sent as text: a path that is not valid UTF-8 can't be serialised.
+impl serde::Serialize for AbsolutePath {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.to_str()
+            .ok_or_else(|| serde::ser::Error::custom("path is not valid UTF-8"))?
+            .serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for AbsolutePath {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Self::parse(PathBuf::from(text)).map_err(serde::de::Error::custom)
+    }
+}
+
 impl AsRef<Path> for AbsolutePath {
     fn as_ref(&self) -> &Path {
         &self.0

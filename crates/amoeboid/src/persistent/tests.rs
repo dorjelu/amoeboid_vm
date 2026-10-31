@@ -57,6 +57,7 @@ impl<const AUTO: bool> Behaviour for Counter<AUTO> {
     type Event = CounterEvent;
     type State = State;
     type Out = Out;
+    type Setup = Peers;
     type Peers = Peers;
     const EVENT_VERSION: u16 = 1;
 
@@ -117,6 +118,15 @@ impl<const AUTO: bool> Behaviour for Counter<AUTO> {
     }
     fn send(peers: &Peers, out: Out) {
         let _ = peers.send(out);
+    }
+    fn start(
+        setup: Peers,
+        _: ractor::ActorCell,
+    ) -> impl Future<Output = Result<Peers, ActorProcessingErr>> + Send {
+        std::future::ready(Ok(setup))
+    }
+    fn child_ended(_: ChildEnded) -> Option<CounterObservation> {
+        None
     }
 }
 
@@ -394,7 +404,7 @@ async fn spawn_counter(
         PersistentArgs {
             id: id.clone(),
             journal: journal.clone(),
-            peers: sender,
+            setup: sender,
             persist_timeout: Duration::from_secs(5),
         },
     )

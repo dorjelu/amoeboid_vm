@@ -5,6 +5,7 @@ use std::num::NonZeroU32;
 
 use serde::{Deserialize, Serialize};
 
+use super::lifecycle::{Generation, Incarnation};
 use super::vm_name::VmName;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
@@ -79,38 +80,89 @@ pub struct ProcessIdentity {
     pub boot: BootId,
 }
 
-/// Marks one spawn (a ULID): set as `AMOEBOID_NONCE` in the process environment and persisted by the
-/// twin before the spawn, so a process whose identity was never recorded can still be found.
-#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct Nonce(ulid::Ulid);
+/// Marks one spawn: `<vm>/<incarnation>/<generation>/<role>`, set as `AMOEBOID_NONCE` in the
+/// process environment. Computed from the twin's history, so a process whose identity was never
+/// recorded can be found again without anything persisted before its spawn.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct Nonce(String);
 
 impl Nonce {
+    pub const VARIABLE: &'static str = "AMOEBOID_NONCE";
+
     #[must_use]
-    pub fn mint() -> Self {
-        Self(ulid::Ulid::generate())
+    pub fn of(
+        vm: &VmName,
+        incarnation: Incarnation,
+        generation: Generation,
+        role: &ProcessRole,
+    ) -> Self {
+        Self(format!("{vm}/{incarnation}/{generation}/{}", role.name()))
     }
 
-    /// The environment entry, `AMOEBOID_NONCE=<ulid>`.
+    /// The environment entry, `AMOEBOID_NONCE=<nonce>`.
     #[must_use]
     pub fn environment_entry(&self) -> String {
         format!("{}={}", Self::VARIABLE, self.0)
     }
 
-    pub const VARIABLE: &'static str = "AMOEBOID_NONCE";
-
     #[must_use]
-    pub fn value(&self) -> String {
-        self.0.to_string()
+    pub fn value(&self) -> &str {
+        &self.0
     }
 }
 
-/// What a VM process does; names its scope unit.
-#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
-pub enum Role {
+/// A process of a VM, typed per backend. The twin keeps roles as keys and never needs to look
+/// inside a backend's variant; a new backend adds a variant here.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessRole {
+    Local(LocalRole),
+}
+
+/// The processes of the local qemu backend.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalRole {
     Qemu,
-    /// virtiofsd for a share socket (`ro-store`, `state`, `d1`, ...).
-    Virtiofsd(String),
+    Virtiofsd(SharedDirectory),
+}
+
+/// What one virtiofsd serves; fixes its socket (`ro-store.sock`, `state.sock`, `d1.sock`) and
+/// guest tag, both part of the contract with `nix/base.nix`.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedDirectory {
+    /// The host's `/nix/store`, read-only.
+    NixStore,
+    /// The VM's guest-writable state directory.
+    GuestState,
+    /// The requested share at this index (from 0), tag `d{index + 1}`.
+    Requested(u16),
+}
+
+impl SharedDirectory {
+    /// `ro-store`, `state`, `d1`, ...
+    #[must_use]
+    pub fn name(self) -> String {
+        match self {
+            Self::NixStore => "ro-store".into(),
+            Self::GuestState => "state".into(),
+            Self::Requested(index) => format!("d{}", u32::from(index) + 1),
+        }
+    }
+}
+
+impl ProcessRole {
+    /// `qemu`, `virtiofsd-d1`, ...: names the scope unit and the nonce's last part.
+    #[must_use]
+    pub fn name(&self) -> String {
+        match self {
+            Self::Local(LocalRole::Qemu) => "qemu".into(),
+            Self::Local(LocalRole::Virtiofsd(directory)) => {
+                format!("virtiofsd-{}", directory.name())
+            }
+        }
+    }
 }
 
 /// The transient scope unit of one VM process: `amoeboid-<vm>-<role>`, under `amoeboid.slice`.
@@ -120,12 +172,8 @@ pub struct ScopeName(String);
 
 impl ScopeName {
     #[must_use]
-    pub fn of(vm: &VmName, role: &Role) -> Self {
-        let role = match role {
-            Role::Qemu => "qemu".to_owned(),
-            Role::Virtiofsd(socket) => format!("virtiofsd-{socket}"),
-        };
-        Self(format!("amoeboid-{vm}-{role}"))
+    pub fn of(vm: &VmName, role: &ProcessRole) -> Self {
+        Self(format!("amoeboid-{vm}-{}", role.name()))
     }
 
     #[must_use]
@@ -157,15 +205,26 @@ mod tests {
     }
 
     #[test]
-    fn scope_names_join_vm_and_role() {
+    fn scope_names_and_nonces_join_vm_and_role() {
         let vm = VmName::parse("work".into()).unwrap();
+        let share = ProcessRole::Local(LocalRole::Virtiofsd(SharedDirectory::Requested(0)));
+        let qemu = ProcessRole::Local(LocalRole::Qemu);
+        assert_eq!(ScopeName::of(&vm, &qemu).as_str(), "amoeboid-work-qemu");
         assert_eq!(
-            ScopeName::of(&vm, &Role::Qemu).as_str(),
-            "amoeboid-work-qemu"
-        );
-        assert_eq!(
-            ScopeName::of(&vm, &Role::Virtiofsd("d1".into())).as_str(),
+            ScopeName::of(&vm, &share).as_str(),
             "amoeboid-work-virtiofsd-d1"
+        );
+        let incarnation = Incarnation::mint();
+        let nonce = Nonce::of(&vm, incarnation, Generation::FIRST, &share);
+        assert_eq!(nonce.value(), format!("work/{incarnation}/1/virtiofsd-d1"));
+    }
+
+    #[test]
+    fn roles_serialise_as_nested_tags() {
+        let role = ProcessRole::Local(LocalRole::Virtiofsd(SharedDirectory::Requested(0)));
+        assert_eq!(
+            serde_json::to_value(&role).unwrap(),
+            serde_json::json!({"local": {"virtiofsd": {"requested": 0}}})
         );
     }
 }
