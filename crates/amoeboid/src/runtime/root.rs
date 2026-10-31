@@ -30,8 +30,11 @@ use crate::protocol::{
 };
 use crate::vm::builder::BuildCommand;
 use crate::vm::local_qemu::Placement;
-use crate::vm::twin::{FromVm, TwinMessage, VmCommand, VmReport, VmSetup, VmTwin};
-use crate::vm::{Account, NixConfig, SshEndpoint, VmSpec};
+use crate::vm::twin::{FromVm, TwinMessage, VmCommand, VmOutcome, VmReport, VmSetup, VmTwin};
+use crate::vm::{Account, NixConfig, SshEndpoint, VmCondition, VmSpec, VmStatus};
+
+/// How long a status question waits for the twins; later answers are dropped.
+const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long a VM may take from qemu starting to sshd answering.
 const BOOT_TIMEOUT_SECONDS: u32 = 120;
@@ -51,6 +54,8 @@ pub enum RootMessage {
     FromVm(FromVm),
     /// The journal's answer to Root's own questions (the stream listing at start).
     Journal(JournalReply),
+    /// A status collection's time is up: answer with what has arrived.
+    StatusTimeout { operation: OperationId },
 }
 
 impl From<JournalReply> for RootMessage {
@@ -64,7 +69,9 @@ impl TryFrom<RootMessage> for JournalReply {
     fn try_from(message: RootMessage) -> Result<Self, RootMessage> {
         match message {
             RootMessage::Journal(reply) => Ok(reply),
-            other @ (RootMessage::Request { .. } | RootMessage::FromVm(_)) => Err(other),
+            other @ (RootMessage::Request { .. }
+            | RootMessage::FromVm(_)
+            | RootMessage::StatusTimeout { .. }) => Err(other),
         }
     }
 }
@@ -80,7 +87,9 @@ impl TryFrom<RootMessage> for FromVm {
     fn try_from(message: RootMessage) -> Result<Self, RootMessage> {
         match message {
             RootMessage::FromVm(report) => Ok(report),
-            other @ (RootMessage::Request { .. } | RootMessage::Journal(_)) => Err(other),
+            other @ (RootMessage::Request { .. }
+            | RootMessage::Journal(_)
+            | RootMessage::StatusTimeout { .. }) => Err(other),
         }
     }
 }
@@ -124,6 +133,34 @@ pub struct RootState {
     journal: ActorRef<JournalMessage>,
     twins: BTreeMap<VmName, ActorRef<TwinMessage>>,
     waiters: BTreeMap<OperationId, (VmName, DerivedActorRef<ServerFrame>)>,
+    statuses: BTreeMap<OperationId, StatusCollection>,
+}
+
+/// A status question to several twins, answered when all have replied or time is up.
+struct StatusCollection {
+    collected: BTreeMap<VmName, VmCondition>,
+    reply_to: DerivedActorRef<ServerFrame>,
+}
+
+impl StatusCollection {
+    fn complete(&self) -> bool {
+        self.collected
+            .values()
+            .all(|condition| *condition != VmCondition::Unknown)
+    }
+
+    fn reply(self, operation: OperationId) {
+        let vms = self
+            .collected
+            .into_iter()
+            .map(|(name, condition)| VmStatus { name, condition })
+            .collect();
+        reply(
+            &self.reply_to,
+            operation,
+            ReplyBody::Vm(VmReply::Status { vms }),
+        );
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -179,6 +216,7 @@ impl Actor for Root {
             journal,
             twins: BTreeMap::new(),
             waiters: BTreeMap::new(),
+            statuses: BTreeMap::new(),
         })
     }
 
@@ -210,6 +248,32 @@ impl Actor for Root {
                 .await;
                 if let Err(failure) = started {
                     reply(&reply_to, operation, ReplyBody::Failed(failure));
+                }
+            }
+            RootMessage::Request {
+                operation,
+                body: RequestBody::Vm(VmRequest::Stop { name }),
+                reply_to,
+            } => {
+                let sent = known_twin(state, &name).and_then(|twin| {
+                    twin.cast(PersistentMessage::Command(VmCommand::Stop { operation }))
+                        .map_err(|error| unreachable_twin(&error))
+                });
+                match sent {
+                    Ok(()) => {
+                        state.waiters.insert(operation, (name, reply_to));
+                    }
+                    Err(failure) => reply(&reply_to, operation, ReplyBody::Failed(failure)),
+                }
+            }
+            RootMessage::Request {
+                operation,
+                body: RequestBody::Vm(VmRequest::Status { name }),
+                reply_to,
+            } => status(&myself, state, operation, name, reply_to),
+            RootMessage::StatusTimeout { operation } => {
+                if let Some(collection) = state.statuses.remove(&operation) {
+                    collection.reply(operation);
                 }
             }
             RootMessage::FromVm(FromVm { vm, report }) => from_vm(state, &vm, report),
@@ -321,11 +385,7 @@ async fn start(
         spec,
         incarnation: Incarnation::mint(),
     }))
-    .map_err(|error| Report {
-        code: "runtime.vm.unreachable".into(),
-        message: format!("can't reach the VM's twin: {error}"),
-        hint: None,
-    })
+    .map_err(|error| unreachable_twin(&error))
 }
 
 /// The VM's twin, spawned (linked to Root) on first use.
@@ -371,12 +431,25 @@ async fn twin(
 fn from_vm(state: &mut RootState, vm: &VmName, report: VmReport) {
     match report {
         VmReport::OperationDone { operation, result } => {
+            if let Some(collection) = state.statuses.get_mut(&operation) {
+                let condition = match result {
+                    Ok(VmOutcome::Status(condition)) => condition,
+                    Ok(VmOutcome::Started(_) | VmOutcome::Stopped) | Err(_) => VmCondition::Unknown,
+                };
+                collection.collected.insert(vm.clone(), condition);
+                if collection.complete()
+                    && let Some(collection) = state.statuses.remove(&operation)
+                {
+                    collection.reply(operation);
+                }
+                return;
+            }
             let Some((name, reply_to)) = state.waiters.remove(&operation) else {
                 tracing::debug!(%operation, "no session waits on this operation");
                 return;
             };
             let body = match (result, state.paths.vm(&name)) {
-                (Ok(started), Ok(paths)) => ReplyBody::Vm(VmReply::Started {
+                (Ok(VmOutcome::Started(started)), Ok(paths)) => ReplyBody::Vm(VmReply::Started {
                     name,
                     ssh: SshEndpoint {
                         user: started.user,
@@ -384,7 +457,11 @@ fn from_vm(state: &mut RootState, vm: &VmName, report: VmReport) {
                         known_hosts: paths.known_hosts(),
                     },
                 }),
-                (Ok(_), Err(error)) => ReplyBody::Failed(Report::of(&error)),
+                (Ok(VmOutcome::Started(_)), Err(error)) => ReplyBody::Failed(Report::of(&error)),
+                (Ok(VmOutcome::Stopped), _) => ReplyBody::Vm(VmReply::Stopped { name }),
+                (Ok(VmOutcome::Status(condition)), _) => ReplyBody::Vm(VmReply::Status {
+                    vms: vec![VmStatus { name, condition }],
+                }),
                 (Err(failure), _) => ReplyBody::Failed(failure),
             };
             reply(&reply_to, operation, body);
@@ -393,6 +470,62 @@ fn from_vm(state: &mut RootState, vm: &VmName, report: VmReport) {
             tracing::error!(%vm, code = reason.code, message = reason.message, "VM quarantined");
         }
     }
+}
+
+/// The twin of a VM the runtime knows (from the journal, or started since).
+fn known_twin(state: &RootState, name: &VmName) -> Result<ActorRef<TwinMessage>, Report> {
+    state.twins.get(name).cloned().ok_or_else(|| Report {
+        code: "runtime.vm.unknown".into(),
+        message: format!("there is no VM named {name}"),
+        hint: Some("see the VMs with amoeboid status".into()),
+    })
+}
+
+fn unreachable_twin(error: &dyn std::fmt::Display) -> Report {
+    Report {
+        code: "runtime.vm.unreachable".into(),
+        message: format!("can't reach the VM's twin: {error}"),
+        hint: None,
+    }
+}
+
+/// Asks one twin, or every twin, for its condition; tell-only: answers are collected as they
+/// arrive and the reply goes out when all are in or `STATUS_TIMEOUT` passes.
+fn status(
+    myself: &ActorRef<RootMessage>,
+    state: &mut RootState,
+    operation: OperationId,
+    name: Option<VmName>,
+    reply_to: DerivedActorRef<ServerFrame>,
+) {
+    let asked: Vec<(VmName, ActorRef<TwinMessage>)> = match name {
+        Some(name) => match known_twin(state, &name) {
+            Ok(twin) => vec![(name, twin)],
+            Err(failure) => return reply(&reply_to, operation, ReplyBody::Failed(failure)),
+        },
+        None => state
+            .twins
+            .iter()
+            .map(|(name, twin)| (name.clone(), twin.clone()))
+            .collect(),
+    };
+    let collection = StatusCollection {
+        collected: asked
+            .iter()
+            .map(|(name, _)| (name.clone(), VmCondition::Unknown))
+            .collect(),
+        reply_to,
+    };
+    if asked.is_empty() {
+        return collection.reply(operation);
+    }
+    state.statuses.insert(operation, collection);
+    for (_, twin) in asked {
+        let _ = twin.cast(PersistentMessage::Command(VmCommand::Status { operation }));
+    }
+    myself.send_after(STATUS_TIMEOUT, move || RootMessage::StatusTimeout {
+        operation,
+    });
 }
 
 fn essential_name(cell: &ractor::ActorCell, runtime: RuntimeId) -> &'static str {

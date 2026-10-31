@@ -260,3 +260,24 @@ async fn a_new_runtime_starts_every_known_twin_which_recovers_on_its_own() {
         "the twin didn't recover on its own: {last:?}"
     );
 }
+
+#[tokio::test]
+async fn status_without_vms_is_an_empty_list_and_stopping_an_unknown_vm_is_refused() {
+    use crate::protocol::{VmReply, VmRequest};
+    let fixture = fixture();
+    let runtime = start(&fixture.paths).await.unwrap();
+    let mut client = Client::connect(&fixture.paths).await.unwrap();
+    let reply = client
+        .request(RequestBody::Vm(VmRequest::Status { name: None }))
+        .await
+        .unwrap();
+    assert_eq!(reply, ReplyBody::Vm(VmReply::Status { vms: Vec::new() }));
+    let name = crate::domain::vm_name::VmName::parse("ghost".into()).unwrap();
+    let reply = client
+        .request(RequestBody::Vm(VmRequest::Stop { name }))
+        .await
+        .unwrap();
+    assert!(matches!(reply, ReplyBody::Failed(report) if report.code == "runtime.vm.unknown"));
+    runtime.stop();
+    runtime.wait().await;
+}

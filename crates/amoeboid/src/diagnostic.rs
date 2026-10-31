@@ -225,6 +225,8 @@ mod tests {
             Box::new(crate::vm::twin::TwinError::RestartedWhileStarting),
             Box::new(crate::vm::twin::TwinError::ChildEnded("x".into())),
             Box::new(crate::vm::twin::TwinError::GenerationsExhausted),
+            Box::new(crate::vm::twin::TwinError::Stopping),
+            Box::new(crate::vm::twin::TwinError::Cancelled),
             Box::new(crate::vm::local_qemu::LocalQemuError::SocketsMissing(
                 "d1.sock".into(),
             )),

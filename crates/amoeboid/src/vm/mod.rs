@@ -105,6 +105,47 @@ pub struct VmSpec {
     pub boot_timeout_seconds: u32,
 }
 
+/// Where a VM is, as the operator sees it: the twin's state without its internals.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum VmCondition {
+    Stopped {
+        last_failure: Option<crate::diagnostic::Report>,
+    },
+    Starting {
+        step: StartStep,
+    },
+    Running {
+        user: UserName,
+        port: LoopbackPort,
+        generation: Generation,
+    },
+    Stopping,
+    Failed {
+        reason: crate::diagnostic::Report,
+        /// Processes of the failed start still recorded; `stop` takes them down.
+        leftovers: usize,
+    },
+    /// Its twin didn't answer in time (Root's view, never the twin's).
+    Unknown,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartStep {
+    Building,
+    PreparingGuest,
+    Booting,
+    WaitingForSsh,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VmStatus {
+    pub name: crate::domain::vm_name::VmName,
+    pub condition: VmCondition,
+}
+
 /// How the operator reaches a running VM; the CLI renders it with `plan::argv::ssh`.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct SshEndpoint {

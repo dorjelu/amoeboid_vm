@@ -43,6 +43,10 @@ pub enum VmCommand {
         /// Used only if this VM has no history yet (its first start ever).
         incarnation: Incarnation,
     },
+    /// Power off, or take down a failed start's leftovers; cancels a start in progress.
+    Stop { operation: OperationId },
+    /// Answered in every state; persists nothing.
+    Status { operation: OperationId },
 }
 
 /// Everything the twin's children report, tagged by child.
@@ -63,6 +67,10 @@ pub enum VmEvent {
     Created {
         incarnation: Incarnation,
         backend: Backend,
+    },
+    StopRequested {
+        operation: OperationId,
+        generation: Generation,
     },
     StartRequested {
         operation: OperationId,
@@ -139,8 +147,14 @@ pub enum VmState {
     Failed {
         generation: Generation,
         reason: Report,
-        /// Started before the failure; to be stopped or reaped (slice 3).
+        /// Started before the failure; `stop` takes them down.
         leftovers: BTreeMap<ProcessRole, ProcessIdentity>,
+    },
+    Stopping {
+        /// Every stop waiting for the machine to go down.
+        operations: Vec<OperationId>,
+        generation: Generation,
+        processes: BTreeMap<ProcessRole, ProcessIdentity>,
     },
 }
 
@@ -232,7 +246,7 @@ pub enum VmOut {
 pub enum VmReport {
     OperationDone {
         operation: OperationId,
-        result: Result<VmStarted, Report>,
+        result: Result<VmOutcome, Report>,
     },
     Unrecoverable {
         reason: Report,
@@ -244,6 +258,14 @@ pub enum VmReport {
 pub struct FromVm {
     pub vm: crate::domain::vm_name::VmName,
     pub report: VmReport,
+}
+
+/// What a finished operation produced.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum VmOutcome {
+    Started(VmStarted),
+    Stopped,
+    Status(super::VmCondition),
 }
 
 /// A started VM, as the twin knows it; Root adds the paths to make the reply.
@@ -290,6 +312,10 @@ pub enum TwinError {
     ChildEnded(String),
     #[error("no generation is left for this VM")]
     GenerationsExhausted,
+    #[error("the VM is stopping")]
+    Stopping,
+    #[error("the start was cancelled by a stop")]
+    Cancelled,
 }
 
 impl crate::diagnostic::Diagnostic for TwinError {
@@ -303,6 +329,8 @@ impl crate::diagnostic::Diagnostic for TwinError {
             Self::RestartedWhileStarting => "vm.restarted_while_starting",
             Self::ChildEnded(_) => "vm.child_ended",
             Self::GenerationsExhausted => "vm.generations_exhausted",
+            Self::Stopping => "vm.stopping",
+            Self::Cancelled => "vm.cancelled",
         }
     }
     fn hint(&self) -> Option<String> {
@@ -315,7 +343,8 @@ impl crate::diagnostic::Diagnostic for TwinError {
                 Some("see the VM's console.log".into())
             }
             Self::RestartedWhileStarting | Self::ChildEnded(_) => Some("start it again".into()),
-            Self::GenerationsExhausted => None,
+            Self::Stopping => Some("wait for the stop to finish, then start it".into()),
+            Self::GenerationsExhausted | Self::Cancelled => None,
         }
     }
 }
@@ -324,7 +353,7 @@ fn one<T>(item: T) -> NonEmpty<T> {
     NonEmpty::new(item, Vec::new())
 }
 
-fn done(operation: OperationId, result: Result<VmStarted, Report>) -> VmOut {
+fn done(operation: OperationId, result: Result<VmOutcome, Report>) -> VmOut {
     VmOut::Root(VmReport::OperationDone { operation, result })
 }
 
@@ -363,83 +392,23 @@ impl Behaviour for VmTwin {
     }
 
     fn on_command(state: &VmTwinState, command: VmCommand) -> Effect<VmEvent, VmOut> {
-        let VmCommand::Start {
-            operation,
-            spec,
-            incarnation,
-        } = command;
-        match &state.vm {
-            VmState::Starting { .. } => return refuse(operation, &TwinError::AlreadyStarting),
-            VmState::Running { .. } => return refuse(operation, &TwinError::AlreadyRunning),
-            VmState::Failed { leftovers, .. } if !leftovers.is_empty() => {
-                return refuse(operation, &TwinError::Leftovers);
-            }
-            VmState::Stopped { .. } | VmState::Failed { .. } => {}
-        }
-        let Some(generation) = state
-            .generation
-            .map_or(Some(Generation::FIRST), Generation::next)
-        else {
-            return refuse(operation, &TwinError::GenerationsExhausted);
-        };
-        let seed_own_config =
-            state.created.is_none() || matches!(spec.nix_config, NixConfig::From(_));
-        let build = VmOut::Build {
-            generation,
-            account: spec.account.clone(),
-            nix_config: spec.nix_config.clone(),
-        };
-        let requested = VmEvent::StartRequested {
-            operation,
-            generation,
-            spec,
-            seed_own_config,
-        };
-        let events = match state.created {
-            Some(_) => one(requested),
-            None => NonEmpty::new(
-                VmEvent::Created {
-                    incarnation,
-                    backend: Backend::Local,
-                },
-                vec![requested],
-            ),
-        };
-        Effect::Persist {
-            events,
-            then: vec![build],
+        match command {
+            VmCommand::Start {
+                operation,
+                spec,
+                incarnation,
+            } => start(state, operation, spec, incarnation),
+            VmCommand::Stop { operation } => stop(state, operation),
+            VmCommand::Status { operation } => Effect::Send(one(done(
+                operation,
+                Ok(VmOutcome::Status(condition(&state.vm))),
+            ))),
         }
     }
 
     fn on_observation(state: &VmTwinState, observation: VmObservation) -> Effect<VmEvent, VmOut> {
-        match observation {
-            VmObservation::Builder(observation) => builder(state, observation),
-            VmObservation::GuestVm(observation) => guest_vm(state, observation),
-            VmObservation::Hypervisor(observation) => hypervisor(state, observation),
-            VmObservation::ChildEnded(child) => match &state.vm {
-                VmState::Starting {
-                    operation,
-                    generation,
-                    ..
-                } => {
-                    let reason = match child.reason {
-                        ChildEndReason::Stopped(reason) => reason.unwrap_or_default(),
-                        ChildEndReason::Failed(reason) => reason,
-                    };
-                    let name = child.name.unwrap_or_else(|| "a child".into());
-                    fail(
-                        *operation,
-                        *generation,
-                        Report::of(&TwinError::ChildEnded(format!("{name}: {reason}"))),
-                    )
-                }
-                VmState::Stopped { .. } | VmState::Running { .. } | VmState::Failed { .. } => {
-                    Effect::None
-                }
-            },
-        }
+        on_observation(state, observation)
     }
-
     fn on_event(state: VmTwinState, event: &VmEvent) -> VmTwinState {
         evolve(state, event)
     }
@@ -464,6 +433,15 @@ impl Behaviour for VmTwin {
                 }),
                 then: Vec::new(),
             },
+            // A stop in progress when the runtime went down: carry it on.
+            VmState::Stopping {
+                generation,
+                processes,
+                ..
+            } => Effect::Send(one(VmOut::StopMachine {
+                generation: *generation,
+                processes: processes.clone(),
+            })),
             VmState::Stopped { .. } | VmState::Failed { .. } => Effect::None,
         }
     }
@@ -474,7 +452,11 @@ impl Behaviour for VmTwin {
     }
 
     fn refuse(command: VmCommand, reason: &Unrecoverable) -> Option<VmOut> {
-        let VmCommand::Start { operation, .. } = command;
+        let operation = match command {
+            VmCommand::Start { operation, .. }
+            | VmCommand::Stop { operation }
+            | VmCommand::Status { operation } => operation,
+        };
         Some(done(operation, Err(Report::of(reason))))
     }
 
@@ -618,6 +600,175 @@ impl Behaviour for VmTwin {
     }
 }
 
+fn start(
+    state: &VmTwinState,
+    operation: OperationId,
+    spec: VmSpec,
+    incarnation: Incarnation,
+) -> Effect<VmEvent, VmOut> {
+    match &state.vm {
+        VmState::Starting { .. } => return refuse(operation, &TwinError::AlreadyStarting),
+        VmState::Running { .. } => return refuse(operation, &TwinError::AlreadyRunning),
+        VmState::Stopping { .. } => return refuse(operation, &TwinError::Stopping),
+        VmState::Failed { leftovers, .. } if !leftovers.is_empty() => {
+            return refuse(operation, &TwinError::Leftovers);
+        }
+        VmState::Stopped { .. } | VmState::Failed { .. } => {}
+    }
+    let Some(generation) = state
+        .generation
+        .map_or(Some(Generation::FIRST), Generation::next)
+    else {
+        return refuse(operation, &TwinError::GenerationsExhausted);
+    };
+    let seed_own_config = state.created.is_none() || matches!(spec.nix_config, NixConfig::From(_));
+    let build = VmOut::Build {
+        generation,
+        account: spec.account.clone(),
+        nix_config: spec.nix_config.clone(),
+    };
+    let requested = VmEvent::StartRequested {
+        operation,
+        generation,
+        spec,
+        seed_own_config,
+    };
+    let events = match state.created {
+        Some(_) => one(requested),
+        None => NonEmpty::new(
+            VmEvent::Created {
+                incarnation,
+                backend: Backend::Local,
+            },
+            vec![requested],
+        ),
+    };
+    Effect::Persist {
+        events,
+        then: vec![build],
+    }
+}
+
+fn on_observation(state: &VmTwinState, observation: VmObservation) -> Effect<VmEvent, VmOut> {
+    match observation {
+        VmObservation::Builder(observation) => builder(state, observation),
+        VmObservation::GuestVm(observation) => guest_vm(state, observation),
+        VmObservation::Hypervisor(observation) => hypervisor(state, observation),
+        VmObservation::ChildEnded(child) => match &state.vm {
+            VmState::Starting {
+                operation,
+                generation,
+                ..
+            } => {
+                let reason = match child.reason {
+                    ChildEndReason::Stopped(reason) => reason.unwrap_or_default(),
+                    ChildEndReason::Failed(reason) => reason,
+                };
+                let name = child.name.unwrap_or_else(|| "a child".into());
+                fail(
+                    *operation,
+                    *generation,
+                    Report::of(&TwinError::ChildEnded(format!("{name}: {reason}"))),
+                )
+            }
+            VmState::Stopped { .. }
+            | VmState::Running { .. }
+            | VmState::Failed { .. }
+            | VmState::Stopping { .. } => Effect::None,
+        },
+    }
+}
+
+/// `Stop` per state: running or leftovers are stopped; a start in progress is cancelled (its
+/// operation answered) and stopped; a stop in progress gains another waiter; nothing running
+/// answers at once.
+fn stop(state: &VmTwinState, operation: OperationId) -> Effect<VmEvent, VmOut> {
+    let requested = |generation| VmEvent::StopRequested {
+        operation,
+        generation,
+    };
+    let stop_machine = |generation, vm: &VmState| VmOut::StopMachine {
+        generation,
+        processes: processes_of(vm),
+    };
+    match &state.vm {
+        VmState::Running { generation, .. } => Effect::Persist {
+            events: one(requested(*generation)),
+            then: vec![stop_machine(*generation, &state.vm)],
+        },
+        VmState::Failed {
+            generation,
+            leftovers,
+            ..
+        } if !leftovers.is_empty() => Effect::Persist {
+            events: one(requested(*generation)),
+            then: vec![stop_machine(*generation, &state.vm)],
+        },
+        VmState::Starting {
+            operation: start,
+            generation,
+            ..
+        } => {
+            let reason = Report::of(&TwinError::Cancelled);
+            Effect::Persist {
+                events: NonEmpty::new(
+                    VmEvent::Failed {
+                        generation: *generation,
+                        reason: reason.clone(),
+                    },
+                    vec![requested(*generation)],
+                ),
+                then: vec![
+                    done(*start, Err(reason)),
+                    stop_machine(*generation, &state.vm),
+                ],
+            }
+        }
+        VmState::Stopping { generation, .. } => Effect::Persist {
+            events: one(requested(*generation)),
+            then: Vec::new(),
+        },
+        VmState::Stopped { .. } | VmState::Failed { .. } => {
+            Effect::Send(one(done(operation, Ok(VmOutcome::Stopped))))
+        }
+    }
+}
+
+/// The twin's state as the operator sees it.
+fn condition(vm: &VmState) -> super::VmCondition {
+    use super::{StartStep, VmCondition};
+    match vm {
+        VmState::Stopped { last_failure } => VmCondition::Stopped {
+            last_failure: last_failure.clone(),
+        },
+        VmState::Starting { progress, .. } => VmCondition::Starting {
+            step: match progress {
+                StartProgress::Building => StartStep::Building,
+                StartProgress::PreparingGuest => StartStep::PreparingGuest,
+                StartProgress::Booting { .. } => StartStep::Booting,
+                StartProgress::WaitingForSsh { .. } => StartStep::WaitingForSsh,
+            },
+        },
+        VmState::Running {
+            generation,
+            spec,
+            port,
+            ..
+        } => VmCondition::Running {
+            user: spec.account.user.clone(),
+            port: *port,
+            generation: *generation,
+        },
+        VmState::Stopping { .. } => VmCondition::Stopping,
+        VmState::Failed {
+            reason, leftovers, ..
+        } => VmCondition::Failed {
+            reason: reason.clone(),
+            leftovers: leftovers.len(),
+        },
+    }
+}
+
 /// The current start, if this observation belongs to it.
 fn current(state: &VmTwinState, generation: Generation) -> Option<&VmState> {
     (state.generation == Some(generation)).then_some(&state.vm)
@@ -693,10 +844,10 @@ fn guest_vm(state: &VmTwinState, observation: GuestVmObservation) -> Effect<VmEv
                 events: one(VmEvent::Ready { generation }),
                 then: vec![done(
                     *operation,
-                    Ok(VmStarted {
+                    Ok(VmOutcome::Started(VmStarted {
                         user: spec.account.user.clone(),
                         port: *port,
-                    }),
+                    })),
                 )],
             }
         }
@@ -804,6 +955,16 @@ fn hypervisor(state: &VmTwinState, observation: HypervisorObservation) -> Effect
         ),
         (
             HypervisorObservation::MachineStopped { reason, .. },
+            VmState::Stopping { operations, .. },
+        ) => Effect::Persist {
+            events: one(VmEvent::MachineStopped { generation, reason }),
+            then: operations
+                .iter()
+                .map(|operation| done(*operation, Ok(VmOutcome::Stopped)))
+                .collect(),
+        },
+        (
+            HypervisorObservation::MachineStopped { reason, .. },
             VmState::Running { .. } | VmState::Failed { .. },
         ) => persist(VmEvent::MachineStopped { generation, reason }),
         (
@@ -814,7 +975,8 @@ fn hypervisor(state: &VmTwinState, observation: HypervisorObservation) -> Effect
             VmState::Stopped { .. }
             | VmState::Starting { .. }
             | VmState::Running { .. }
-            | VmState::Failed { .. },
+            | VmState::Failed { .. }
+            | VmState::Stopping { .. },
         ) => Effect::None,
     }
 }
@@ -886,10 +1048,15 @@ fn evolve(state: VmTwinState, event: &VmEvent) -> VmTwinState {
             other @ (VmState::Stopped { .. }
             | VmState::Starting { .. }
             | VmState::Running { .. }
-            | VmState::Failed { .. }) => other,
+            | VmState::Failed { .. }
+            | VmState::Stopping { .. }) => other,
         }),
+        VmEvent::StopRequested {
+            operation,
+            generation,
+        } => rebuild(stopping(vm, *operation, *generation)),
         VmEvent::MachineStopped { reason, .. } => rebuild(match vm {
-            VmState::Running { .. } => VmState::Stopped {
+            VmState::Running { .. } | VmState::Stopping { .. } => VmState::Stopped {
                 last_failure: reason.clone(),
             },
             VmState::Failed {
@@ -908,6 +1075,33 @@ fn evolve(state: VmTwinState, event: &VmEvent) -> VmTwinState {
             reason: reason.clone(),
             leftovers: processes_of(&vm),
         }),
+    }
+}
+
+/// The state after a `StopRequested`: a stop in progress gains a waiter; anything else starts
+/// stopping whatever it has running.
+fn stopping(vm: VmState, operation: OperationId, generation: Generation) -> VmState {
+    match vm {
+        VmState::Stopping {
+            mut operations,
+            generation,
+            processes,
+        } => {
+            operations.push(operation);
+            VmState::Stopping {
+                operations,
+                generation,
+                processes,
+            }
+        }
+        other @ (VmState::Stopped { .. }
+        | VmState::Starting { .. }
+        | VmState::Running { .. }
+        | VmState::Failed { .. }) => VmState::Stopping {
+            operations: vec![operation],
+            generation,
+            processes: processes_of(&other),
+        },
     }
 }
 
@@ -931,7 +1125,8 @@ fn next_progress(progress: StartProgress, event: &VmEvent) -> StartProgress {
 fn event_generation(event: &VmEvent) -> Option<Generation> {
     match event {
         VmEvent::Created { .. } => None,
-        VmEvent::StartRequested { generation, .. }
+        VmEvent::StopRequested { generation, .. }
+        | VmEvent::StartRequested { generation, .. }
         | VmEvent::Built { generation }
         | VmEvent::GuestPrepared { generation, .. }
         | VmEvent::ProcessStarted { generation, .. }
@@ -959,9 +1154,10 @@ fn advance(vm: VmState, step: impl FnOnce(StartProgress) -> StartProgress) -> Vm
             seed_own_config,
             progress: step(progress),
         },
-        other @ (VmState::Stopped { .. } | VmState::Running { .. } | VmState::Failed { .. }) => {
-            other
-        }
+        other @ (VmState::Stopped { .. }
+        | VmState::Running { .. }
+        | VmState::Failed { .. }
+        | VmState::Stopping { .. }) => other,
     }
 }
 
@@ -977,6 +1173,7 @@ fn with_processes(
             ..
         }
         | VmState::Running { processes, .. }
+        | VmState::Stopping { processes, .. }
         | VmState::Failed {
             leftovers: processes,
             ..
@@ -999,6 +1196,7 @@ fn processes_of(vm: &VmState) -> BTreeMap<ProcessRole, ProcessIdentity> {
             ..
         }
         | VmState::Running { processes, .. }
+        | VmState::Stopping { processes, .. }
         | VmState::Failed {
             leftovers: processes,
             ..

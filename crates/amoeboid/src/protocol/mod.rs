@@ -147,6 +147,14 @@ pub enum VmRequest {
         /// Create or rebase from this config directory; `None` keeps the VM's own.
         nix_config: Option<crate::domain::path::AbsolutePath>,
     },
+    /// Power the VM off (gracefully, then by force), or take down what a failed start left.
+    Stop {
+        name: crate::domain::vm_name::VmName,
+    },
+    /// One VM, or every VM when `name` is `None`.
+    Status {
+        name: Option<crate::domain::vm_name::VmName>,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -155,6 +163,13 @@ pub enum VmReply {
     Started {
         name: crate::domain::vm_name::VmName,
         ssh: crate::vm::SshEndpoint,
+    },
+    /// Also when it was already stopped.
+    Stopped {
+        name: crate::domain::vm_name::VmName,
+    },
+    Status {
+        vms: Vec<crate::vm::VmStatus>,
     },
 }
 

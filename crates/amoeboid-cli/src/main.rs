@@ -12,6 +12,7 @@ use amoeboid::protocol::{
     ReplyBody, RequestBody, RuntimeReply, RuntimeRequest, VmReply, VmRequest,
 };
 use amoeboid::runtime::paths::RuntimePaths;
+use amoeboid::vm::{StartStep, VmCondition};
 use clap::{Parser, Subcommand};
 
 /// Build and run NixOS microVMs for coding agents against chosen host directories.
@@ -39,6 +40,19 @@ enum Command {
         /// Directories to share into the VM, each PATH[:rw|:ro] (default rw).
         #[arg(value_name = "SHARE")]
         shares: Vec<String>,
+    },
+    /// Power a VM off: the guest is asked first, then stopped by force after a grace period.
+    /// Also takes down what a failed start left running, and cancels a start in progress.
+    Stop {
+        /// The VM's name.
+        #[arg(long, default_value = "default")]
+        name: String,
+    },
+    /// Show where each VM is (or one, with --name).
+    Status {
+        /// Only this VM.
+        #[arg(long)]
+        name: Option<String>,
     },
 }
 
@@ -73,6 +87,8 @@ async fn run(command: Command) -> Result<(), Report> {
                 other @ ReplyBody::Vm(_) => Err(unexpected(&other)),
             }
         }
+        Command::Stop { name } => stop(&paths, name).await,
+        Command::Status { name } => status(&paths, name).await,
         Command::Start {
             name,
             base_nix_config,
@@ -116,9 +132,93 @@ async fn run(command: Command) -> Result<(), Report> {
                     Ok(())
                 }
                 ReplyBody::Failed(failure) => Err(failure),
-                other @ ReplyBody::Runtime(_) => Err(unexpected(&other)),
+                other @ (ReplyBody::Runtime(_)
+                | ReplyBody::Vm(VmReply::Stopped { .. } | VmReply::Status { .. })) => {
+                    Err(unexpected(&other))
+                }
             }
         }
+    }
+}
+
+async fn stop(paths: &RuntimePaths, name: String) -> Result<(), Report> {
+    let name = VmName::parse(name).map_err(|error| report(&error))?;
+    let mut client = connect(paths).await?;
+    render::line(&format!("stopping '{name}'"));
+    match request(&mut client, RequestBody::Vm(VmRequest::Stop { name })).await? {
+        ReplyBody::Vm(VmReply::Stopped { name }) => {
+            render::line(&format!("'{name}' is stopped"));
+            Ok(())
+        }
+        ReplyBody::Failed(failure) => Err(failure),
+        other @ (ReplyBody::Runtime(_)
+        | ReplyBody::Vm(VmReply::Started { .. } | VmReply::Status { .. })) => {
+            Err(unexpected(&other))
+        }
+    }
+}
+
+async fn status(paths: &RuntimePaths, name: Option<String>) -> Result<(), Report> {
+    let name = name
+        .map(VmName::parse)
+        .transpose()
+        .map_err(|error| report(&error))?;
+    let mut client = connect(paths).await?;
+    match request(&mut client, RequestBody::Vm(VmRequest::Status { name })).await? {
+        ReplyBody::Vm(VmReply::Status { vms }) => {
+            if vms.is_empty() {
+                render::line("no VMs yet; create one with amoeboid start");
+            }
+            for vm in vms {
+                render::line(&format!(
+                    "{:<20} {}",
+                    vm.name.as_str(),
+                    describe(&vm.condition)
+                ));
+            }
+            Ok(())
+        }
+        ReplyBody::Failed(failure) => Err(failure),
+        other @ (ReplyBody::Runtime(_)
+        | ReplyBody::Vm(VmReply::Started { .. } | VmReply::Stopped { .. })) => {
+            Err(unexpected(&other))
+        }
+    }
+}
+
+fn describe(condition: &VmCondition) -> String {
+    match condition {
+        VmCondition::Stopped { last_failure: None } => "stopped".into(),
+        VmCondition::Stopped {
+            last_failure: Some(failure),
+        } => format!("stopped ({})", failure.message),
+        VmCondition::Starting { step } => format!(
+            "starting: {}",
+            match step {
+                StartStep::Building => "building",
+                StartStep::PreparingGuest => "preparing the guest",
+                StartStep::Booting => "booting",
+                StartStep::WaitingForSsh => "waiting for sshd",
+            }
+        ),
+        VmCondition::Running {
+            user,
+            port,
+            generation,
+        } => format!(
+            "running: {}@127.0.0.1 port {port} (start {generation})",
+            user.as_str()
+        ),
+        VmCondition::Stopping => "stopping".into(),
+        VmCondition::Failed {
+            reason,
+            leftovers: 0,
+        } => format!("failed: {}", reason.message),
+        VmCondition::Failed { reason, leftovers } => format!(
+            "failed: {}; {leftovers} processes still running (amoeboid stop takes them down)",
+            reason.message
+        ),
+        VmCondition::Unknown => "unknown: its twin didn't answer".into(),
     }
 }
 

@@ -202,7 +202,7 @@ fn every_step_of_a_start_persists_its_fact_then_asks_the_next_child() {
     );
     assert!(matches!(events.as_slice(), [VmEvent::Ready { .. }]));
     assert!(
-        matches!(outs.as_slice(), [VmOut::Root(VmReport::OperationDone { operation: done, result: Ok(started) })]
+        matches!(outs.as_slice(), [VmOut::Root(VmReport::OperationDone { operation: done, result: Ok(VmOutcome::Started(started)) })]
         if *done == operation && started.port == port() && started.user.as_str() == "alice")
     );
     assert!(
@@ -437,4 +437,219 @@ fn events_survive_their_persisted_form() {
             "{json}"
         );
     }
+}
+
+fn stopped_answers(outs: &[VmOut]) -> Vec<OperationId> {
+    outs.iter()
+        .filter_map(|out| match out {
+            VmOut::Root(VmReport::OperationDone {
+                operation,
+                result: Ok(VmOutcome::Stopped),
+            }) => Some(*operation),
+            VmOut::Build { .. }
+            | VmOut::PrepareGuest { .. }
+            | VmOut::Boot { .. }
+            | VmOut::AwaitSsh { .. }
+            | VmOut::StopMachine { .. }
+            | VmOut::Adopt { .. }
+            | VmOut::Root(_) => None,
+        })
+        .collect()
+}
+
+#[test]
+fn stopping_a_running_vm_asks_the_backend_and_answers_every_waiter_once_it_is_down() {
+    let (state, _) = running();
+    let first = OperationId::mint();
+    let (state, events, outs) = command(state, VmCommand::Stop { operation: first });
+    assert!(matches!(events.as_slice(), [VmEvent::StopRequested { .. }]));
+    assert!(
+        matches!(outs.as_slice(), [VmOut::StopMachine { processes, .. }] if processes.contains_key(&qemu()))
+    );
+    assert!(matches!(state.vm, VmState::Stopping { .. }));
+
+    // A second stop waits for the same one; a start is refused meanwhile.
+    let second = OperationId::mint();
+    let (state, _, outs) = command(state, VmCommand::Stop { operation: second });
+    assert!(outs.is_empty());
+    let (again, _) = start_command(NixConfig::Existing);
+    let (_, _, outs) = command(state.clone(), again);
+    assert!(
+        matches!(outs.as_slice(), [VmOut::Root(VmReport::OperationDone { result: Err(reason), .. })] if reason.code == "vm.stopping")
+    );
+
+    let (state, events, outs) = observe(
+        state,
+        VmObservation::Hypervisor(HypervisorObservation::MachineStopped {
+            generation: Generation::FIRST,
+            reason: None,
+        }),
+    );
+    assert!(matches!(
+        events.as_slice(),
+        [VmEvent::MachineStopped { .. }]
+    ));
+    assert_eq!(stopped_answers(&outs), [first, second]);
+    assert_eq!(state.vm, VmState::Stopped { last_failure: None });
+}
+
+#[test]
+fn stopping_a_start_in_progress_cancels_it_and_stops_what_it_started() {
+    let (first_start, start_operation) = start_command(NixConfig::Existing);
+    let (state, ..) = command(VmTwin::initial(), first_start);
+    let generation = Generation::FIRST;
+    let (state, ..) = observe(
+        state,
+        VmObservation::Builder(BuilderObservation::Built { generation }),
+    );
+    let (state, ..) = observe(
+        state,
+        VmObservation::GuestVm(GuestVmObservation::Prepared {
+            generation,
+            port: port(),
+            host_key: hostkey(),
+        }),
+    );
+    let (state, ..) = observe(
+        state,
+        VmObservation::Hypervisor(HypervisorObservation::ProcessStarted {
+            generation,
+            role: qemu(),
+            identity: identity(812),
+        }),
+    );
+    let stop = OperationId::mint();
+    let (state, events, outs) = command(state, VmCommand::Stop { operation: stop });
+    assert!(
+        matches!(events.as_slice(), [VmEvent::Failed { reason, .. }, VmEvent::StopRequested { .. }] if reason.code == "vm.cancelled")
+    );
+    assert!(matches!(outs.as_slice(), [
+        VmOut::Root(VmReport::OperationDone { operation, result: Err(_) }),
+        VmOut::StopMachine { processes, .. },
+    ] if *operation == start_operation && processes.contains_key(&qemu())));
+    // The build or boot finishing late changes nothing.
+    let (state, events, _) = observe(
+        state,
+        VmObservation::Hypervisor(HypervisorObservation::MachineRunning { generation }),
+    );
+    assert_eq!(events, Vec::new());
+    let (state, _, outs) = observe(
+        state,
+        VmObservation::Hypervisor(HypervisorObservation::MachineStopped {
+            generation,
+            reason: None,
+        }),
+    );
+    assert_eq!(stopped_answers(&outs), [stop]);
+    assert!(matches!(state.vm, VmState::Stopped { .. }));
+}
+
+#[test]
+fn stopping_a_failed_start_takes_down_its_leftovers_and_then_allows_a_new_start() {
+    let (first_start, _) = start_command(NixConfig::Existing);
+    let (state, ..) = command(VmTwin::initial(), first_start);
+    let generation = Generation::FIRST;
+    let (state, ..) = observe(
+        state,
+        VmObservation::Builder(BuilderObservation::Built { generation }),
+    );
+    let (state, ..) = observe(
+        state,
+        VmObservation::GuestVm(GuestVmObservation::Prepared {
+            generation,
+            port: port(),
+            host_key: hostkey(),
+        }),
+    );
+    let (state, ..) = observe(
+        state,
+        VmObservation::Hypervisor(HypervisorObservation::ProcessStarted {
+            generation,
+            role: qemu(),
+            identity: identity(812),
+        }),
+    );
+    let reason = Report {
+        code: "x".into(),
+        message: "x".into(),
+        hint: None,
+    };
+    let (state, ..) = observe(
+        state,
+        VmObservation::Hypervisor(HypervisorObservation::BootFailed { generation, reason }),
+    );
+    let (state, _, outs) = command(
+        state,
+        VmCommand::Stop {
+            operation: OperationId::mint(),
+        },
+    );
+    assert!(matches!(outs.as_slice(), [VmOut::StopMachine { .. }]));
+    let (state, ..) = observe(
+        state,
+        VmObservation::Hypervisor(HypervisorObservation::MachineStopped {
+            generation,
+            reason: None,
+        }),
+    );
+    let (again, _) = start_command(NixConfig::Existing);
+    let (_, events, _) = command(state, again);
+    assert!(matches!(
+        events.as_slice(),
+        [VmEvent::StartRequested { .. }]
+    ));
+}
+
+#[test]
+fn stopping_a_stopped_vm_answers_at_once_without_persisting() {
+    let operation = OperationId::mint();
+    let (_, events, outs) = command(VmTwin::initial(), VmCommand::Stop { operation });
+    assert_eq!(events, Vec::new());
+    assert_eq!(stopped_answers(&outs), [operation]);
+}
+
+#[test]
+fn status_is_answered_in_every_state_without_persisting() {
+    let (running_state, _) = running();
+    let (first_start, _) = start_command(NixConfig::Existing);
+    let (starting, ..) = command(VmTwin::initial(), first_start);
+    for (state, expected) in [
+        (VmTwin::initial(), "stopped"),
+        (starting, "starting"),
+        (running_state, "running"),
+    ] {
+        let operation = OperationId::mint();
+        let (_, events, outs) = command(state, VmCommand::Status { operation });
+        assert_eq!(events, Vec::new());
+        let condition = match outs.as_slice() {
+            [
+                VmOut::Root(VmReport::OperationDone {
+                    result: Ok(VmOutcome::Status(condition)),
+                    ..
+                }),
+            ] => condition.clone(),
+            _ => crate::vm::VmCondition::Unknown,
+        };
+        let name = serde_json::to_value(&condition).unwrap();
+        assert!(
+            name.get(expected).is_some() || name == serde_json::json!(expected),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn recovery_carries_on_an_interrupted_stop() {
+    let (state, _) = running();
+    let (state, ..) = command(
+        state,
+        VmCommand::Stop {
+            operation: OperationId::mint(),
+        },
+    );
+    let (_, events, outs) = apply(state.clone(), VmTwin::on_recovered(&state));
+    assert_eq!(events, Vec::new());
+    assert!(
+        matches!(outs.as_slice(), [VmOut::StopMachine { processes, .. }] if processes.contains_key(&qemu()))
+    );
 }
