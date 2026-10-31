@@ -2,5 +2,6 @@
 
 pub mod journal;
 pub mod nonempty;
+pub mod persistent;
 pub mod protocol;
 pub mod runtime;

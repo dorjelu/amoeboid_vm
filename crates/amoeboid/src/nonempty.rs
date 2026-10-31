@@ -23,3 +23,12 @@ impl<T> NonEmpty<T> {
         std::iter::once(&self.head).chain(&self.tail)
     }
 }
+
+impl<T> IntoIterator for NonEmpty<T> {
+    type Item = T;
+    type IntoIter = std::iter::Chain<std::iter::Once<T>, std::vec::IntoIter<T>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        std::iter::once(self.head).chain(self.tail)
+    }
+}

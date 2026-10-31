@@ -93,6 +93,15 @@ mod tests {
     use super::*;
     use crate::runtime::paths::AbsDir;
 
+    /// Held by every test here. A fork in a parallel test copies all open fds until its child
+    /// execs (`O_CLOEXEC` acts at exec, not fork), briefly keeping a dropped lock alive.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static FORKS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        FORKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn paths(dir: &tempfile::TempDir) -> RuntimePaths {
         let dir = AbsDir::parse(dir.path().to_path_buf()).unwrap();
         RuntimePaths::under(dir.clone(), dir).unwrap()
@@ -107,6 +116,7 @@ mod tests {
 
     #[test]
     fn a_second_acquire_sees_the_lock_held_with_the_first_holders_record() {
+        let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         let paths = paths(&dir);
         let first = acquire(&paths, &record()).unwrap();
@@ -117,6 +127,7 @@ mod tests {
 
     #[test]
     fn dropping_the_lock_releases_it() {
+        let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         let paths = paths(&dir);
         drop(acquire(&paths, &record()).unwrap());
@@ -128,6 +139,7 @@ mod tests {
 
     #[test]
     fn a_child_process_does_not_keep_the_lock_alive() {
+        let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         let paths = paths(&dir);
         let lock = acquire(&paths, &record()).unwrap();
@@ -141,6 +153,7 @@ mod tests {
 
     #[test]
     fn a_symlink_at_the_lock_path_is_refused() {
+        let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
         let paths = paths(&dir);
         std::os::unix::fs::symlink(dir.path().join("elsewhere"), paths.lock()).unwrap();

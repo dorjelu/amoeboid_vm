@@ -228,3 +228,10 @@ impl Actor for Journal {
         Ok(())
     }
 }
+
+#[cfg(test)]
+pub(crate) mod tests_support {
+    pub(crate) fn store_error(message: &str) -> super::StoreError {
+        super::StoreError(message.to_owned())
+    }
+}

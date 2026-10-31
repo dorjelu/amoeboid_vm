@@ -113,7 +113,9 @@ Ready / Reconciling ── Effect::Persist ─▶ Persisting{batch, events, then
    ◀── PersistFailed / PersistTimeout ── Err: restart, replay rebuilds from what is durable
 ----
 
-The `Reconciling` → `Ready` transition is generic so it is logged and visible in status. The stash is unbounded.
+The `Reconciling` → `Ready` transition is generic so it is logged and visible in status. The stash is unbounded. While `Persisting`, commands and observations are both held in arrival order and re-fed once the batch is durable. Observations that arrive while `Recovering` are dropped: the watchers that produce them are spawned by `on_recovered`, so anything earlier belongs to a previous incarnation.
+
+The mode machine is a pure function, `step(core, input) -> (core, actions)`; the ractor actor only executes the actions (persist, arm a timeout, send, log, stop). ractor's `kill` aborts a running handler (`ActorCell::kill` "terminates async work"); the actor's handler is synchronous, so a kill lands between steps.
 
 === Unrecoverable streams and quarantine
 
@@ -296,7 +298,6 @@ Moot now that `steps` is replaced, recorded so they are not reintroduced: the st
 == Open questions
 
 * Supervision strategy and restart intensity per level of the tree.
-* Whether a ractor stop or kill interrupts a running handler (not found in the docs, 2026-10-30). The journal design does not depend on it.
 * `daemon restart` policy with VMs running (with adoption it can simply restart).
 * Stream trimming: at generation end, or kept for history.
 * Snapshot cadence, if streams turn out not to be short.
