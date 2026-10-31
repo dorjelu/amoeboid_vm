@@ -153,10 +153,11 @@ mod tests {
         server.await.unwrap();
     }
 
+    /// Only that the kernel hands one out: whether it is still free a moment later is the race
+    /// `free_port` documents, so a test can't assert it.
     #[test]
-    fn a_free_port_is_non_zero_and_bindable() {
-        let port = free_port().unwrap();
-        assert!(std::net::TcpListener::bind(("127.0.0.1", port.get())).is_ok());
+    fn a_free_port_is_handed_out() {
+        assert!(free_port().is_ok());
     }
 
     fn which(program: &str) -> Option<std::path::PathBuf> {
