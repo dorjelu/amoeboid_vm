@@ -73,7 +73,7 @@ Root (registry, routing)                         ractor-supervisor
 
 Strategies come from `ractor-supervisor`: OneForOne, OneForAll, RestForOne; Permanent, Transient, Temporary; `max_restarts` within `max_window`, with `reset_after` and backoff. Exceeding the limit fails the supervisor itself to its parent, as an OTP supervisor does. The concrete strategy per level is decided with slice 1.
 
-Root spawns VMs at runtime, so it uses `DynamicSupervisor`. Supervision is the link made by `spawn_linked` (the parent receives the child's lifecycle events); separately, `ractor-supervisor` registers every child under its `ChildSpec.id` in ractor's process-wide name registry for lookup. Child ids are prefixed with the `RuntimeId`, so two runtimes in one process (parallel `InProcess` tests) do not collide.
+Root level: the journal and the listener are essential, linked children; if either ends, Root fails and the runtime exits, and systemd's `Restart=on-failure` brings it back (VMs outlive it by design). Client sessions are spawned unlinked by the listener, so a client's failure never reaches Root. Root spawns VMs at runtime, so for them it uses `DynamicSupervisor`. Supervision is the link made by `spawn_linked` (the parent receives the child's lifecycle events); separately, `ractor-supervisor` registers every child under its `ChildSpec.id` in ractor's process-wide name registry for lookup. Child ids are prefixed with the `RuntimeId`, so two runtimes in one process (parallel `InProcess` tests) do not collide.
 
 `ractor-supervisor` is 0.2.0 and has one maintainer. It is built only on ractor's public lifecycle events, so it can be pinned, vendored or replaced without touching any actor.
 
@@ -297,7 +297,7 @@ Moot now that `steps` is replaced, recorded so they are not reintroduced: the st
 
 == Open questions
 
-* Supervision strategy and restart intensity per level of the tree.
+* Supervision strategy and restart intensity for the VM level and below.
 * `daemon restart` policy with VMs running (with adoption it can simply restart).
 * Stream trimming: at generation end, or kept for history.
 * Snapshot cadence, if streams turn out not to be short.

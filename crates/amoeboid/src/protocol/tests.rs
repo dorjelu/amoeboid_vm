@@ -30,6 +30,7 @@ fn client_frames() -> impl Strategy<Value = ClientFrame> {
 fn server_frames() -> impl Strategy<Value = ServerFrame> {
     let refusals = prop_oneof![
         Just(Refusal::HandshakeRequired),
+        Just(Refusal::HandshakeRepeated),
         Just(Refusal::MalformedFrame),
         any::<u32>().prop_map(|max| Refusal::FrameTooLarge { max }),
     ];

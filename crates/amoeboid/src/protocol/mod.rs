@@ -150,11 +150,16 @@ pub enum RuntimeReply {
     Pong,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, thiserror::Error)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Refusal {
+    #[error("the first frame must be a handshake")]
     HandshakeRequired,
+    #[error("the connection already completed its handshake")]
+    HandshakeRepeated,
+    #[error("the frame doesn't decode")]
     MalformedFrame,
+    #[error("the frame exceeds {max} bytes")]
     FrameTooLarge { max: u32 },
 }
 
