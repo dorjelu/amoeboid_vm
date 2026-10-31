@@ -1,20 +1,18 @@
-//! The only module that prints.
+//! The only module that prints. Write errors are ignored: a reader that went away (`amoeboid
+//! status | head`) is not a failure of the command.
 
-#![allow(
-    clippy::print_stdout,
-    clippy::print_stderr,
-    reason = "the CLI's output boundary"
-)]
+use std::io::Write as _;
 
 use amoeboid::diagnostic::Report;
 
 pub fn line(text: &str) {
-    println!("{text}");
+    let _ = writeln!(std::io::stdout().lock(), "{text}");
 }
 
 pub fn error(report: &Report) {
-    eprintln!("amoeboid: {}", report.message);
+    let mut stderr = std::io::stderr().lock();
+    let _ = writeln!(stderr, "amoeboid: {}", report.message);
     if let Some(hint) = &report.hint {
-        eprintln!("  hint: {hint}");
+        let _ = writeln!(stderr, "  hint: {hint}");
     }
 }

@@ -226,6 +226,17 @@ async fn a_new_runtime_starts_every_known_twin_which_recovers_on_its_own() {
     let second = start_with(&fixture.paths, Persistence::Sqlite, slow_build)
         .await
         .unwrap();
+    // Asked at once: requests wait for the registry, so the VM is already listed.
+    let mut client = Client::connect(&fixture.paths).await.unwrap();
+    let reply = client
+        .request(RequestBody::Vm(crate::protocol::VmRequest::Status {
+            name: None,
+        }))
+        .await
+        .unwrap();
+    let listed = matches!(&reply, ReplyBody::Vm(crate::protocol::VmReply::Status { vms })
+        if vms.iter().any(|vm| vm.name.as_str() == "interrupted"));
+    assert!(listed, "{reply:?}");
     // No request names the VM; give its twin a moment to recover by itself.
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     second.stop();

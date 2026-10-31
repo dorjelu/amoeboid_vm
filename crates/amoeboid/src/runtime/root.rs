@@ -134,6 +134,9 @@ pub struct RootState {
     twins: BTreeMap<VmName, ActorRef<TwinMessage>>,
     waiters: BTreeMap<OperationId, (VmName, DerivedActorRef<ServerFrame>)>,
     statuses: BTreeMap<OperationId, StatusCollection>,
+    /// Requests that arrived before the journal listed the known VMs: held, then handled in
+    /// order, so no request sees a registry that is still being filled.
+    held: Option<Vec<RootMessage>>,
 }
 
 /// A status question to several twins, answered when all have replied or time is up.
@@ -217,6 +220,7 @@ impl Actor for Root {
             twins: BTreeMap::new(),
             waiters: BTreeMap::new(),
             statuses: BTreeMap::new(),
+            held: Some(Vec::new()),
         })
     }
 
@@ -226,83 +230,19 @@ impl Actor for Root {
         message: RootMessage,
         state: &mut RootState,
     ) -> Result<(), ActorProcessingErr> {
-        match message {
-            RootMessage::Request {
-                operation,
-                body: RequestBody::Runtime(RuntimeRequest::Ping),
-                reply_to,
-            } => reply(&reply_to, operation, ReplyBody::Runtime(RuntimeReply::Pong)),
-            RootMessage::Request {
-                operation,
-                body:
-                    RequestBody::Vm(VmRequest::Start {
-                        name,
-                        shares,
-                        nix_config,
-                    }),
-                reply_to,
-            } => {
-                let started = start(
-                    &myself, state, operation, name, shares, nix_config, &reply_to,
-                )
-                .await;
-                if let Err(failure) = started {
-                    reply(&reply_to, operation, ReplyBody::Failed(failure));
-                }
+        if let (Some(held), RootMessage::Request { .. }) = (&mut state.held, &message) {
+            held.push(message);
+            return Ok(());
+        }
+        let listed = matches!(
+            message,
+            RootMessage::Journal(JournalReply::Streams { .. } | JournalReply::StreamsFailed { .. })
+        );
+        handle(&myself, message, state).await;
+        if listed && let Some(held) = state.held.take() {
+            for message in held {
+                handle(&myself, message, state).await;
             }
-            RootMessage::Request {
-                operation,
-                body: RequestBody::Vm(VmRequest::Stop { name }),
-                reply_to,
-            } => {
-                let sent = known_twin(state, &name).and_then(|twin| {
-                    twin.cast(PersistentMessage::Command(VmCommand::Stop { operation }))
-                        .map_err(|error| unreachable_twin(&error))
-                });
-                match sent {
-                    Ok(()) => {
-                        state.waiters.insert(operation, (name, reply_to));
-                    }
-                    Err(failure) => reply(&reply_to, operation, ReplyBody::Failed(failure)),
-                }
-            }
-            RootMessage::Request {
-                operation,
-                body: RequestBody::Vm(VmRequest::Status { name }),
-                reply_to,
-            } => status(&myself, state, operation, name, reply_to),
-            RootMessage::StatusTimeout { operation } => {
-                if let Some(collection) = state.statuses.remove(&operation) {
-                    collection.reply(operation);
-                }
-            }
-            RootMessage::FromVm(FromVm { vm, report }) => from_vm(state, &vm, report),
-            RootMessage::Journal(JournalReply::Streams { ids, .. }) => {
-                for id in ids {
-                    match id
-                        .below(&state.vm_streams)
-                        .map(|name| VmName::parse(name.to_owned()))
-                    {
-                        Some(Ok(name)) => {
-                            if let Err(failure) = twin(&myself, state, &name).await {
-                                tracing::error!(vm = %name, message = failure.message, "can't start its twin");
-                            }
-                        }
-                        Some(Err(_)) | None => {
-                            tracing::warn!(id = id.as_str(), "a stream under vm/ that names no VM");
-                        }
-                    }
-                }
-            }
-            RootMessage::Journal(JournalReply::StreamsFailed { reason, .. }) => {
-                tracing::error!(%reason, "can't list the VMs; their twins start on first request");
-            }
-            RootMessage::Journal(
-                JournalReply::Replayed { .. }
-                | JournalReply::ReplayFailed { .. }
-                | JournalReply::Persisted { .. }
-                | JournalReply::PersistFailed { .. },
-            ) => tracing::debug!("journal reply Root didn't ask for; ignored"),
         }
         Ok(())
     }
@@ -343,6 +283,88 @@ impl Actor for Root {
             }
         };
         std::future::ready(result)
+    }
+}
+
+/// One message, with the registry known (or known to be unavailable).
+async fn handle(myself: &ActorRef<RootMessage>, message: RootMessage, state: &mut RootState) {
+    match message {
+        RootMessage::Request {
+            operation,
+            body: RequestBody::Runtime(RuntimeRequest::Ping),
+            reply_to,
+        } => reply(&reply_to, operation, ReplyBody::Runtime(RuntimeReply::Pong)),
+        RootMessage::Request {
+            operation,
+            body:
+                RequestBody::Vm(VmRequest::Start {
+                    name,
+                    shares,
+                    nix_config,
+                }),
+            reply_to,
+        } => {
+            let started = start(
+                myself, state, operation, name, shares, nix_config, &reply_to,
+            )
+            .await;
+            if let Err(failure) = started {
+                reply(&reply_to, operation, ReplyBody::Failed(failure));
+            }
+        }
+        RootMessage::Request {
+            operation,
+            body: RequestBody::Vm(VmRequest::Stop { name }),
+            reply_to,
+        } => {
+            let sent = known_twin(state, &name).and_then(|twin| {
+                twin.cast(PersistentMessage::Command(VmCommand::Stop { operation }))
+                    .map_err(|error| unreachable_twin(&error))
+            });
+            match sent {
+                Ok(()) => {
+                    state.waiters.insert(operation, (name, reply_to));
+                }
+                Err(failure) => reply(&reply_to, operation, ReplyBody::Failed(failure)),
+            }
+        }
+        RootMessage::Request {
+            operation,
+            body: RequestBody::Vm(VmRequest::Status { name }),
+            reply_to,
+        } => status(myself, state, operation, name, reply_to),
+        RootMessage::StatusTimeout { operation } => {
+            if let Some(collection) = state.statuses.remove(&operation) {
+                collection.reply(operation);
+            }
+        }
+        RootMessage::FromVm(FromVm { vm, report }) => from_vm(state, &vm, report),
+        RootMessage::Journal(JournalReply::Streams { ids, .. }) => {
+            for id in ids {
+                match id
+                    .below(&state.vm_streams)
+                    .map(|name| VmName::parse(name.to_owned()))
+                {
+                    Some(Ok(name)) => {
+                        if let Err(failure) = twin(myself, state, &name).await {
+                            tracing::error!(vm = %name, message = failure.message, "can't start its twin");
+                        }
+                    }
+                    Some(Err(_)) | None => {
+                        tracing::warn!(id = id.as_str(), "a stream under vm/ that names no VM");
+                    }
+                }
+            }
+        }
+        RootMessage::Journal(JournalReply::StreamsFailed { reason, .. }) => {
+            tracing::error!(%reason, "can't list the VMs; their twins start on first request");
+        }
+        RootMessage::Journal(
+            JournalReply::Replayed { .. }
+            | JournalReply::ReplayFailed { .. }
+            | JournalReply::Persisted { .. }
+            | JournalReply::PersistFailed { .. },
+        ) => tracing::debug!("journal reply Root didn't ask for; ignored"),
     }
 }
 
