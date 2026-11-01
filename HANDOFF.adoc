@@ -24,7 +24,7 @@ dd49e1b Add GuestVm: guest files, Nix config copies, port, sshd wait
 
 Slices done (0001 build order, as amended in conversation): 1 (runtime skeleton, ping), 2 (local start), 3 (stop, status, eager registry, unit files). All verified by hand against a real VM (see "Real-VM check" below). 132 lib tests + 2 CLI tests, clippy `-D warnings` clean, fmt clean.
 
-The previous Rust attempt lives unchanged in `rust_attempt_archived/` (builds standalone, `cd rust_attempt_archived && cargo test --workspace`); delete it once nothing more is wanted from it. The Python launcher (`src/amoeboid/`) still exists and still works; its VM `rustbox` lives in `~/.local/share/amoeboid` and must not be disturbed.
+The previous Rust attempt and the Python launcher are both removed (2026-11-01; history keeps them). The Python launcher's VM `rustbox` still has its data in `~/.local/share/amoeboid/rustbox`; the Rust runtime doesn't know it (no stream), so `vacuum_vm` refuses it: leave it, or remove that directory by hand.
 
 == How we work (operator preferences)
 
