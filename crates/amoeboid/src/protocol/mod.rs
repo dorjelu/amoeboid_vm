@@ -31,6 +31,56 @@ pub struct OperationId(Ulid);
 #[serde(transparent)]
 pub struct RuntimeId(Ulid);
 
+/// Position of an event within its operation's progress, from 1.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct EventSequence(std::num::NonZeroU32);
+
+impl EventSequence {
+    pub const FIRST: Self = Self(std::num::NonZeroU32::MIN);
+
+    /// The sequence of the event at `index` (from 0) of a progress log; `None` past `u32`.
+    #[must_use]
+    pub fn of_index(index: usize) -> Option<Self> {
+        u32::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_add(1))
+            .and_then(std::num::NonZeroU32::new)
+            .map(Self)
+    }
+
+    /// The index (from 0) this sequence has in a progress log.
+    #[must_use]
+    pub fn index(self) -> usize {
+        usize::try_from(self.0.get() - 1).unwrap_or(usize::MAX)
+    }
+}
+
+/// A step an operation has reached.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(tag = "operation", content = "step", rename_all = "snake_case")]
+pub enum ProgressEvent {
+    Start(crate::vm::StartStep),
+    Stop(StopStep),
+    Vacuum(VacuumProgress),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StopStep {
+    /// The guest was asked to power off; it is stopped by force after the grace period.
+    PoweringOff,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VacuumProgress {
+    StoppingVm,
+    TerminatingTwin,
+    EndingProcesses,
+    Retiring,
+}
+
 /// ULIDs on the wire are their 26-character Crockford base32 text, checked on decode.
 macro_rules! ulid_identifier {
     ($type:ident) => {
@@ -65,6 +115,12 @@ pub enum ClientFrame {
         operation: OperationId,
         body: RequestBody,
     },
+    /// Re-attach to an operation: its progress from `from` (all when `None`), then live, then
+    /// its reply. Answered with `runtime.operation.unknown` when the runtime doesn't know it.
+    Subscribe {
+        operation: OperationId,
+        from: Option<EventSequence>,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -82,6 +138,13 @@ pub enum ServerFrame {
     Reply {
         operation: OperationId,
         body: ReplyBody,
+    },
+    /// Progress of `operation`, sent before its reply and only once the step it reports is
+    /// durable.
+    Event {
+        operation: OperationId,
+        sequence: EventSequence,
+        event: ProgressEvent,
     },
     /// Answer to a `HandshakeStart` with another protocol version; ends the connection.
     /// Hint: `amoeboid daemon restart`.

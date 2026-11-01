@@ -21,7 +21,7 @@ use super::hypervisor::{Adoptee, BootPlan, HypervisorCommand, HypervisorObservat
 use super::local_qemu::{LocalQemu, LocalQemuSetup, Placement};
 use super::{
     Account, Backend, Generation, Incarnation, NixConfig, NixConfigRequest, SharesRequest,
-    StartRequest, VmSpec,
+    StartRequest, StartStep, VmSpec,
 };
 use crate::adapters::process::Exit;
 use crate::diagnostic::Report;
@@ -33,7 +33,7 @@ use crate::nonempty::NonEmpty;
 use crate::persistent::{
     Behaviour, ChildEnded, ChildPolicy, Effect, PersistentMessage, Unrecoverable,
 };
-use crate::protocol::OperationId;
+use crate::protocol::{OperationId, ProgressEvent, StopStep};
 use crate::runtime::paths::VmPaths;
 
 /// Marker type implementing [`Behaviour`] for one VM.
@@ -258,6 +258,11 @@ pub enum VmReport {
     },
     Unrecoverable {
         reason: Report,
+    },
+    /// An operation reached a step; sent with the event that records it.
+    Progress {
+        operation: OperationId,
+        event: crate::protocol::ProgressEvent,
     },
 }
 
@@ -699,8 +704,22 @@ fn start(
     };
     Effect::Persist {
         events,
-        then: vec![build],
+        then: vec![build, start_progress(operation, StartStep::Building)],
     }
+}
+
+fn start_progress(operation: OperationId, step: StartStep) -> VmOut {
+    VmOut::Root(VmReport::Progress {
+        operation,
+        event: ProgressEvent::Start(step),
+    })
+}
+
+fn powering_off(operation: OperationId) -> VmOut {
+    VmOut::Root(VmReport::Progress {
+        operation,
+        event: ProgressEvent::Stop(StopStep::PoweringOff),
+    })
 }
 
 fn on_observation(state: &VmTwinState, observation: VmObservation) -> Effect<VmEvent, VmOut> {
@@ -727,7 +746,10 @@ fn stop(state: &VmTwinState, operation: OperationId) -> Effect<VmEvent, VmOut> {
     match &state.vm {
         VmState::Running { generation, .. } => Effect::Persist {
             events: one(requested(*generation)),
-            then: vec![stop_machine(*generation, &state.vm)],
+            then: vec![
+                stop_machine(*generation, &state.vm),
+                powering_off(operation),
+            ],
         },
         VmState::Failed {
             generation,
@@ -735,7 +757,10 @@ fn stop(state: &VmTwinState, operation: OperationId) -> Effect<VmEvent, VmOut> {
             ..
         } if !leftovers.is_empty() => Effect::Persist {
             events: one(requested(*generation)),
-            then: vec![stop_machine(*generation, &state.vm)],
+            then: vec![
+                stop_machine(*generation, &state.vm),
+                powering_off(operation),
+            ],
         },
         VmState::Starting {
             operation: start,
@@ -754,12 +779,13 @@ fn stop(state: &VmTwinState, operation: OperationId) -> Effect<VmEvent, VmOut> {
                 then: vec![
                     done(*start, Err(reason)),
                     stop_machine(*generation, &state.vm),
+                    powering_off(operation),
                 ],
             }
         }
         VmState::Stopping { generation, .. } => Effect::Persist {
             events: one(requested(*generation)),
-            then: Vec::new(),
+            then: vec![powering_off(operation)],
         },
         VmState::Stopped { .. } | VmState::Failed { .. } => {
             Effect::Send(one(done(operation, Ok(VmOutcome::Stopped))))
@@ -825,11 +851,14 @@ fn builder(state: &VmTwinState, observation: BuilderObservation) -> Effect<VmEve
     match observation {
         BuilderObservation::Built { generation } => Effect::Persist {
             events: one(VmEvent::Built { generation }),
-            then: vec![VmOut::PrepareGuest {
-                generation,
-                spec: spec.clone(),
-                seed_own_config: *seed_own_config,
-            }],
+            then: vec![
+                VmOut::PrepareGuest {
+                    generation,
+                    spec: spec.clone(),
+                    seed_own_config: *seed_own_config,
+                },
+                start_progress(*operation, StartStep::PreparingGuest),
+            ],
         },
         BuilderObservation::BuildFailed { generation, reason } => {
             fail(*operation, generation, reason)
@@ -861,13 +890,16 @@ fn guest_vm(state: &VmTwinState, observation: GuestVmObservation) -> Effect<VmEv
             Some(incarnation),
         ) => Effect::Persist {
             events: one(VmEvent::GuestPrepared { generation, port }),
-            then: vec![VmOut::Boot {
-                generation,
-                incarnation,
-                shares: spec.shares.clone(),
-                port,
-                account: spec.account.clone(),
-            }],
+            then: vec![
+                VmOut::Boot {
+                    generation,
+                    incarnation,
+                    shares: spec.shares.clone(),
+                    port,
+                    account: spec.account.clone(),
+                },
+                start_progress(*operation, StartStep::Booting),
+            ],
         },
         (GuestVmObservation::PrepareFailed { reason, .. }, StartProgress::PreparingGuest, _) => {
             fail(*operation, generation, reason)
@@ -964,17 +996,21 @@ fn hypervisor(state: &VmTwinState, observation: HypervisorObservation) -> Effect
         (
             HypervisorObservation::MachineRunning { .. },
             VmState::Starting {
+                operation,
                 spec,
                 progress: StartProgress::Booting { port, .. },
                 ..
             },
         ) => Effect::Persist {
             events: one(VmEvent::MachineRunning { generation }),
-            then: vec![VmOut::AwaitSsh {
-                generation,
-                port: *port,
-                timeout_seconds: spec.boot_timeout_seconds,
-            }],
+            then: vec![
+                VmOut::AwaitSsh {
+                    generation,
+                    port: *port,
+                    timeout_seconds: spec.boot_timeout_seconds,
+                },
+                start_progress(*operation, StartStep::WaitingForSsh),
+            ],
         },
         (HypervisorObservation::BootFailed { reason, .. }, VmState::Starting { operation, .. }) => {
             fail(*operation, generation, reason)

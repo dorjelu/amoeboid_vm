@@ -8,11 +8,12 @@ use crate::domain::account::{GroupId, GuestHome, UserId};
 use crate::domain::path::AbsolutePath;
 use crate::domain::process::{BootId, LocalRole, ProcessId};
 
+/// Applies the effect; progress reports are left out of the messages (see [`progress_of`]).
 fn apply(
     state: VmTwinState,
     effect: Effect<VmEvent, VmOut>,
 ) -> (VmTwinState, Vec<VmEvent>, Vec<VmOut>) {
-    match effect {
+    let (state, events, outs) = match effect {
         Effect::None => (state, Vec::new(), Vec::new()),
         Effect::Send(outs) => (state, Vec::new(), outs.into_iter().collect()),
         Effect::Persist { events, then } => {
@@ -20,7 +21,35 @@ fn apply(
             let state = events.iter().fold(state, VmTwin::on_event);
             (state, events, then)
         }
-    }
+    };
+    let outs = outs
+        .into_iter()
+        .filter(|out| !matches!(out, VmOut::Root(VmReport::Progress { .. })))
+        .collect();
+    (state, events, outs)
+}
+
+/// The progress an effect reports, and whether it rides with persisted events.
+fn progress_of(effect: &Effect<VmEvent, VmOut>) -> (Vec<crate::protocol::ProgressEvent>, bool) {
+    let (outs, persisted): (Vec<&VmOut>, bool) = match effect {
+        Effect::None => (Vec::new(), false),
+        Effect::Send(outs) => (outs.iter().collect(), false),
+        Effect::Persist { then, .. } => (then.iter().collect(), true),
+    };
+    let events = outs
+        .into_iter()
+        .filter_map(|out| match out {
+            VmOut::Root(VmReport::Progress { event, .. }) => Some(*event),
+            VmOut::Build { .. }
+            | VmOut::PrepareGuest { .. }
+            | VmOut::Boot { .. }
+            | VmOut::AwaitSsh { .. }
+            | VmOut::StopMachine { .. }
+            | VmOut::Adopt { .. }
+            | VmOut::Root(_) => None,
+        })
+        .collect();
+    (events, persisted)
 }
 
 fn command(state: VmTwinState, command: VmCommand) -> (VmTwinState, Vec<VmEvent>, Vec<VmOut>) {
@@ -828,5 +857,57 @@ fn a_new_vm_is_created_from_the_base_and_an_existing_one_keeps_its_own_unless_gi
     assert_eq!(
         resolve_on(&existing, NixConfigRequest::Given(base.clone())),
         Ok((base, true))
+    );
+}
+
+#[test]
+fn each_step_of_a_start_and_a_stop_is_reported_with_the_event_that_records_it() {
+    use crate::protocol::{ProgressEvent, StopStep};
+    let (start, _) = start_command(NixConfig::Existing);
+    let state = VmTwin::initial();
+    let effect = VmTwin::on_command(&state, start);
+    assert_eq!(
+        progress_of(&effect),
+        (vec![ProgressEvent::Start(StartStep::Building)], true)
+    );
+    let (state, ..) = apply(state, effect);
+    let generation = Generation::FIRST;
+    let steps = [
+        (
+            VmObservation::Builder(BuilderObservation::Built { generation }),
+            StartStep::PreparingGuest,
+        ),
+        (
+            VmObservation::GuestVm(GuestVmObservation::Prepared {
+                generation,
+                port: port(),
+                host_key: hostkey(),
+            }),
+            StartStep::Booting,
+        ),
+        (
+            VmObservation::Hypervisor(HypervisorObservation::MachineRunning { generation }),
+            StartStep::WaitingForSsh,
+        ),
+    ];
+    let mut state = state;
+    for (observation, step) in steps {
+        let effect = VmTwin::on_observation(&state, observation);
+        assert_eq!(
+            progress_of(&effect),
+            (vec![ProgressEvent::Start(step)], true)
+        );
+        state = apply(state, effect).0;
+    }
+    let (running, _) = running();
+    let stop = VmTwin::on_command(
+        &running,
+        VmCommand::Stop {
+            operation: OperationId::mint(),
+        },
+    );
+    assert_eq!(
+        progress_of(&stop),
+        (vec![ProgressEvent::Stop(StopStep::PoweringOff)], true)
     );
 }

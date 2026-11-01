@@ -207,6 +207,26 @@ Two TOML files in `$XDG_CONFIG_HOME/amoeboid` (0001's `run_config.toml`, plus on
 * Linger: with `linger = true` (the default) `amoeboid-daemon` checks linger at start and enables it if off; it never disables it. A failure is logged and the runtime starts anyway.
 * Durations split by source: status and persist timeouts and the restart policy from the daemon file; boot timeout and powerdown grace from the run file, recorded in the VM's spec at start (a stop uses the grace of the start it stops); terminate grace, socket wait and vacuum graces only from the builder (`ProcessTiming`).
 
+== Protocol: progress, retries, re-attaching, cancelling
+
+Amends 0002 §Protocol.
+
+[source,rust]
+----
+enum ClientFrame { HandshakeStart { .. }, Request { operation, body }, Subscribe { operation, from: Option<EventSequence> } }
+enum ServerFrame { …, Event { operation, sequence: EventSequence, event: ProgressEvent } }
+RequestBody::Operation(OperationRequest::Cancel { target })   →   ReplyBody::Operation(OperationReply::Cancelled { target })
+enum ProgressEvent { Start(StartStep), Stop(StopStep), Vacuum(VacuumProgress) }
+----
+
+* **`Cancel` is a request, not a frame** (0002 listed it as a frame): it has its own operation id and a normal reply, `Cancelled { target }` or a typed refusal (`runtime.operation.unknown`, `runtime.operation.finished`, `runtime.operation.not_cancellable`). Only a start in progress can be cancelled: Root sends the twin `CancelStart { operation, start }`, the scoped form of a stop that cancels a start; the start's client gets `vm.cancelled`.
+* **Progress** is sent as `Event` frames to everyone attached to an operation, before its `Reply`. The twin sends a start's or a stop's progress in the follow-up messages of the event it reports (`StartRequested` → building, `Built` → preparing the guest, `GuestPrepared` → booting, `MachineRunning` → waiting for sshd, `StopRequested` → powering off), so a step is reported only once durable; Root reports a vacuum's steps.
+* **Operations table** in Root, replacing the per-operation waiters: per `OperationId`, the VM, the kind, the progress so far, the final reply once there is one, and the attached sessions. Kept in memory until 10 minutes after the operation finishes (swept every minute).
+* **Retries are idempotent** (0002's client-minted id as idempotency key): a `Request` with a known operation id attaches to it, replaying its progress and its reply, instead of running again.
+* **`Subscribe { operation, from }`** re-attaches while the runtime lives: progress from `from`, then live, then the reply. After a runtime restart the operation is unknown (`runtime.operation.unknown`); a start in flight then is recorded as `restarted_while_starting`, visible in status. Progress that survives a restart (rebuilt from the journal) is deferred.
+* The CLI prints progress and sends `Cancel` for its start on Ctrl-C.
+* Testing goes through the runtime and the library `Client`, not the CLI: the CLI only turns arguments into frames and frames into lines (`end_to_end` tests, stand-in runner and virtiofsd).
+
 == Order of the remaining work
 
 . Install the daemon units for real.

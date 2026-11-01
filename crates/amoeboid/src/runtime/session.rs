@@ -118,7 +118,10 @@ impl Actor for Session {
             }
             (
                 Phase::AwaitingHandshake,
-                SessionMessage::Inbound(ClientFrame::Request { operation, .. }),
+                SessionMessage::Inbound(
+                    ClientFrame::Request { operation, .. }
+                    | ClientFrame::Subscribe { operation, .. },
+                ),
             ) => (
                 Some(refused(Some(operation), Refusal::HandshakeRequired)),
                 true,
@@ -134,6 +137,17 @@ impl Actor for Session {
                 };
                 if state.root.cast(request).is_err() {
                     tracing::warn!(%operation, "request dropped: root stopped");
+                }
+                (None, false)
+            }
+            (Phase::Open, SessionMessage::Inbound(ClientFrame::Subscribe { operation, from })) => {
+                let subscribe = RootMessage::Subscribe {
+                    operation,
+                    from,
+                    reply_to: myself.get_derived(),
+                };
+                if state.root.cast(subscribe).is_err() {
+                    tracing::warn!(%operation, "subscription dropped: root stopped");
                 }
                 (None, false)
             }
