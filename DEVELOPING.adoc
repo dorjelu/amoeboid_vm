@@ -1,0 +1,307 @@
+= amoeboid: developer guide
+:toc: left
+:toclevels: 2
+
+How the Rust runtime is built and why. Operator-facing behaviour belongs in `README.adoc`; design decisions and their reasons are recorded in `decisions/` (0001, amended by 0002, amended by 0003; a later record wins). This guide describes the code as it is.
+
+== Gist
+
+amoeboid runs NixOS microVMs (microvm.nix, qemu, one virtiofsd per shared directory) for coding agents, against host directories the operator chooses. The guest is untrusted.
+
+A per-user runtime owns every VM. It is an actor system (ractor) started by systemd socket activation; the CLI is only a client that turns arguments into protocol frames and frames into lines. VMs outlive the runtime: each process runs in its own systemd scope, and a restarted runtime adopts them by process identity. Each VM's history is an event stream in a SQLite journal.
+
+== Layout
+
+[source]
+----
+crates/
+  amoeboid/          library: the whole control plane (embeddable; tests live here)
+  amoeboid-daemon/   binary: hosts a runtime under socket activation; --journal; linger
+  amoeboid-cli/      binary `amoeboid`: client only (never hosts a runtime)
+nix/                 the bundled NixOS flake, embedded into the library (vm::bundled)
+decisions/           decision records
+tools/cov-gate.jq    branch-coverage gate for pure modules
+deny.toml            dependency policy
+mise.toml            tasks: test, test-thorough, lint, fmt, cov, deny, install
+----
+
+Library modules, roughly from the bottom up:
+
+[cols="1,3"]
+|===
+|`domain/` |refined values: `VmName`, `AbsolutePath`, `RelativePath`, `HostDirectory`, `Shares`, account, ports, process identity and roles, nonce, lifecycle (`Generation`, `Incarnation`)
+|`plan/` |pure construction: argv (`nix_build`, `virtiofsd`, `runner`, `ssh_keygen`, `ssh`), qemu extra arguments, generated files (`mounts`, `host.nix`, `known_hosts`), systemd units; byte-exact output checked against `tests/golden`
+|`config/` |`run_config.toml` and `daemon_config.toml`: decode (every problem at once), canonical encode, load
+|`clock`, `nonempty`, `diagnostic` |injected wall time; a non-empty list; the `Diagnostic` trait and `Report`
+|`adapters/` |effects as free functions: `process` (spawn into scopes, identify, pidfd signal and watch, nonce search), `files`, `guest` (writes into guest-writable trees), `ssh`, `nix`, `qmp`
+|`journal/` |the journal actor and its stores (SQLite, memory)
+|`persistent/` |the generic event-sourced actor: `Behaviour`, the pure mode machine (`machine::step`)
+|`protocol/` |frames and the codec
+|`vm/` |the VM subtree: twin, Builder, GuestVm, hypervisor protocol, LocalQemu, vacuum, bundled config
+|`runtime/` |Root, MachineSupervisor, operations table, listener and sessions, quarantine records, paths, lock, process timing
+|`client` |the library client: connect, handshake, `request`, `request_as`, `subscribe`
+|`end_to_end` |end-to-end tests (test builds only)
+|===
+
+== Runtime topology
+
+[source]
+----
+amoeboid-daemon ─ Runtime::start: daemon.lock (flock) ─ socket ─ Root
+Root (plain actor; registry, routing, operations table)
+├── Journal             essential   single SQLite connection
+├── Listener            essential   accept loop ─▶ Session × client (unlinked)
+└── MachineSupervisor   essential   one-for-one, per-VM restart budget
+     └── VmTwin × name  Persistent<VmTwin>, stream vm/<name>: the VM's digital twin
+          ├── Builder      host.nix, the VM's Nix config, nix build
+          ├── GuestVm      host key, guest files, home files, port, sshd wait
+          └── LocalQemu    the hypervisor backend: virtiofsd × shares + qemu, watchers, stop
+----
+
+* *Essential* children end the runtime when they end; systemd (`Restart=on-failure`) brings it back and VMs survive. A twin never ends the runtime.
+* The twin and its three children are one restart unit: any child's end fails the twin (`ChildPolicy::Escalate`), and the restarted twin rebuilds everything from its stream. Children are named `<twin>/<role>@<twin actor id>` so a respawn never collides with names a dying incarnation still holds.
+* Root knows twins only through the MachineSupervisor's reports (`Up`, `Restarting`, `Exhausted`, `Terminated`) and routes by `Route::{Spawning { held }, Up, Restarting}`.
+
+=== Messaging rules
+
+* Tell only. An actor never awaits another actor; awaiting I/O inside a handler (SQLite, sockets, QMP) is allowed. Replies carry correlation ids; timeouts are `send_after` messages.
+* Cross-type replies use ractor's `DerivedActorRef`; the receiving enum has exactly one wrapper variant per derived type, so the conversion back is total (`get_derived` panics otherwise).
+* Domain errors are messages. A handler returns `Err` only to fail the actor on purpose (a persistent actor's `Fatal`).
+* A failing actor's error reaches its parent unchanged in `SupervisionEvent::ActorFailed`, so a supervisor can downcast it (the MachineSupervisor does).
+
+== Persistence
+
+=== Journal
+
+One actor owns the one SQLite connection (`JournalStore::{Sqlite(path), Memory}`; WAL, `synchronous=NORMAL`, schema in `user_version`, file `0600`, opened `O_NOFOLLOW`).
+
+[source,sql]
+----
+events     (persistence_id, sequence, payload, at)   -- one stream per persistent actor, positions from 1
+tombstones (persistence_id, through, at)             -- events at or below `through` are retired
+----
+
+* An append must start at the stream's next position (`last + 1`); anything else is `PersistFailed { Conflict }`: the writer is stale. This is the writer fence.
+* `Retire` writes a tombstone at the stream's last position: retired events are kept but neither replayed nor listed. A replay returns `Replay { events, last }` where `last` includes retired events, so a reused name continues its stream after the tombstone.
+* `at` is stamped by the journal from the injected `Clock`.
+* Streams: `vm/<name>` (the twin's) and `quarantine/<name>` (Root's records). The listing of `vm/*` is the registry.
+
+=== Persistent actors
+
+A `Behaviour` supplies pure handlers in the style of Akka's `EventSourcedBehavior`: `on_command`, `on_observation`, `on_event` (total; also run in replay), `on_recovered`, `reconciled`, `refuse`, `on_unrecoverable`, `child_ended`, and `send`, the one effect. Handlers return an `Effect::{None, Persist { events, then }, Send}`: messages in `then` go out only after the events are durable.
+
+[source]
+----
+Recovering ─Replayed─▶ fold on_event ─▶ on_recovered ─▶ Reconciling ─reconciled()─▶ Ready
+Ready/Reconciling ─Persist─▶ Persisting ─Persisted─▶ fold, send `then`, resume
+replay store error, persist conflict or timeout ─▶ Fatal: the actor fails, its supervisor restarts it
+undecodable event or unknown event version ─▶ Unrecoverable (terminal; refuses commands, reports once)
+----
+
+Commands are stashed while not `Ready`; observations run while reconciling and are held while persisting; observations arriving while recovering belong to a previous incarnation and are dropped. The mode machine is the pure `persistent::machine::step`; the actor only executes its actions.
+
+=== The twin
+
+The twin is the only persistent actor in a VM subtree; its children report observations and keep no streams. Its state: `created` (incarnation, backend), the latest generation, the VM state (`Stopped`, `Starting { progress }`, `Running`, `Failed { leftovers }`, `Stopping`), and the last start's spec.
+
+* A start request (`StartRequest`) carries what the operator gave or the VM's own (`SharesRequest`, `NixConfigRequest`: `Given` or `OwnElse`); the twin resolves it into the persisted `VmSpec`, because only it knows whether the VM is new and what it had.
+* Every child message carries the generation; older ones are dropped.
+* Processes are recorded as `ProcessStarted { role, identity }`. Identity is process id, start time (clock ticks since boot) and boot id; not the executable, because the runner script execs qemu.
+* A spawn's nonce, `AMOEBOID_NONCE=<vm>/<incarnation>/<generation>/<role>`, is deterministic from the twin's history, so a spawn whose record was lost is found by scanning processes. `vacuum_vm` finds a VM's processes by the prefix `<vm>/`.
+
+== VM lifecycle
+
+=== Start
+
+[source]
+----
+Root reads run_config.toml, checks shares against the world, builds a StartRequest
+twin: resolve ─▶ persist StartRequested ─▶ Builder: host.nix, VM's Nix config (own, preset, directory), nix build
+     ─Built─▶ GuestVm: host key, guest files (mounts, hostname, ssh key), config copies, home files, port
+     ─GuestPrepared─▶ LocalQemu Boot: clear runtime dir, qemu args, virtiofsd × shares (scoped), wait for sockets, qemu (scoped)
+     ─MachineRunning─▶ GuestVm AwaitSsh (banner on the forwarded port) ─SshReady─▶ Ready: reply Started
+----
+
+Each step's progress event goes out with the event that records it. The Builder goes before GuestVm because guest preparation copies the config the Builder creates.
+
+=== Stop
+
+QMP `system_powerdown`, then `SIGTERM` after the powerdown grace (from the start's spec), then `SIGKILL` after the terminate grace; every signal goes through a verified pidfd. A stop of a start in progress cancels it; a stop of a failed start takes down its leftovers.
+
+=== Adoption
+
+On recovery a twin whose VM is `Running` sends `Adopt` with each process's identity; LocalQemu checks each (pidfd plus start time) and reports `Adopted` or `Lost`, which the twin persists before deciding. A start in progress at recovery fails as `restarted_while_starting`; a stop in progress is carried on. Adopted processes are watched by a blocking `poll` on their pidfd with a cancel flag, so a running VM never holds the runtime's shutdown.
+
+=== VMs outlive the runtime
+
+Every VM process runs in its own transient scope, `systemd-run --user --scope --collect --slice=amoeboid.slice --unit=amoeboid-<vm>-<role>` (a duplicate spawn fails at systemd-run: the unit name is fixed), in its own process group, inheriting no runtime fd (`O_CLOEXEC` everywhere). Tests use `Placement::Direct` (plain children).
+
+== Supervision and quarantine
+
+The MachineSupervisor (ours, over ractor links; `ractor-supervisor` is not used) runs one twin per VM:
+
+[source]
+----
+Spawning ─▶ Up ─failed, budget left─▶ Restarting{attempt} ─backoff─▶ Spawning
+Up ─budget spent─▶ Exhausted (Root quarantines: SuspiciousHalt)      Up ─Terminate─▶ Terminated
+----
+
+* A failure is classified by downcasting `persistent::machine::Fatal` (`Conflict` restarts at once; journal errors, escalated children, spawn failures and anything else after backoff). The policy is the pure `decide`, on tokio's monotonic clock; its numbers come from `daemon_config.toml`.
+* Quarantine records (`quarantine/<name>`) carry a cause: `Unreplayable` (the twin's stream can't be replayed; only `vacuum_vm` removes it) or `SuspiciousHalt` (budget spent; `release_vm` retires the record and spawns the twin with a fresh budget). Root loads the records at start and spawns no twin for a quarantined VM.
+* `vacuum_vm`: graceful stop through a twin that is up, then `Terminate`, then the vacuum task (ends every process carrying the VM's nonce prefix, removes the runtime and state directories), then retires `vm/<name>` and, last, `quarantine/<name>`. Only names Root knows are vacuumed.
+
+== Protocol
+
+Frames are length-prefixed JSON (4-byte big-endian, at most 1 MiB), one enum per direction; the protocol version must match exactly; the socket is same-user (`0600` in a `0700` directory).
+
+[source]
+----
+ClientFrame: HandshakeStart | Request { operation, body } | Subscribe { operation, from }
+ServerFrame: HandshakeAccepted | HandshakeRejected | Event { operation, sequence, event } | Reply { operation, body } | Refused
+RequestBody: Runtime(Ping) | Vm(Start | Stop | Status | Vacuum | Release) | Operation(Cancel { target })
+----
+
+* `operation` is minted by the client (a ULID) and is the idempotency key: a request repeating a known id attaches to it (its progress, then its reply) instead of running again.
+* Root's operations table keeps, per operation, the VM, the kind, the progress log, the reply and the attached sessions; finished operations are dropped 10 minutes after they finish. `Subscribe { from }` re-attaches; after a runtime restart an operation is unknown (`runtime.operation.unknown`).
+* `Cancel` is a request: only a start in progress can be cancelled (the twin's `CancelStart`); unknown, finished and other operations get typed refusals.
+* Status is answered tell-only: Root asks the twins that are up, answers restarting and quarantined VMs itself, and replies when all are in or the status timeout passes (`Unknown` for a twin that didn't answer).
+
+== Configuration
+
+[cols="1,2,2"]
+|===
+| |`run_config.toml` |`daemon_config.toml`
+|Read |by Root at every start |once, when the runtime starts
+|Keys |`guest.user`, `guest.home_files`, `new_vm.base_nix_config`, `new_vm.default_shares`, `ssh.port`, `timeouts.boot_seconds`, `timeouts.powerdown_seconds` |`linger`, `journal.path`, `restart.*`, `timeouts.status_seconds`, `timeouts.persist_seconds`
+|Bad file |the start fails, every problem listed |the runtime refuses to start
+|===
+
+* Both live in `$XDG_CONFIG_HOME/amoeboid` (`ConfigPaths`); absent means defaults. Each is a bijection with its value: decode then encode gives the value back, and encoding is canonical. Paths under the home are written `~/…`.
+* Presets are directories in `nix_presets/`; `default` is seeded from the bundled config (by `daemon install`, or by the Builder when a start needs it).
+* Journal location, first that is given: the builder (`JournalLocation::At`), `amoeboid-daemon --journal`, `journal.path`, then `$XDG_DATA_HOME/amoeboid/journal.sqlite`; never inside a VM's directory.
+* Time: wall time only through `Clock` (journal stamps); monotonic time and timers are tokio's (tests pause and advance it); process-level waits are `ProcessTiming`, set by whoever builds the runtime.
+
+=== Adding a key
+
+Add it to the value type in `config/run.rs` or `config/daemon.rs`, to `decode` (with its range and a problem message) and to `encode`, extend the strategies in `config/tests.rs` so the bijection property covers it, and document it in README.
+
+== Files
+
+[source]
+----
+$XDG_DATA_HOME/amoeboid/        daemon.lock, journal.sqlite, <vm>/
+  <vm>/vm                       nix build out-link: runner/bin/microvm-run, virtiofsd/bin/virtiofsd
+  <vm>/nix, host.nix            the VM's own Nix config and its `host` flake input
+  <vm>/guest/                   GUEST-WRITABLE: state share (mounts, hostname, ssh_host_ed25519_key, home/)
+  <vm>/ssh/                     host key pair, known_hosts
+  <vm>/build.log, virtiofsd.log, console.log
+$XDG_RUNTIME_DIR/amoeboid/      runtime.sock, <vm>/ (control.sock, *.sock, amoeboid-qemu-args)
+$XDG_CONFIG_HOME/amoeboid/      run_config.toml, daemon_config.toml, nix_presets/<name>/
+~/.config/systemd/user/         amoeboid.socket, amoeboid.service
+----
+
+== Nix side
+
+`nix/` is a flake with two layers: `base.nix` is plumbing the runtime depends on (shares, extra-args script, QMP socket, account, home bind mount, `amoeboid-mounts.service`, sshd); `recipe.nix` is content (packages, services, sizing) operators edit. The `host` input is overridden per start with `<data>/<vm>/host.nix`. Bundled changes reach only new presets and VMs.
+
+=== Rust ↔ Nix coupling
+
+Nothing checks these at build time: a rename on one side must be mirrored on the other.
+
+[cols="2,2,2"]
+|===
+|Contract |Rust |Nix
+
+|QMP socket `control.sock` |`VmPaths::control_socket` |`microvm.socket`
+|fixed shares: tag `ro-store` / socket `ro-store.sock`; tag `amoeboid` / socket `state.sock` |`plan::share::virtiofs_shares` |`microvm.shares`
+|requested shares: tag `dN` (from `d1`), socket `dN.sock`, chardev `amoN` |`plan::share::tag`, `plan::qemu::arguments` |mounted by tag from `mounts`
+|extra qemu arguments in `amoeboid-qemu-args` (runner's cwd), word-split |`VmPaths::qemu_arguments`, `plan::qemu` |`microvm.extraArgsScript`
+|state share at `/mnt/amoeboid` |`domain::account` (reserved homes) |`state` in `base.nix`
+|`mounts`: `tag\tmode\tpath`, parents first |`plan::files::mounts_table`, `Shares` order |`amoeboid-mounts.service`
+|`hostname`, `ssh_host_ed25519_key`, `term` (always removed) |`vm::guest_vm::prepare` |`amoeboid-mounts.service`
+|guest home = `<state>/home` at the host home's path |`plan::files::host_module`, GuestVm |`fileSystems.${home}`
+|build outputs `runner/bin/microvm-run`, `virtiofsd/bin/virtiofsd` |`VmPaths::runner`, `VmPaths::virtiofsd` |`packages.default` linkFarm
+|guest sshd on port 22 |`plan::GUEST_SSH_PORT` |`services.openssh`
+|===
+
+== Sensitive points
+
+Guest-writable writes::
+Everything under `<vm>/guest/` is written only through `adapters::guest` (`GuestTree`): directories are walked with `openat2` and `RESOLVE_NO_SYMLINKS`/`BENEATH`, files are replaced, never written through. A plain write there would let the guest redirect it onto any host file.
+
+Reading back::
+Never read guest-writable files to decide anything.
+
+Process signalling::
+Only through a pidfd opened and then checked against the recorded identity (process id, start time, boot id); a zombie counts as gone.
+
+ssh::
+`plan::argv::ssh` is the only builder of ssh argv: the VM's key pinned under `HostKeyAlias=amoeboid-<vm>` with its own known_hosts and `StrictHostKeyChecking=yes`, forwarding off. The command `start` prints is built by it.
+
+Generated Nix::
+Anything interpolated into `host.nix` is validated or escaped (`plan::files::nix_string`).
+
+Shares::
+`Shares::validate` refuses duplicates, non-directories and anything covering the home, keeps at most 24 (PCI slots), orders parents first; paths are UTF-8 without control characters (they go into the tab-separated `mounts`). Read-only is enforced by `virtiofsd --readonly` on the host, never by the guest.
+
+qemu arguments::
+Word-split by the runner: no argument may contain whitespace.
+
+Journal::
+Never inside a VM's directory; created `0600`; one connection.
+
+== Code style
+
+* No `unsafe`, no `unwrap`/`expect`/`panic!` outside tests (tests may unwrap, not `panic!`), no wildcard enum arms, no `print!` outside the CLI's `render` module; clippy pedantic with `-D warnings`.
+* Make impossible states unrepresentable: refined newtypes with private fields and a validating `parse`, `#[serde(try_from)]` so no decoded value skips refinement; no unchecked constructors.
+* Polymorphism through enums and `match`; test doubles are enum variants (`BuildCommand::Scripted`, `Placement::Direct`) or actors speaking the same messages.
+* No abbreviations in identifiers, wire fields, SQL columns or docs (`OperationId`, `message`, `error`).
+* Every operator-facing error implements `Diagnostic` (stable dotted `code`, lowercase `message` without a trailing period, imperative `hint`) and is listed in the catalogue test in `diagnostic.rs`, which checks codes are unique and messages well-formed.
+* Raw `Path`/`PathBuf`/`OsString` only in boundary modules that allow `clippy::disallowed_types` with a reason.
+* CLI: long options only, no abbreviations; help text written for the operator.
+* Comments say why or name a coupling; explain actor design in Akka/OTP terms.
+
+== Testing
+
+[cols="1,3"]
+|===
+|Unit and property |next to the code; proptest for codecs and validators (config bijection, frames, names); goldens in `crates/amoeboid/tests/golden`
+|Actors |driven with `testing::probe` (an actor forwarding to a channel); the twin's handlers are driven directly without actors (`vm/twin_tests.rs`)
+|End to end |`end_to_end.rs`: a runtime (in-process, SQLite) driven through the library `Client`, real processes as plain children, a scripted build installing stand-ins: virtiofsd creates its socket; the runner (`python3`) answers an SSH banner on the forwarded port and QMP on `control.sock`, exiting on powerdown. The daemon, not the CLI, is the test surface.
+|Paused time |`#[tokio::test(start_paused = true)]` for timers and budgets, only without real processes or I/O (an idle paused runtime auto-advances)
+|Coverage |`mise run cov`: pure modules (domain, plan, config, `persistent/machine.rs`) must reach 100 % branches
+|Dependencies |`mise run deny`: advisories, licences, banned crates, crates.io only
+|===
+
+Pitfalls:
+
+* A fork in a parallel test holds copies of every fd until its child execs, keeping a dropped `daemon.lock` alive: `testing::forks()` is held by `process::spawn` around each fork in test builds and by tests across a runtime stop and restart; `testing::executable` writes scripts under it (avoids ETXTBSY).
+* Don't assert racy facts (a free port staying free); exit notifications arrive in any order, so decisions check liveness.
+* Test VMs that spawn marked processes need unique names: a vacuum test's nonce scan would reach another test's processes.
+* Tests in pure modules count toward the coverage gate (no `let … else` or guards there); a generic function's copies don't add up, so branchy logic goes in a non-generic core.
+
+=== Checking against a real VM
+
+Changes to `nix/`, processes or the VM lifecycle need a run against a real VM. The scratch daemon must use the real `XDG_RUNTIME_DIR` (`systemd-run --user` needs it), so stop the installed units first:
+
+[source,sh]
+----
+systemctl --user stop amoeboid.socket amoeboid.service; rm -f $XDG_RUNTIME_DIR/amoeboid/runtime.sock
+S=/some/scratch; mkdir -p $S/data $S/project $S/config/amoeboid
+printf 'linger = false\n' > $S/config/amoeboid/daemon_config.toml
+printf '[new_vm]\ndefault_shares = ["%s:rw"]\n' $S/project > $S/config/amoeboid/run_config.toml
+export XDG_DATA_HOME=$S/data XDG_CONFIG_HOME=$S/config AMOEBOID_LOG=info
+setsid systemd-socket-activate -l $XDG_RUNTIME_DIR/amoeboid/runtime.sock -E XDG_DATA_HOME -E XDG_CONFIG_HOME \
+  -E XDG_RUNTIME_DIR -E HOME -E USER -E PATH -E AMOEBOID_LOG ./target/debug/amoeboid-daemon >> $S/daemon.log 2>&1 &
+./target/debug/amoeboid start --name scratch   # status, the printed ssh command, stop, vacuum_vm
+# adoption: SIGKILL the daemon, start the activator again (it exits with the daemon), check status
+# cleanup: vacuum_vm, kill daemon and activator, rm -rf $S, systemctl --user start amoeboid.socket
+----
+
+To build a VM from the checkout's flake instead of a preset: `amoeboid start --base-nix-config ./nix`.
+
+== Workflow
+
+* Gates before every commit, chained so a failure stops the commit: `mise run test`, then `mise run lint`, then `git commit`. Check `git status` first: a commit takes everything staged. Loop tests touching processes or timing several times before committing.
+* One logical change per commit; imperative subject; a technical body (what, why, affected messages, files, compatibility). Decisions go into a decision record in the same change.
+* `mise run install` installs both binaries into `~/.cargo/bin` and restarts the runtime; `amoeboid daemon install` writes the systemd units, `daemon_config.toml` and the `default` preset when absent.
