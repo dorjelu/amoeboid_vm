@@ -6,6 +6,8 @@ pub mod clock;
 pub mod config;
 pub mod diagnostic;
 pub mod domain;
+#[cfg(test)]
+mod end_to_end;
 pub mod journal;
 pub mod nonempty;
 pub mod persistent;
