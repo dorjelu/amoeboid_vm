@@ -63,7 +63,7 @@ while True:
         command = json.loads(line).get("execute")
         stream.write('{"return": {}}\n')
         stream.flush()
-        if command == "system_powerdown":
+        if command == "system_powerdown" and not os.path.exists(IGNORE_POWERDOWN):
             os._exit(0)
 "#;
 
@@ -96,7 +96,16 @@ impl Installation {
                 stand_ins.as_path().join("runner.py").display()
             ),
         );
-        std::fs::write(stand_ins.as_path().join("runner.py"), RUNNER).unwrap();
+        // A guest that ignores powerdown when this file exists (a stop then waits its grace).
+        let ignore = stand_ins.as_path().join("ignore-powerdown");
+        std::fs::write(
+            stand_ins.as_path().join("runner.py"),
+            format!(
+                "IGNORE_POWERDOWN = {:?}\n{RUNNER}",
+                ignore.display().to_string()
+            ),
+        )
+        .unwrap();
         // Every start shares the project by default and waits briefly for the stand-in sshd.
         std::fs::write(
             config.run_config().as_path(),
@@ -117,21 +126,31 @@ impl Installation {
     }
 
     /// The build installs the stand-ins where Nix's out-link would hold the runner and
-    /// virtiofsd (the build runs in the VM's state directory).
-    fn build(&self) -> BuildCommand {
+    /// virtiofsd (the build runs in the VM's state directory), after `seconds`.
+    fn build(&self, seconds: u32) -> BuildCommand {
         let stand_ins = self.stand_ins.display();
         BuildCommand::Scripted(Argv::for_tests(&[
             "sh",
             "-c",
             &format!(
-                "mkdir -p vm/runner/bin vm/virtiofsd/bin && \
+                "sleep {seconds} && mkdir -p vm/runner/bin vm/virtiofsd/bin && \
                  cp {stand_ins}/runner vm/runner/bin/microvm-run && \
                  cp {stand_ins}/virtiofsd vm/virtiofsd/bin/virtiofsd"
             ),
         ]))
     }
 
+    /// From now on, guests ignore the powerdown request.
+    pub(crate) fn ignore_powerdown(&self) {
+        std::fs::write(self.stand_ins.as_path().join("ignore-powerdown"), "").unwrap();
+    }
+
     pub(crate) async fn start(&self) -> Runtime {
+        self.start_building_for(0).await
+    }
+
+    /// A runtime whose builds take `seconds`.
+    pub(crate) async fn start_building_for(&self, seconds: u32) -> Runtime {
         Runtime::start(RuntimeConfig {
             paths: self.paths.clone(),
             config: self.config.clone(),
@@ -141,7 +160,7 @@ impl Installation {
             version: "test".into(),
             account: Account::of_this_process(std::env::var_os).unwrap(),
             vm_defaults: VmDefaults {
-                build: self.build(),
+                build: self.build(seconds),
                 placement: Placement::Direct,
                 process: ProcessTiming::quick(),
             },
@@ -186,7 +205,10 @@ pub(crate) async fn condition(client: &mut Client, name: &str) -> Option<VmCondi
     .await
     {
         ReplyBody::Vm(VmReply::Status { vms }) => vms.into_iter().next().map(|vm| vm.condition),
-        ReplyBody::Runtime(_) | ReplyBody::Vm(_) | ReplyBody::Failed(_) => None,
+        ReplyBody::Runtime(_)
+        | ReplyBody::Vm(_)
+        | ReplyBody::Operation(_)
+        | ReplyBody::Failed(_) => None,
     }
 }
 
@@ -475,6 +497,106 @@ async fn a_start_reports_its_steps_in_order_and_a_retry_or_subscription_replays_
     assert!(
         matches!(stopped, ReplyBody::Vm(VmReply::Stopped { .. })),
         "{stopped:?}"
+    );
+    runtime.stop();
+    runtime.wait().await;
+}
+
+fn cancel(target: crate::protocol::OperationId) -> RequestBody {
+    RequestBody::Operation(crate::protocol::OperationRequest::Cancel { target })
+}
+
+#[tokio::test]
+async fn cancelling_a_start_in_progress_stops_it_and_answers_both_clients() {
+    use crate::protocol::{OperationId, OperationReply};
+    let installation = Installation::new();
+    let runtime = installation.start_building_for(3).await;
+    let target = OperationId::mint();
+    let mut starter = installation.client().await;
+    let pending = tokio::spawn(async move {
+        starter
+            .request_as(
+                target,
+                RequestBody::Vm(VmRequest::Start {
+                    name: vm("doomed"),
+                    shares: None,
+                    nix_config: None,
+                }),
+                |_, _| {},
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut client = installation.client().await;
+    let cancelled = client.request(cancel(target)).await.unwrap();
+    assert_eq!(
+        cancelled,
+        ReplyBody::Operation(OperationReply::Cancelled { target })
+    );
+    let outcome = pending.await.unwrap().unwrap();
+    assert!(
+        matches!(&outcome, ReplyBody::Failed(report) if report.code == "vm.cancelled"),
+        "{outcome:?}"
+    );
+    let after = condition(&mut client, "doomed").await;
+    assert!(
+        !matches!(
+            after,
+            Some(VmCondition::Running { .. } | VmCondition::Starting { .. })
+        ),
+        "{after:?}"
+    );
+    // Cancelling again: the start has finished.
+    let again = client.request(cancel(target)).await.unwrap();
+    assert!(
+        matches!(&again, ReplyBody::Failed(report) if report.code == "runtime.operation.finished"),
+        "{again:?}"
+    );
+    runtime.stop();
+    runtime.wait().await;
+}
+
+#[tokio::test]
+async fn only_a_start_can_be_cancelled_and_only_a_known_operation() {
+    use crate::protocol::OperationId;
+    let installation = Installation::new();
+    let runtime = installation.start().await;
+    let mut client = installation.client().await;
+    let unknown = client.request(cancel(OperationId::mint())).await.unwrap();
+    assert!(
+        matches!(&unknown, ReplyBody::Failed(report) if report.code == "runtime.operation.unknown"),
+        "{unknown:?}"
+    );
+    let started = start(&mut client, "patient").await;
+    assert!(
+        matches!(started, ReplyBody::Vm(VmReply::Started { .. })),
+        "{started:?}"
+    );
+    // A stop that waits out its grace, because the guest ignores powerdown.
+    installation.ignore_powerdown();
+    let stop = OperationId::mint();
+    let mut stopper = installation.client().await;
+    let pending = tokio::spawn(async move {
+        stopper
+            .request_as(
+                stop,
+                RequestBody::Vm(VmRequest::Stop {
+                    name: vm("patient"),
+                }),
+                |_, _| {},
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let refused = client.request(cancel(stop)).await.unwrap();
+    assert!(
+        matches!(&refused, ReplyBody::Failed(report) if report.code == "runtime.operation.not_cancellable"),
+        "{refused:?}"
+    );
+    let outcome = pending.await.unwrap().unwrap();
+    assert!(
+        matches!(outcome, ReplyBody::Vm(VmReply::Stopped { .. })),
+        "{outcome:?}"
     );
     runtime.stop();
     runtime.wait().await;

@@ -141,7 +141,7 @@ async fn run(command: Command) -> Result<(), Report> {
                     Ok(())
                 }
                 ReplyBody::Failed(failure) => Err(failure),
-                other @ ReplyBody::Vm(_) => Err(unexpected(&other)),
+                other @ (ReplyBody::Vm(_) | ReplyBody::Operation(_)) => Err(unexpected(&other)),
             }
         }
         Command::Config {
@@ -211,6 +211,7 @@ async fn run(command: Command) -> Result<(), Report> {
                 }
                 ReplyBody::Failed(failure) => Err(failure),
                 other @ (ReplyBody::Runtime(_)
+                | ReplyBody::Operation(_)
                 | ReplyBody::Vm(
                     VmReply::Stopped { .. }
                     | VmReply::Status { .. }
@@ -233,6 +234,7 @@ async fn stop(paths: &RuntimePaths, name: String) -> Result<(), Report> {
         }
         ReplyBody::Failed(failure) => Err(failure),
         other @ (ReplyBody::Runtime(_)
+        | ReplyBody::Operation(_)
         | ReplyBody::Vm(
             VmReply::Started { .. }
             | VmReply::Status { .. }
@@ -254,6 +256,7 @@ async fn release(paths: &RuntimePaths, name: String) -> Result<(), Report> {
         }
         ReplyBody::Failed(failure) => Err(failure),
         other @ (ReplyBody::Runtime(_)
+        | ReplyBody::Operation(_)
         | ReplyBody::Vm(
             VmReply::Started { .. }
             | VmReply::Stopped { .. }
@@ -274,6 +277,7 @@ async fn vacuum(paths: &RuntimePaths, name: String) -> Result<(), Report> {
         }
         ReplyBody::Failed(failure) => Err(failure),
         other @ (ReplyBody::Runtime(_)
+        | ReplyBody::Operation(_)
         | ReplyBody::Vm(
             VmReply::Started { .. }
             | VmReply::Stopped { .. }
@@ -305,6 +309,7 @@ async fn status(paths: &RuntimePaths, name: Option<String>) -> Result<(), Report
         }
         ReplyBody::Failed(failure) => Err(failure),
         other @ (ReplyBody::Runtime(_)
+        | ReplyBody::Operation(_)
         | ReplyBody::Vm(
             VmReply::Started { .. }
             | VmReply::Stopped { .. }

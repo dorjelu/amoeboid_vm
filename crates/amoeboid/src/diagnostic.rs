@@ -94,6 +94,16 @@ mod tests {
             }),
             Box::new(RegistryError::NotReleasable(work())),
             Box::new(RegistryError::NotQuarantined(work())),
+            Box::new(RegistryError::UnknownOperation(
+                crate::protocol::OperationId::mint(),
+            )),
+            Box::new(RegistryError::OperationFinished(
+                crate::protocol::OperationId::mint(),
+            )),
+            Box::new(RegistryError::NotCancellable(
+                crate::protocol::OperationId::mint(),
+            )),
+            Box::new(crate::vm::twin::TwinError::StartNotInProgress),
             Box::new(Fatal::Replay(crate::journal::tests_support::store_error(
                 "x",
             ))),

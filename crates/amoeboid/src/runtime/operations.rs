@@ -21,6 +21,10 @@ pub enum OperationKind {
     Stop,
     Vacuum,
     Release,
+    /// Cancelling the start `target`.
+    Cancel {
+        target: OperationId,
+    },
 }
 
 pub struct Operation {
@@ -145,14 +149,16 @@ impl Operations {
         entry.finished = Some(now);
     }
 
-    /// Unfinished operations of `vm` of one of `kinds`.
+    /// Unfinished operations of `vm` whose kind `wanted` accepts.
     #[must_use]
-    pub fn unfinished(&self, vm: &VmName, kinds: &[OperationKind]) -> Vec<OperationId> {
+    pub fn unfinished(
+        &self,
+        vm: &VmName,
+        wanted: impl Fn(OperationKind) -> bool,
+    ) -> Vec<OperationId> {
         self.table
             .iter()
-            .filter(|(_, entry)| {
-                entry.outcome.is_none() && entry.vm == *vm && kinds.contains(&entry.kind)
-            })
+            .filter(|(_, entry)| entry.outcome.is_none() && entry.vm == *vm && wanted(entry.kind))
             .map(|(operation, _)| *operation)
             .collect()
     }

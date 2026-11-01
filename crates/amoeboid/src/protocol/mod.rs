@@ -169,6 +169,7 @@ pub enum ServerFrame {
 pub enum RequestBody {
     Runtime(RuntimeRequest),
     Vm(VmRequest),
+    Operation(OperationRequest),
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -181,8 +182,24 @@ pub enum RequestBody {
 pub enum ReplyBody {
     Runtime(RuntimeReply),
     Vm(VmReply),
+    Operation(OperationReply),
     /// The operation failed; rendered by the client like a local error.
     Failed(crate::diagnostic::Report),
+}
+
+/// Requests about another operation.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(tag = "request", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OperationRequest {
+    /// Cancel a start in progress: it is stopped, and its client answered `vm.cancelled`.
+    Cancel { target: OperationId },
+}
+
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(tag = "reply", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OperationReply {
+    /// The target was cancelled and what it started is stopped.
+    Cancelled { target: OperationId },
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]

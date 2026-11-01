@@ -52,6 +52,11 @@ pub enum VmCommand {
     Stop { operation: OperationId },
     /// Answered in every state; persists nothing.
     Status { operation: OperationId },
+    /// Cancel the start `start` if it is still in progress: a stop, answered as `operation`.
+    CancelStart {
+        operation: OperationId,
+        start: OperationId,
+    },
 }
 
 /// Everything the twin's children report, tagged by child.
@@ -331,6 +336,8 @@ pub enum TwinError {
     Stopping,
     #[error("the start was cancelled by a stop")]
     Cancelled,
+    #[error("the start is no longer in progress")]
+    StartNotInProgress,
 }
 
 impl crate::diagnostic::Diagnostic for TwinError {
@@ -345,6 +352,7 @@ impl crate::diagnostic::Diagnostic for TwinError {
             Self::GenerationsExhausted => "vm.generations_exhausted",
             Self::Stopping => "vm.stopping",
             Self::Cancelled => "vm.cancelled",
+            Self::StartNotInProgress => "vm.start_not_in_progress",
         }
     }
     fn hint(&self) -> Option<String> {
@@ -359,6 +367,7 @@ impl crate::diagnostic::Diagnostic for TwinError {
             Self::RestartedWhileStarting => Some("start it again".into()),
             Self::Stopping => Some("wait for the stop to finish, then start it".into()),
             Self::GenerationsExhausted | Self::Cancelled => None,
+            Self::StartNotInProgress => Some("see how it ended with amoeboid status".into()),
         }
     }
 }
@@ -414,6 +423,16 @@ impl Behaviour for VmTwin {
                 incarnation,
             } => start(state, operation, *request, incarnation),
             VmCommand::Stop { operation } => stop(state, operation),
+            VmCommand::CancelStart { operation, start } => match &state.vm {
+                VmState::Starting {
+                    operation: current, ..
+                } if *current == start => stop(state, operation),
+                VmState::Stopped { .. }
+                | VmState::Starting { .. }
+                | VmState::Running { .. }
+                | VmState::Failed { .. }
+                | VmState::Stopping { .. } => refuse(operation, &TwinError::StartNotInProgress),
+            },
             VmCommand::Status { operation } => Effect::Send(one(done(
                 operation,
                 Ok(VmOutcome::Status(condition(&state.vm))),
@@ -471,7 +490,8 @@ impl Behaviour for VmTwin {
         let operation = match command {
             VmCommand::Start { operation, .. }
             | VmCommand::Stop { operation }
-            | VmCommand::Status { operation } => operation,
+            | VmCommand::Status { operation }
+            | VmCommand::CancelStart { operation, .. } => operation,
         };
         Some(done(operation, Err(Report::of(reason))))
     }

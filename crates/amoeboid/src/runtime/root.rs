@@ -52,8 +52,9 @@ use crate::journal::{
 use crate::nonempty::NonEmpty;
 use crate::persistent::PersistentMessage;
 use crate::protocol::{
-    EventSequence, OperationId, ProgressEvent, ReplyBody, RequestBody, RuntimeId, RuntimeReply,
-    RuntimeRequest, ServerFrame, VacuumProgress, VmReply, VmRequest,
+    EventSequence, OperationId, OperationReply, OperationRequest, ProgressEvent, ReplyBody,
+    RequestBody, RuntimeId, RuntimeReply, RuntimeRequest, ServerFrame, VacuumProgress, VmReply,
+    VmRequest,
 };
 use crate::vm::builder::BuildCommand;
 use crate::vm::local_qemu::Placement;
@@ -292,6 +293,10 @@ pub enum RegistryError {
     NotQuarantined(VmName),
     #[error("the runtime knows no operation {0}")]
     UnknownOperation(OperationId),
+    #[error("the operation {0} has already finished")]
+    OperationFinished(OperationId),
+    #[error("the operation {0} can't be cancelled: only a start in progress can")]
+    NotCancellable(OperationId),
 }
 
 impl crate::diagnostic::Diagnostic for RegistryError {
@@ -305,6 +310,8 @@ impl crate::diagnostic::Diagnostic for RegistryError {
             Self::NotReleasable(_) => "runtime.vm.not_releasable",
             Self::NotQuarantined(_) => "runtime.vm.not_quarantined",
             Self::UnknownOperation(_) => "runtime.operation.unknown",
+            Self::OperationFinished(_) => "runtime.operation.finished",
+            Self::NotCancellable(_) => "runtime.operation.not_cancellable",
         }
     }
     fn hint(&self) -> Option<String> {
@@ -331,6 +338,9 @@ impl crate::diagnostic::Diagnostic for RegistryError {
             Self::Vacuuming(_) => Some("wait for the vacuum to finish".into()),
             Self::Restarting { .. } => Some("retry shortly; see amoeboid status".into()),
             Self::TwinFailed { .. } => Some("see amoeboid status, then retry".into()),
+            Self::OperationFinished(_) | Self::NotCancellable(_) => {
+                Some("see where the VM is with amoeboid status".into())
+            }
             Self::UnknownOperation(_) => Some(
                 "it finished long ago or the runtime restarted since; see amoeboid status".into(),
             ),
@@ -520,6 +530,11 @@ fn handle(myself: &ActorRef<RootMessage>, message: RootMessage, state: &mut Root
             body: RequestBody::Vm(request),
             reply_to,
         } => vm_request(myself, state, operation, request, reply_to),
+        RootMessage::Request {
+            operation,
+            body: RequestBody::Operation(OperationRequest::Cancel { target }),
+            reply_to,
+        } => cancel(state, operation, target, reply_to),
         RootMessage::Vacuumed { name, result } => match result {
             Ok(()) => retire_next(myself, state, &name, None),
             Err(failure) => vacuum_failed(state, &name, failure),
@@ -624,6 +639,77 @@ fn dispatch(
     }
 }
 
+/// Cancels the start `target` (0003 §Protocol). The cancel is an operation of its own: a retry
+/// attaches. A start still waiting for its twin is dropped here; one in progress is cancelled by
+/// the twin, which stops what it started.
+fn cancel(
+    state: &mut RootState,
+    operation: OperationId,
+    target: OperationId,
+    reply_to: DerivedActorRef<ServerFrame>,
+) {
+    if state.operations.attach(operation, None, reply_to.clone()) {
+        return;
+    }
+    let Some((vm, kind, finished)) = state
+        .operations
+        .get(target)
+        .map(|entry| (entry.vm.clone(), entry.kind, entry.finished()))
+    else {
+        let unknown = Report::of(&RegistryError::UnknownOperation(target));
+        return reply(&reply_to, operation, ReplyBody::Failed(unknown));
+    };
+    state.operations.begin(
+        operation,
+        vm.clone(),
+        OperationKind::Cancel { target },
+        reply_to,
+    );
+    let refused = match (kind, finished) {
+        (_, true) => Some(RegistryError::OperationFinished(target)),
+        (OperationKind::Start, false) => None,
+        (
+            OperationKind::Stop
+            | OperationKind::Vacuum
+            | OperationKind::Release
+            | OperationKind::Cancel { .. },
+            false,
+        ) => Some(RegistryError::NotCancellable(target)),
+    };
+    if let Some(refused) = refused {
+        return finish(state, operation, ReplyBody::Failed(Report::of(&refused)));
+    }
+    match state.routes.get_mut(&vm) {
+        Some(Route::Spawning { held }) if held.iter().any(|(held, _)| *held == target) => {
+            held.retain(|(held, _)| *held != target);
+            let cancelled = Report::of(&crate::vm::twin::TwinError::Cancelled);
+            finish(state, target, ReplyBody::Failed(cancelled));
+            finish(
+                state,
+                operation,
+                ReplyBody::Operation(OperationReply::Cancelled { target }),
+            );
+        }
+        Some(Route::Up { twin }) => {
+            let sent = twin.cast(PersistentMessage::Command(VmCommand::CancelStart {
+                operation,
+                start: target,
+            }));
+            if let Err(error) = sent {
+                finish(
+                    state,
+                    operation,
+                    ReplyBody::Failed(unreachable_twin(&error)),
+                );
+            }
+        }
+        Some(Route::Spawning { .. } | Route::Restarting { .. }) | None => {
+            let gone = Report::of(&crate::vm::twin::TwinError::StartNotInProgress);
+            finish(state, operation, ReplyBody::Failed(gone));
+        }
+    }
+}
+
 /// The operation's reply, to everyone attached.
 fn finish(state: &mut RootState, operation: OperationId, body: ReplyBody) {
     state
@@ -725,9 +811,13 @@ fn machine(myself: &ActorRef<RootMessage>, state: &mut RootState, report: Machin
 /// A twin failed: every operation waiting on it is answered, and a vacuum waiting for its stop
 /// goes on to terminate it.
 fn twin_failed(state: &mut RootState, name: &VmName, reason: &Report) {
-    let failed = state
-        .operations
-        .unfinished(name, &[OperationKind::Start, OperationKind::Stop]);
+    // Everything waiting on the twin; a vacuum or a release carries on by itself.
+    let failed = state.operations.unfinished(name, |kind| {
+        matches!(
+            kind,
+            OperationKind::Start | OperationKind::Stop | OperationKind::Cancel { .. }
+        )
+    });
     for operation in failed {
         let failure = Report::of(&RegistryError::TwinFailed {
             name: name.clone(),
@@ -1062,14 +1152,18 @@ fn from_vm(myself: &ActorRef<RootMessage>, state: &mut RootState, vm: &VmName, r
                 }
                 return;
             }
-            let Some(name) = state
+            let Some((name, kind)) = state
                 .operations
                 .get(operation)
-                .map(|entry| entry.vm.clone())
+                .map(|entry| (entry.vm.clone(), entry.kind))
             else {
                 tracing::debug!(%operation, "an operation Root no longer knows");
                 return;
             };
+            if let (OperationKind::Cancel { target }, Ok(VmOutcome::Stopped)) = (kind, &result) {
+                let body = ReplyBody::Operation(OperationReply::Cancelled { target });
+                return finish(state, operation, body);
+            }
             let body = match (result, state.paths.vm(&name)) {
                 (Ok(VmOutcome::Started(started)), Ok(paths)) => ReplyBody::Vm(VmReply::Started {
                     name,
