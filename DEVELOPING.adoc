@@ -221,10 +221,9 @@ The VM's ssh host key lives in `<vm>/ssh/` and is copied into the guest every st
 `nix/` is a flake with two layers: `base.nix` is plumbing the runtime depends on (shares, extra-args script, QMP socket, account, home bind mount, `amoeboid-mounts.service`, sshd); `recipe.nix` is content (packages, services, sizing) operators edit. Bundled changes reach only new presets and VMs; a commit changing `nix/` says so.
 
 * Build: `nix build path:<vm>/nix --no-write-lock-file --out-link <vm>/vm --override-input host path:<vm>/host.nix` (`plan::argv::nix_build`). `host` is a `flake = false` input (placeholder `host-default.nix`); `host.nix` sets `amoeboid.{user,uid,gid,home}` (`plan::files::host_module`). The account is therefore part of the build; nothing else that varies per start is: ports and shares reach qemu through `amoeboid-qemu-args` and the guest through state-share files, so a restart with other shares never rebuilds.
-* Outputs: `packages.<system>.default` is a linkFarm with `runner` and `virtiofsd`, for `x86_64-linux` and `aarch64-linux`; the guest has the host's architecture. A preset qualifies if its flake takes `host`, publishes that package, and keeps `base.nix`'s contract.
+* Outputs: `packages.<system>.default` is a linkFarm with `runner` and `virtiofsd`, for `x86_64-linux` and `aarch64-linux`; the guest has the host's architecture. A preset qualifies if its flake takes `host`, publishes that package, and keeps the names in the coupling table below.
 * Guest boot ordering: `amoeboid-mounts.service` runs before `serial-getty@ttyS0`, `sshd` and `sshd-keygen` (with `RequiresMountsFor` the state share and the home), so nothing logs in before the shares and the pinned host key are in place; that is why the runtime writes `mounts`, `hostname` and the key before boot.
 * Sizing defaults are 8 vCPUs and 8192 MiB (`base.nix`). `microvm.mem = 2048` exactly hangs qemu.
-* The flake also publishes `contract` (`amoeboid-contract.json`: names of shares, sockets, state files, `amoeboid.contract` version). Nothing in the runtime reads it yet: it is a hook for checking the coupling below after a build.
 
 === Rust ↔ Nix coupling
 

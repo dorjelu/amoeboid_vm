@@ -16,7 +16,7 @@
   # amoeboid copies this directory as a preset (~/.config/amoeboid/nix_presets/<name>),
   # then per VM. Any directory works as a preset if its flake takes a `host` input and
   # provides packages.<host system>.default with `runner` and `virtiofsd`, and its NixOS
-  # configuration keeps base.nix's contract (shares, extra-args file, control socket).
+  # configuration keeps base.nix's plumbing (shares, extra-args file, control socket).
   # The guest has the host's architecture: `nix build` picks the host system's package.
   outputs = { self, nixpkgs, microvm, host }:
     let
@@ -39,26 +39,10 @@
         let
           pkgs = nixpkgs.legacyPackages.${system};
           config = self.nixosConfigurations.${system}.config;
-          share = tag: builtins.head (builtins.filter (s: s.tag == tag) config.microvm.shares);
         in {
           default = pkgs.linkFarm "amoeboid-vm" {
             runner = config.microvm.declaredRunner;
             virtiofsd = pkgs.virtiofsd;
-            # What the runtime relies on; published for a check after the build (not read yet).
-            contract = pkgs.writeText "amoeboid-contract.json" (builtins.toJSON {
-              version = config.amoeboid.contract;
-              home = "share";
-              controlSocket = config.microvm.socket;
-              stateShare = {
-                inherit (share "amoeboid") tag socket mountPoint;
-              };
-              storeShare = {
-                inherit (share "ro-store") tag socket;
-              };
-              extraArgsFile = "amoeboid-qemu-args";
-              stateFiles = [ "mounts" "hostname" "term" "ssh_host_ed25519_key" ];
-              guestSshPort = 22;
-            });
           };
         });
     };

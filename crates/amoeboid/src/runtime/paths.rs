@@ -188,7 +188,7 @@ fn check_socket(socket: &AbsolutePath) -> Result<(), LocationError> {
 }
 
 /// Everything one VM keeps on the host. Owned by the VM's twin. Names that the guest or Nix
-/// side depends on are part of the contract with `nix/base.nix` (DEVELOPING.adoc).
+/// side depends on are coupled with `nix/base.nix` (DEVELOPING.adoc, Rust ↔ Nix coupling).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct VmPaths {
     name: VmName,
