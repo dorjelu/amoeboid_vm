@@ -457,26 +457,26 @@ impl Actor for Root {
         })
     }
 
-    async fn handle(
+    fn handle(
         &self,
         myself: ActorRef<RootMessage>,
         message: RootMessage,
         state: &mut RootState,
-    ) -> Result<(), ActorProcessingErr> {
+    ) -> impl Future<Output = Result<(), ActorProcessingErr>> + Send {
         if let (Some(loading), RootMessage::Request { .. }) = (&mut state.loading, &message) {
             loading.held.push(message);
-            return Ok(());
+            return std::future::ready(Ok(()));
         }
-        handle(&myself, message, state).await;
+        handle(&myself, message, state);
         if state.loading.as_ref().is_some_and(Loading::complete)
             && let Some(loading) = state.loading.take()
         {
             loaded(state, loading.vms.unwrap_or_default());
             for message in loading.held {
-                handle(&myself, message, state).await;
+                handle(&myself, message, state);
             }
         }
-        Ok(())
+        std::future::ready(Ok(()))
     }
 
     /// Every child of Root is essential: whichever ends, the runtime ends.
@@ -508,7 +508,7 @@ impl Actor for Root {
 }
 
 /// One message, with the registry known (or known to be unavailable).
-async fn handle(myself: &ActorRef<RootMessage>, message: RootMessage, state: &mut RootState) {
+fn handle(myself: &ActorRef<RootMessage>, message: RootMessage, state: &mut RootState) {
     match message {
         RootMessage::Request {
             operation,
