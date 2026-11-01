@@ -12,8 +12,9 @@ from pathlib import Path
 from amoeboid.errors import AppError, fail
 from amoeboid.result import Ok, Result
 
-BUNDLED_NIX = Path(__file__).resolve().parent / "nix"
-"""The NixOS configuration shipped with amoeboid; seeds the `default` preset."""
+BUNDLED_NIX = Path(__file__).resolve().parents[2] / "nix"
+"""The NixOS configuration shipped with amoeboid (the checkout's `nix/`, shared with the Rust
+runtime); seeds the `default` preset."""
 
 CONFIG_FILE = "run_config.kdl"
 DEFAULT_VM = "default"

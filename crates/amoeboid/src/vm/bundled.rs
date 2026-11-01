@@ -7,7 +7,7 @@ use crate::domain::tree::Tree;
 /// Shared with the Python launcher until it is retired; then `nix/` moves to the repository root.
 macro_rules! bundled_files {
     ($($name:literal),* $(,)?) => {
-        [$(($name, include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../src/amoeboid/nix/", $name)).as_slice())),*]
+        [$(($name, include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../nix/", $name)).as_slice())),*]
     };
 }
 
