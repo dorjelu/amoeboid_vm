@@ -22,10 +22,10 @@ nix/                 the bundled NixOS flake, embedded into the library (vm::bun
 decisions/           decision records
 tools/cov-gate.jq    branch-coverage gate for pure modules
 deny.toml            dependency policy
-mise.toml            tasks: test, test-thorough, lint, fmt, cov, deny, install
+mise.toml            tasks: test, test-thorough, lint, fmt, cov, cov-gate, deny, install
 ----
 
-Library modules, roughly from the bottom up:
+Library modules, roughly from the bottom up (dependencies point downward, with one exception: `adapters::ssh` takes `runtime::paths::VmPaths`):
 
 [cols="1,3"]
 |===
@@ -40,7 +40,7 @@ Library modules, roughly from the bottom up:
 |`vm/` |the VM subtree: twin, Builder, GuestVm, hypervisor protocol, LocalQemu, vacuum, bundled config
 |`runtime/` |Root, MachineSupervisor, operations table, listener and sessions, quarantine records, paths, lock, process timing
 |`client` |the library client: connect, handshake, `request`, `request_as`, `subscribe`
-|`end_to_end` |end-to-end tests (test builds only)
+|`end_to_end`, `testing` |end-to-end tests; test helpers (`forks`, `probe`, `executable`, goldens); test builds only
 |===
 
 == Runtime topology
@@ -64,7 +64,8 @@ Root (plain actor; registry, routing, operations table)
 
 === Messaging rules
 
-* Tell only. An actor never awaits another actor; awaiting I/O inside a handler (SQLite, sockets, QMP) is allowed. Replies carry correlation ids; timeouts are `send_after` messages.
+* Tell only. An actor never awaits another actor. Replies carry correlation ids; timeouts are `send_after` messages.
+* Awaiting I/O inside a handler is allowed where the actor exists for it (the Journal's SQLite, LocalQemu's QMP); the Builder and GuestVm run their work in a spawned task and report back. Root's handler is synchronous and never awaits: slow work (the vacuum task) runs in a spawned task that tells Root its result.
 * Cross-type replies use ractor's `DerivedActorRef`; the receiving enum has exactly one wrapper variant per derived type, so the conversion back is total (`get_derived` panics otherwise).
 * Domain errors are messages. A handler returns `Err` only to fail the actor on purpose (a persistent actor's `Fatal`).
 * A failing actor's error reaches its parent unchanged in `SupervisionEvent::ActorFailed`, so a supervisor can downcast it (the MachineSupervisor does).
@@ -88,7 +89,7 @@ tombstones (persistence_id, through, at)             -- events at or below `thro
 
 === Persistent actors
 
-A `Behaviour` supplies pure handlers in the style of Akka's `EventSourcedBehavior`: `on_command`, `on_observation`, `on_event` (total; also run in replay), `on_recovered`, `reconciled`, `refuse`, `on_unrecoverable`, `child_ended`, and `send`, the one effect. Handlers return an `Effect::{None, Persist { events, then }, Send}`: messages in `then` go out only after the events are durable.
+A `Behaviour` supplies pure handlers in the style of Akka's `EventSourcedBehavior`: `initial`, `on_command`, `on_observation`, `on_event` (total; also run in replay), `on_recovered`, `reconciled`, `refuse`, `on_unrecoverable`, `child_ended`, and an `EVENT_VERSION` stored in every event's envelope. Two hooks are effectful: `start`, run when the actor starts (spawns the behaviour's children linked to it and returns its peers), and `send`, the one way to send. Handlers return an `Effect::{None, Persist { events, then }, Send}`: messages in `then` go out only after the events are durable.
 
 [source]
 ----
@@ -106,6 +107,7 @@ The twin is the only persistent actor in a VM subtree; its children report obser
 
 * A start request (`StartRequest`) carries what the operator gave or the VM's own (`SharesRequest`, `NixConfigRequest`: `Given` or `OwnElse`); the twin resolves it into the persisted `VmSpec`, because only it knows whether the VM is new and what it had.
 * Every child message carries the generation; older ones are dropped.
+* The guest's own config copy (`~/amoeboid/nix` in the guest) is seeded only on a VM's first start and on a rebase, and never read back; `~/amoeboid/reference` (what is running) is rewritten every start. Adopting an agent's edits is a manual step, because a config evaluates into a runner that executes on the host as the user.
 * Processes are recorded as `ProcessStarted { role, identity }`. Identity is process id, start time (clock ticks since boot) and boot id; not the executable, because the runner script execs qemu.
 * A spawn's nonce, `AMOEBOID_NONCE=<vm>/<incarnation>/<generation>/<role>`, is deterministic from the twin's history, so a spawn whose record was lost is found by scanning processes. `vacuum_vm` finds a VM's processes by the prefix `<vm>/`.
 
@@ -136,6 +138,14 @@ On recovery a twin whose VM is `Running` sends `Adopt` with each process's ident
 
 Every VM process runs in its own transient scope, `systemd-run --user --scope --collect --slice=amoeboid.slice --unit=amoeboid-<vm>-<role>` (a duplicate spawn fails at systemd-run: the unit name is fixed), in its own process group, inheriting no runtime fd (`O_CLOEXEC` everywhere). Tests use `Placement::Direct` (plain children).
 
+=== Process facts
+
+* LocalQemu ties the processes together: a virtiofsd that dies terminates qemu (`ShareExited`), and qemu exiting terminates the shares; the twin only hears `MachineRunning` and `MachineStopped { reason }`, plus per-process facts to persist.
+* virtiofsd runs as the invoking user with `--sandbox=namespace` and uid/gid maps (guest ids to the host user), so files the guest writes, as any user, land as the host user.
+* The network is qemu user-mode only: the one inbound path is the forward `127.0.0.1:<port> -> 22`; outbound is unrestricted, including the host's loopback through 10.0.2.2.
+* The runner runs in the VM's runtime directory; socket paths in `amoeboid-qemu-args` (`dN.sock`, chardev `amoN`) are relative to it.
+* qemu's serial console goes to `<vm>/console.log`; nothing attaches a terminal.
+
 == Supervision and quarantine
 
 The MachineSupervisor (ours, over ractor links; `ractor-supervisor` is not used) runs one twin per VM:
@@ -146,7 +156,7 @@ Spawning ─▶ Up ─failed, budget left─▶ Restarting{attempt} ─backoff�
 Up ─budget spent─▶ Exhausted (Root quarantines: SuspiciousHalt)      Up ─Terminate─▶ Terminated
 ----
 
-* A failure is classified by downcasting `persistent::machine::Fatal` (`Conflict` restarts at once; journal errors, escalated children, spawn failures and anything else after backoff). The policy is the pure `decide`, on tokio's monotonic clock; its numbers come from `daemon_config.toml`.
+* A failure is classified by downcasting `persistent::machine::Fatal` into a `FailureKind`: `Conflict` (from `Fatal::Persist(PersistFailure::Conflict)`) restarts at once; `Journal`, `ChildEscalated`, `SpawnFailed` and `Bug` (a panic, an unknown error, `Encode`, `SeqOverflow`) restart after backoff. The policy is the pure `decide`, on tokio's monotonic clock; its numbers come from `daemon_config.toml`.
 * Quarantine records (`quarantine/<name>`) carry a cause: `Unreplayable` (the twin's stream can't be replayed; only `vacuum_vm` removes it) or `SuspiciousHalt` (budget spent; `release_vm` retires the record and spawns the twin with a fresh budget). Root loads the records at start and spawns no twin for a quarantined VM.
 * `vacuum_vm`: graceful stop through a twin that is up, then `Terminate`, then the vacuum task (ends every process carrying the VM's nonce prefix, removes the runtime and state directories), then retires `vm/<name>` and, last, `quarantine/<name>`. Only names Root knows are vacuumed.
 
@@ -178,12 +188,12 @@ RequestBody: Runtime(Ping) | Vm(Start | Stop | Status | Vacuum | Release) | Oper
 
 * Both live in `$XDG_CONFIG_HOME/amoeboid` (`ConfigPaths`); absent means defaults. Each is a bijection with its value: decode then encode gives the value back, and encoding is canonical. Paths under the home are written `~/…`.
 * Presets are directories in `nix_presets/`; `default` is seeded from the bundled config (by `daemon install`, or by the Builder when a start needs it).
-* Journal location, first that is given: the builder (`JournalLocation::At`), `amoeboid-daemon --journal`, `journal.path`, then `$XDG_DATA_HOME/amoeboid/journal.sqlite`; never inside a VM's directory.
+* Journal location, first that is given: `JournalLocation::At` (set by the builder, which is what `amoeboid-daemon --journal` does), `journal.path`, then `$XDG_DATA_HOME/amoeboid/journal.sqlite`. A path under the data directory must lie directly in it (`runtime.start.journal_inside_vm` otherwise).
 * Time: wall time only through `Clock` (journal stamps); monotonic time and timers are tokio's (tests pause and advance it); process-level waits are `ProcessTiming`, set by whoever builds the runtime.
 
 === Adding a key
 
-Add it to the value type in `config/run.rs` or `config/daemon.rs`, to `decode` (with its range and a problem message) and to `encode`, extend the strategies in `config/tests.rs` so the bijection property covers it, and document it in README.
+Add it to the value type in `config/run.rs` or `config/daemon.rs`, to `decode` (with its range and a problem message) and to `encode`, extend the strategies in `config/tests.rs` so the bijection property covers it, and document it in README. Existing files without the key must keep loading: an absent key decodes to its default.
 
 == Files
 
@@ -192,17 +202,29 @@ Add it to the value type in `config/run.rs` or `config/daemon.rs`, to `decode` (
 $XDG_DATA_HOME/amoeboid/        daemon.lock, journal.sqlite, <vm>/
   <vm>/vm                       nix build out-link: runner/bin/microvm-run, virtiofsd/bin/virtiofsd
   <vm>/nix, host.nix            the VM's own Nix config and its `host` flake input
-  <vm>/guest/                   GUEST-WRITABLE: state share (mounts, hostname, ssh_host_ed25519_key, home/)
+  <vm>/guest/                   GUEST-WRITABLE: the state share: mounts, hostname, ssh_host_ed25519_key
+                                (term removed every start), home/ (the guest's home, with home files,
+                                home/amoeboid/{nix,reference,README.md})
   <vm>/ssh/                     host key pair, known_hosts
   <vm>/build.log, virtiofsd.log, console.log
 $XDG_RUNTIME_DIR/amoeboid/      runtime.sock, <vm>/ (control.sock, *.sock, amoeboid-qemu-args)
 $XDG_CONFIG_HOME/amoeboid/      run_config.toml, daemon_config.toml, nix_presets/<name>/
-~/.config/systemd/user/         amoeboid.socket, amoeboid.service
+$XDG_CONFIG_HOME/systemd/user/  amoeboid.socket, amoeboid.service (else ~/.config/systemd/user)
 ----
+
+`daemon.lock` and the journal still share the data directory with the VMs; moving them to `$XDG_STATE_HOME/amoeboid` is decided (0003) but not done (TODO in `runtime/paths.rs`).
+
+The VM's ssh host key lives in `<vm>/ssh/` and is copied into the guest every start, so the guest can't keep a different identity.
 
 == Nix side
 
-`nix/` is a flake with two layers: `base.nix` is plumbing the runtime depends on (shares, extra-args script, QMP socket, account, home bind mount, `amoeboid-mounts.service`, sshd); `recipe.nix` is content (packages, services, sizing) operators edit. The `host` input is overridden per start with `<data>/<vm>/host.nix`. Bundled changes reach only new presets and VMs.
+`nix/` is a flake with two layers: `base.nix` is plumbing the runtime depends on (shares, extra-args script, QMP socket, account, home bind mount, `amoeboid-mounts.service`, sshd); `recipe.nix` is content (packages, services, sizing) operators edit. Bundled changes reach only new presets and VMs; a commit changing `nix/` says so.
+
+* Build: `nix build path:<vm>/nix --no-write-lock-file --out-link <vm>/vm --override-input host path:<vm>/host.nix` (`plan::argv::nix_build`). `host` is a `flake = false` input (placeholder `host-default.nix`); `host.nix` sets `amoeboid.{user,uid,gid,home}` (`plan::files::host_module`). The account is therefore part of the build; nothing else that varies per start is: ports and shares reach qemu through `amoeboid-qemu-args` and the guest through state-share files, so a restart with other shares never rebuilds.
+* Outputs: `packages.<system>.default` is a linkFarm with `runner` and `virtiofsd`, for `x86_64-linux` and `aarch64-linux`; the guest has the host's architecture. A preset qualifies if its flake takes `host`, publishes that package, and keeps `base.nix`'s contract.
+* Guest boot ordering: `amoeboid-mounts.service` runs before `serial-getty@ttyS0`, `sshd` and `sshd-keygen` (with `RequiresMountsFor` the state share and the home), so nothing logs in before the shares and the pinned host key are in place; that is why the runtime writes `mounts`, `hostname` and the key before boot.
+* Sizing defaults are 8 vCPUs and 8192 MiB (`base.nix`). `microvm.mem = 2048` exactly hangs qemu.
+* The flake also publishes `contract` (`amoeboid-contract.json`: names of shares, sockets, state files, `amoeboid.contract` version). Nothing in the runtime reads it yet: it is a hook for checking the coupling below after a build.
 
 === Rust ↔ Nix coupling
 
@@ -230,7 +252,10 @@ Guest-writable writes::
 Everything under `<vm>/guest/` is written only through `adapters::guest` (`GuestTree`): directories are walked with `openat2` and `RESOLVE_NO_SYMLINKS`/`BENEATH`, files are replaced, never written through. A plain write there would let the guest redirect it onto any host file.
 
 Reading back::
-Never read guest-writable files to decide anything.
+Never read guest-writable files to decide anything (the guest's config copy included).
+
+Console output::
+`<vm>/console.log` is guest-controlled bytes. Nothing shows it on the host terminal today; anything that ever does must sanitise it (keep SGR colour, drop other escapes and C0 controls but tab and newline).
 
 Process signalling::
 Only through a pidfd opened and then checked against the recorded identity (process id, start time, boot id); a zombie counts as gone.
@@ -252,11 +277,12 @@ Never inside a VM's directory; created `0600`; one connection.
 
 == Code style
 
-* No `unsafe`, no `unwrap`/`expect`/`panic!` outside tests (tests may unwrap, not `panic!`), no wildcard enum arms, no `print!` outside the CLI's `render` module; clippy pedantic with `-D warnings`.
+* No `unsafe`, no `unwrap`/`expect`/`panic!` outside tests (tests may unwrap, not `panic!`), no wildcard enum arms, no `print!`/`println!`/`eprintln!` anywhere (`print_stdout`/`print_stderr` are denied): the CLI prints only through `render`, with `writeln!` on a locked handle; clippy pedantic with `-D warnings`.
 * Make impossible states unrepresentable: refined newtypes with private fields and a validating `parse`, `#[serde(try_from)]` so no decoded value skips refinement; no unchecked constructors.
 * Polymorphism through enums and `match`; test doubles are enum variants (`BuildCommand::Scripted`, `Placement::Direct`) or actors speaking the same messages.
 * No abbreviations in identifiers, wire fields, SQL columns or docs (`OperationId`, `message`, `error`).
 * Every operator-facing error implements `Diagnostic` (stable dotted `code`, lowercase `message` without a trailing period, imperative `hint`) and is listed in the catalogue test in `diagnostic.rs`, which checks codes are unique and messages well-formed.
+* No hardcoded users, ids, homes or host paths: derive them from `Account::of_this_process`, `RuntimePaths` and `ConfigPaths`.
 * Raw `Path`/`PathBuf`/`OsString` only in boundary modules that allow `clippy::disallowed_types` with a reason.
 * CLI: long options only, no abbreviations; help text written for the operator.
 * Comments say why or name a coupling; explain actor design in Akka/OTP terms.
@@ -267,7 +293,7 @@ Never inside a VM's directory; created `0600`; one connection.
 |===
 |Unit and property |next to the code; proptest for codecs and validators (config bijection, frames, names); goldens in `crates/amoeboid/tests/golden`
 |Actors |driven with `testing::probe` (an actor forwarding to a channel); the twin's handlers are driven directly without actors (`vm/twin_tests.rs`)
-|End to end |`end_to_end.rs`: a runtime (in-process, SQLite) driven through the library `Client`, real processes as plain children, a scripted build installing stand-ins: virtiofsd creates its socket; the runner (`python3`) answers an SSH banner on the forwarded port and QMP on `control.sock`, exiting on powerdown. The daemon, not the CLI, is the test surface.
+|End to end |`end_to_end.rs`: a runtime (in-process, SQLite) driven through the library `Client`, real processes as plain children, a scripted build installing stand-ins: virtiofsd creates its socket; the runner (`python3`; the host key needs `ssh-keygen`) answers an SSH banner on the forwarded port and QMP on `control.sock`, exiting on powerdown. The daemon, not the CLI, is the test surface.
 |Paused time |`#[tokio::test(start_paused = true)]` for timers and budgets, only without real processes or I/O (an idle paused runtime auto-advances)
 |Coverage |`mise run cov`: pure modules (domain, plan, config, `persistent/machine.rs`) must reach 100 % branches
 |Dependencies |`mise run deny`: advisories, licences, banned crates, crates.io only
@@ -304,4 +330,13 @@ To build a VM from the checkout's flake instead of a preset: `amoeboid start --b
 
 * Gates before every commit, chained so a failure stops the commit: `mise run test`, then `mise run lint`, then `git commit`. Check `git status` first: a commit takes everything staged. Loop tests touching processes or timing several times before committing.
 * One logical change per commit; imperative subject; a technical body (what, why, affected messages, files, compatibility). Decisions go into a decision record in the same change.
-* `mise run install` installs both binaries into `~/.cargo/bin` and restarts the runtime; `amoeboid daemon install` writes the systemd units, `daemon_config.toml` and the `default` preset when absent.
+* `mise run install` installs both binaries into `~/.cargo/bin` and restarts the runtime. `amoeboid daemon install` rewrites the systemd units and writes `daemon_config.toml` and the `default` preset when absent. The service unit fixes `PATH` as it was when `daemon install` ran: run it from a shell where `nix`, `ssh-keygen` and `systemd-run` resolve.
+* Logs: `AMOEBOID_LOG` (a tracing filter, default `info`); the daemon logs to stderr, which systemd puts in the journal (`journalctl --user -u amoeboid.service`).
+
+=== Checklist for a change
+
+* Pure construction first (`domain`, `plan`, `config`), with tests; effects in the module that owns them.
+* A write into a guest-writable directory goes through `adapters::guest`, with a test that plants a symlink.
+* A change to `base.nix` or to a coupled name updates both sides of the coupling table and is checked against a real VM.
+* A new operator-facing error implements `Diagnostic` and joins the catalogue test.
+* A decision goes into a decision record in the same change; operator-facing text (README, `--help`, log lines, the guest README) stays consistent.
