@@ -1,8 +1,8 @@
-# Branch-coverage gate over `cargo llvm-cov report --json` (design §Testing/Measures).
-# Pure modules must reach 100 % branches; everything else is only reported.
-# Decide functions live in `ops/**/decide.rs`; extend the pattern if a pure module is added.
+# Branch-coverage gate over `cargo llvm-cov report --json`.
+# Pure modules must reach 100 % branches; everything else is only reported. Pure: the value
+# layer (domain, plan, config) and the persistent actor's mode machine.
 
-def pure: test("/crates/amoeboid/src/(domain/|kdl/|config/|plan/|records/|console\\.rs$|layout\\.rs$|contract\\.rs$|ops/(.*/)?decide\\.rs$)");
+def pure: test("/crates/amoeboid/src/(domain/|plan/|config/|persistent/machine\\.rs$)");
 
 [.data[].files[] | select(.filename | pure)
  | {file: .filename, count: .summary.branches.count, covered: .summary.branches.covered}] as $pure

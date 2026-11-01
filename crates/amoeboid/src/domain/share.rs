@@ -195,6 +195,16 @@ impl Shares {
         protected: &[AbsolutePath],
         is_directory: impl Fn(&HostDirectory) -> bool,
     ) -> Result<Self, SharesError> {
+        Self::validate_with(requests, protected, &is_directory)
+    }
+
+    /// The validation itself, one copy whatever the caller's check: coverage of every caller
+    /// adds up here.
+    fn validate_with(
+        requests: Vec<ShareRequest>,
+        protected: &[AbsolutePath],
+        is_directory: &dyn Fn(&HostDirectory) -> bool,
+    ) -> Result<Self, SharesError> {
         let mut seen = std::collections::BTreeSet::new();
         let mut problems = Vec::new();
         let mut valid = Vec::new();
@@ -353,5 +363,61 @@ mod tests {
             HostDirectory::parse(path),
             Err(HostDirectoryError::ControlCharacters(_))
         ));
+    }
+
+    #[test]
+    #[allow(
+        clippy::disallowed_types,
+        reason = "builds a raw path that is not UTF-8 to refine"
+    )]
+    fn paths_that_are_not_utf8_are_refused() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let raw = std::ffi::OsString::from_vec(b"/srv/\xff".to_vec());
+        let path = AbsolutePath::parse(raw.into()).unwrap();
+        assert!(matches!(
+            HostDirectory::parse(path),
+            Err(HostDirectoryError::NotUtf8(_))
+        ));
+    }
+
+    #[test]
+    fn persisted_shares_out_of_order_are_refused() {
+        let request = |path: &str| json!({"directory": path, "mode": "rw"});
+        // Children before their parent: valid shares, but not in the order validation gives.
+        let decoded: Result<Shares, _> =
+            serde_json::from_value(json!([request("/srv/a/b"), request("/srv/a")]));
+        assert!(decoded.is_err());
+        let ordered: Result<Shares, _> =
+            serde_json::from_value(json!([request("/srv/a"), request("/srv/a/b")]));
+        assert!(ordered.is_ok());
+    }
+
+    #[test]
+    fn more_shares_than_pci_slots_are_refused() {
+        let requests = |count: usize| -> Vec<ShareRequest> {
+            (0..count)
+                .map(|index| ShareRequest {
+                    directory: HostDirectory::parse(
+                        AbsolutePath::parse(format!("/srv/share{index}").into()).unwrap(),
+                    )
+                    .unwrap(),
+                    mode: Mode::ReadWrite,
+                })
+                .collect()
+        };
+        assert!(Shares::validate(requests(MAX_SHARES), &[], |_| true).is_ok());
+        let SharesError(problems) =
+            Shares::validate(requests(MAX_SHARES + 1), &[], |_| true).unwrap_err();
+        let counts: Vec<usize> = problems
+            .iter()
+            .filter_map(|problem| match problem {
+                ShareProblem::TooMany { count } => Some(*count),
+                ShareProblem::Duplicate { .. }
+                | ShareProblem::NotADirectory { .. }
+                | ShareProblem::HidesHome { .. }
+                | ShareProblem::NotInMountOrder { .. } => None,
+            })
+            .collect();
+        assert_eq!(counts, [MAX_SHARES + 1]);
     }
 }

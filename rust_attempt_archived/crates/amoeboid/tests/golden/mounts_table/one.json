@@ -1,8 +1,0 @@
-{
-  "mounts": [
-    {
-      "path": "/srv/dev/app",
-      "mode": "rw"
-    }
-  ]
-}

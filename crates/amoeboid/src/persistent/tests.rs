@@ -24,6 +24,8 @@ enum CounterCommand {
 #[derive(Debug)]
 enum CounterObservation {
     Open,
+    /// A fact that is persisted but doesn't open the counter (it stays reconciling).
+    Note(u32),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -76,6 +78,10 @@ impl<const AUTO: bool> Behaviour for Counter<AUTO> {
                 then: vec![],
             },
             CounterObservation::Open => Effect::None,
+            CounterObservation::Note(amount) => Effect::Persist {
+                events: NonEmpty::new(CounterEvent::Added(amount), vec![]),
+                then: vec![],
+            },
         }
     }
     fn on_event(state: State, event: &CounterEvent) -> State {
@@ -461,4 +467,54 @@ async fn state_survives_killing_and_respawning_the_actor() {
         .cast(PersistentMessage::Command(CounterCommand::Read))
         .unwrap();
     assert_eq!(receiver.recv().await, Some(Out::Total(5)));
+}
+
+#[test]
+fn replies_for_another_batch_than_the_one_in_flight_are_ignored() {
+    let (core, actions) = step(ready_with(vec![]), Input::Command(CounterCommand::Add(1)));
+    let current = persisted_batch(&actions);
+    let stale = current.next();
+    let inputs = [
+        Input::Persisted {
+            batch: stale,
+            last: sequence(9),
+        },
+        Input::PersistFailed {
+            batch: stale,
+            reason: PersistFailure::Conflict { first: 1, next: 2 },
+        },
+        Input::PersistTimeout(stale),
+    ];
+    let mut core = core;
+    for input in inputs {
+        let (next, actions) = step(core, input);
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, Action::Stop(_))),
+            "a stale reply stopped the actor"
+        );
+        assert!(matches!(next.mode, Mode::Persisting(_)));
+        core = next;
+    }
+}
+
+#[test]
+fn a_persist_while_reconciling_resumes_reconciling_until_reconciled() {
+    let (core, _) = run(
+        Core::<Manual>::recovering(),
+        vec![Input::Replayed(Replay::of(vec![]))],
+    );
+    // Not yet reconciled (the counter opens on its observation); a persisting observation
+    // that leaves it closed returns to reconciling.
+    let (core, actions) = step(core, Input::Observation(CounterObservation::Note(1)));
+    let batch = persisted_batch(&actions);
+    let (core, _) = step(
+        core,
+        Input::Persisted {
+            batch,
+            last: sequence(1),
+        },
+    );
+    assert!(matches!(core.mode, Mode::Reconciling { .. }));
 }

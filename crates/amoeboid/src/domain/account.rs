@@ -216,4 +216,11 @@ mod tests {
             assert!(UserName::parse(bad.into()).is_err(), "{bad}");
         }
     }
+
+    #[test]
+    fn a_guest_home_with_dot_segments_is_refused() {
+        for home in ["/home/./alice", "/home/../alice", "/home//alice"] {
+            assert!(GuestHome::parse(home.into()).is_err(), "{home}");
+        }
+    }
 }

@@ -306,3 +306,17 @@ fn the_canonical_files_read_as_documented() {
          [timeouts]\nboot_seconds = 120\npowerdown_seconds = 30\n"
     );
 }
+
+#[test]
+fn a_config_file_that_cant_be_read_is_an_error_and_a_missing_one_the_defaults() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = AbsolutePath::parse(temporary.path().to_path_buf()).unwrap();
+    let paths = crate::runtime::paths::ConfigPaths::new(root.clone(), root);
+    assert_eq!(run::load(&paths).unwrap(), RunConfig::default());
+    // A directory where the file should be: present, but not readable as text.
+    std::fs::create_dir_all(paths.run_config().as_path()).unwrap();
+    assert!(matches!(
+        run::load(&paths),
+        Err(super::LoadError::Read { .. })
+    ));
+}
