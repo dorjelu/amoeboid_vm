@@ -382,3 +382,100 @@ async fn a_machine_that_exits_by_itself_is_seen_stopped() {
     runtime.stop();
     runtime.wait().await;
 }
+
+#[tokio::test]
+async fn a_start_reports_its_steps_in_order_and_a_retry_or_subscription_replays_them() {
+    use crate::protocol::{EventSequence, OperationId, ProgressEvent};
+    use crate::vm::StartStep;
+    let installation = Installation::new();
+    let runtime = installation.start().await;
+    let mut client = installation.client().await;
+    let operation = OperationId::mint();
+    let body = RequestBody::Vm(VmRequest::Start {
+        name: vm("watched"),
+        shares: None,
+        nix_config: None,
+    });
+    let mut seen = Vec::new();
+    let reply = client
+        .request_as(operation, body.clone(), |sequence, event| {
+            seen.push((sequence, event));
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(reply, ReplyBody::Vm(VmReply::Started { .. })),
+        "{reply:?}"
+    );
+    let steps = [
+        StartStep::Building,
+        StartStep::PreparingGuest,
+        StartStep::Booting,
+        StartStep::WaitingForSsh,
+    ];
+    let expected: Vec<(EventSequence, ProgressEvent)> = steps
+        .iter()
+        .enumerate()
+        .map(|(index, step)| {
+            (
+                EventSequence::of_index(index).unwrap(),
+                ProgressEvent::Start(*step),
+            )
+        })
+        .collect();
+    assert_eq!(seen, expected);
+
+    // The same id again: the same answer and progress, and nothing runs a second time.
+    let mut retried = Vec::new();
+    let again = installation
+        .client()
+        .await
+        .request_as(operation, body, |sequence, event| {
+            retried.push((sequence, event));
+        })
+        .await
+        .unwrap();
+    assert_eq!(again, reply);
+    assert_eq!(retried, expected);
+    assert_eq!(
+        journal_lines(&installation.paths, "vm/watched", "\"start_requested\"").len(),
+        1
+    );
+
+    // Re-attached from the third step.
+    let mut late = Vec::new();
+    let subscribed = installation
+        .client()
+        .await
+        .subscribe(operation, EventSequence::of_index(2), |sequence, event| {
+            late.push((sequence, event));
+        })
+        .await
+        .unwrap();
+    assert_eq!(subscribed, reply);
+    assert_eq!(late, expected[2..]);
+
+    let unknown = installation
+        .client()
+        .await
+        .subscribe(OperationId::mint(), None, |_, _| {})
+        .await
+        .unwrap();
+    assert!(
+        matches!(&unknown, ReplyBody::Failed(report) if report.code == "runtime.operation.unknown"),
+        "{unknown:?}"
+    );
+    let stopped = request(
+        &mut client,
+        VmRequest::Stop {
+            name: vm("watched"),
+        },
+    )
+    .await;
+    assert!(
+        matches!(stopped, ReplyBody::Vm(VmReply::Stopped { .. })),
+        "{stopped:?}"
+    );
+    runtime.stop();
+    runtime.wait().await;
+}
