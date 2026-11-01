@@ -1,0 +1,35 @@
+# cargo-deny policy (`mise run deny`): known vulnerabilities, licences, a few banned crates,
+# crates.io only. No crate allowlist: a new dependency passes when it meets these rules.
+
+[graph]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+all-features = false
+
+[advisories]
+version = 2
+# Vulnerabilities and unsound crates are denied by default.
+yanked = "deny"
+# A dependency we chose ourselves that its maintainers abandoned is worth knowing about.
+unmaintained = "workspace"
+
+[licenses]
+version = 2
+allow = ["MIT", "Apache-2.0", "Unicode-3.0", "Zlib"]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = [
+    # One async runtime: tokio.
+    { crate = "async-std", reason = "the runtime is tokio" },
+    { crate = "smol", reason = "the runtime is tokio" },
+    # No C TLS stack: nothing in amoeboid speaks TLS; if it ever does, rustls.
+    { crate = "openssl", reason = "use rustls if TLS is ever needed" },
+    { crate = "openssl-sys", reason = "use rustls if TLS is ever needed" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
