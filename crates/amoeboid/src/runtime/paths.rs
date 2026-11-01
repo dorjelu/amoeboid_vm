@@ -82,10 +82,16 @@ impl ConfigPaths {
         self.directory.join("daemon_config.toml")
     }
 
-    /// One directory per preset: `presets/NAME`.
+    /// One directory per preset: `nix_presets/NAME`.
     #[must_use]
     pub fn presets(&self) -> AbsolutePath {
         self.directory.join("nix_presets")
+    }
+
+    /// The preset `name`'s directory (a preset name is one directory name).
+    #[must_use]
+    pub fn preset(&self, name: &crate::config::run::PresetName) -> AbsolutePath {
+        self.presets().join(name.as_str())
     }
 }
 

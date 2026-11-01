@@ -118,9 +118,26 @@ pub fn install() -> Result<Vec<String>, Report> {
     if let Some(config) = seed_daemon_config()? {
         written.push(config);
     }
+    if let Some(preset) = seed_default_preset()? {
+        written.push(preset);
+    }
     systemctl(&["daemon-reload"])?;
     systemctl(&["enable", "--now", units::SOCKET_NAME])?;
     Ok(written)
+}
+
+/// Writes the `default` preset from the config built into amoeboid unless it exists; the
+/// written path, if any. An existing preset is the operator's and is never replaced.
+fn seed_default_preset() -> Result<Option<String>, Report> {
+    let paths = ConfigPaths::from_env(std::env::var_os).map_err(|error| Report::of(&error))?;
+    let target = paths.preset(&amoeboid::config::run::PresetName::default_preset());
+    if target.as_path().exists() {
+        return Ok(None);
+    }
+    files::ensure_directory(&paths.presets(), 0o755).map_err(|error| Report::of(&error))?;
+    files::replace_directory(&target, &amoeboid::vm::bundled::config())
+        .map_err(|error| Report::of(&error))?;
+    Ok(Some(target.display().to_string()))
 }
 
 /// Writes `daemon_config.toml` with the defaults unless it exists; the written path, if any.
