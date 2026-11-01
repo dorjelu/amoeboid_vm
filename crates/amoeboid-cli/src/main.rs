@@ -20,11 +20,25 @@ use amoeboid::vm::{StartStep, VmCondition};
 use clap::{Parser, Subcommand};
 
 /// Build and run NixOS microVMs for coding agents against chosen host directories.
+/// Long options only: clap's `-h` and `-V` are replaced by `--help` and `--version`, on every
+/// subcommand.
 #[derive(Parser)]
-#[command(name = "amoeboid", version)]
+#[command(
+    name = "amoeboid",
+    version,
+    disable_help_flag = true,
+    disable_version_flag = true,
+    disable_help_subcommand = true
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Print help.
+    #[arg(long, global = true, action = clap::ArgAction::Help)]
+    help: Option<bool>,
+    /// Print the version.
+    #[arg(long, action = clap::ArgAction::Version)]
+    version: Option<bool>,
 }
 
 #[derive(Subcommand)]
@@ -449,5 +463,45 @@ fn unexpected(reply: &ReplyBody) -> Report {
         code: "cli.unexpected_reply".into(),
         message: format!("unexpected reply from the runtime: {reply:?}"),
         hint: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory as _;
+    use clap::Parser as _;
+    use clap::error::ErrorKind;
+
+    use super::Cli;
+
+    #[test]
+    fn the_command_tree_is_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn options_are_long_only_on_every_command() {
+        let kind = |words: &[&str]| Cli::try_parse_from(words).err().map(|error| error.kind());
+        for short in [
+            &["amoeboid", "-h"][..],
+            &["amoeboid", "-V"],
+            &["amoeboid", "start", "-h"],
+        ] {
+            assert_eq!(kind(short), Some(ErrorKind::UnknownArgument), "{short:?}");
+        }
+        assert_eq!(kind(&["amoeboid", "--help"]), Some(ErrorKind::DisplayHelp));
+        assert_eq!(
+            kind(&["amoeboid", "--version"]),
+            Some(ErrorKind::DisplayVersion)
+        );
+        assert_eq!(
+            kind(&["amoeboid", "vacuum_vm", "--help"]),
+            Some(ErrorKind::DisplayHelp)
+        );
+        // No abbreviated long options.
+        assert_eq!(
+            kind(&["amoeboid", "start", "--base", "x"]),
+            Some(ErrorKind::UnknownArgument)
+        );
     }
 }
