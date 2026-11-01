@@ -11,7 +11,8 @@ use amoeboid::client::Client;
 use amoeboid::diagnostic::{Diagnostic, Report};
 use amoeboid::domain::vm_name::VmName;
 use amoeboid::protocol::{
-    ReplyBody, RequestBody, RuntimeReply, RuntimeRequest, VmReply, VmRequest,
+    OperationId, OperationRequest, ProgressEvent, ReplyBody, RequestBody, RuntimeReply,
+    RuntimeRequest, StopStep, VacuumProgress, VmReply, VmRequest,
 };
 use amoeboid::runtime::paths::RuntimePaths;
 use amoeboid::runtime::quarantine::QuarantineCause;
@@ -187,16 +188,15 @@ async fn run(command: Command) -> Result<(), Report> {
                 .as_deref()
                 .map(|raw| shares::nix_config_source(raw, &working_directory, home.as_deref()))
                 .transpose()?;
-            let mut client = connect(&runtime_paths()?).await?;
-            render::line(&format!(
-                "starting '{name}' (this builds it first; it can take a while)"
-            ));
+            let paths = runtime_paths()?;
+            let mut client = connect(&paths).await?;
+            render::line(&format!("starting '{name}' (Ctrl-C cancels it)"));
             let body = RequestBody::Vm(VmRequest::Start {
                 name,
                 shares,
                 nix_config,
             });
-            match request(&mut client, body).await? {
+            match cancellable(&mut client, &paths, body).await? {
                 ReplyBody::Vm(VmReply::Started { name, ssh }) => {
                     let argv = amoeboid::plan::argv::ssh(
                         &name,
@@ -227,7 +227,7 @@ async fn stop(paths: &RuntimePaths, name: String) -> Result<(), Report> {
     let name = VmName::parse(name).map_err(|error| report(&error))?;
     let mut client = connect(paths).await?;
     render::line(&format!("stopping '{name}'"));
-    match request(&mut client, RequestBody::Vm(VmRequest::Stop { name })).await? {
+    match observed(&mut client, RequestBody::Vm(VmRequest::Stop { name })).await? {
         ReplyBody::Vm(VmReply::Stopped { name }) => {
             render::line(&format!("'{name}' is stopped"));
             Ok(())
@@ -270,7 +270,7 @@ async fn vacuum(paths: &RuntimePaths, name: String) -> Result<(), Report> {
     let name = VmName::parse(name).map_err(|error| report(&error))?;
     let mut client = connect(paths).await?;
     render::line(&format!("vacuuming '{name}'"));
-    match request(&mut client, RequestBody::Vm(VmRequest::Vacuum { name })).await? {
+    match observed(&mut client, RequestBody::Vm(VmRequest::Vacuum { name })).await? {
         ReplyBody::Vm(VmReply::Vacuumed { name }) => {
             render::line(&format!("'{name}' is removed"));
             Ok(())
@@ -381,6 +381,67 @@ async fn connect(paths: &RuntimePaths) -> Result<Client, Report> {
 
 async fn request(client: &mut Client, body: RequestBody) -> Result<ReplyBody, Report> {
     client.request(body).await.map_err(|error| report(&error))
+}
+
+/// One operation, printing its progress as it arrives.
+async fn observed(client: &mut Client, body: RequestBody) -> Result<ReplyBody, Report> {
+    client
+        .request_as(OperationId::mint(), body, |_, event| {
+            render::line(&format!("  {}", progress(event)));
+        })
+        .await
+        .map_err(|error| report(&error))
+}
+
+/// Like [`observed`], but Ctrl-C asks the runtime (over a second connection) to cancel it; the
+/// operation's own answer still decides what is printed.
+async fn cancellable(
+    client: &mut Client,
+    paths: &RuntimePaths,
+    body: RequestBody,
+) -> Result<ReplyBody, Report> {
+    let operation = OperationId::mint();
+    let running = client.request_as(operation, body, |_, event| {
+        render::line(&format!("  {}", progress(event)));
+    });
+    tokio::pin!(running);
+    let reply = tokio::select! {
+        reply = &mut running => reply,
+        _ = tokio::signal::ctrl_c() => {
+            render::line("  cancelling");
+            let cancel = async {
+                let mut second = connect(paths).await?;
+                let target = OperationRequest::Cancel { target: operation };
+                request(&mut second, RequestBody::Operation(target)).await
+            };
+            let (reply, cancelled) = tokio::join!(running, cancel);
+            match cancelled {
+                Ok(ReplyBody::Failed(failure)) | Err(failure) => render::error(&failure),
+                Ok(_) => {}
+            }
+            reply
+        }
+    };
+    reply.map_err(|error| report(&error))
+}
+
+/// One progress line.
+fn progress(event: ProgressEvent) -> &'static str {
+    match event {
+        ProgressEvent::Start(StartStep::Building) => "building its NixOS configuration",
+        ProgressEvent::Start(StartStep::PreparingGuest) => "preparing the guest's files",
+        ProgressEvent::Start(StartStep::Booting) => "booting",
+        ProgressEvent::Start(StartStep::WaitingForSsh) => "waiting for its sshd",
+        ProgressEvent::Stop(StopStep::PoweringOff) => {
+            "asked the guest to power off (stopped by force after the grace period)"
+        }
+        ProgressEvent::Vacuum(VacuumProgress::StoppingVm) => "stopping the VM",
+        ProgressEvent::Vacuum(VacuumProgress::TerminatingTwin) => "stopping its twin",
+        ProgressEvent::Vacuum(VacuumProgress::EndingProcesses) => {
+            "ending its processes, removing its files"
+        }
+        ProgressEvent::Vacuum(VacuumProgress::Retiring) => "retiring its history",
+    }
 }
 
 fn unexpected(reply: &ReplyBody) -> Report {

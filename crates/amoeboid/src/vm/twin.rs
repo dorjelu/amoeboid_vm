@@ -334,7 +334,7 @@ pub enum TwinError {
     GenerationsExhausted,
     #[error("the VM is stopping")]
     Stopping,
-    #[error("the start was cancelled by a stop")]
+    #[error("the start was cancelled")]
     Cancelled,
     #[error("the start is no longer in progress")]
     StartNotInProgress,
