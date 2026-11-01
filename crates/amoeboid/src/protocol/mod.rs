@@ -147,7 +147,7 @@ pub enum ServerFrame {
         event: ProgressEvent,
     },
     /// Answer to a `HandshakeStart` with another protocol version; ends the connection.
-    /// Hint: `amoeboid daemon restart`.
+    /// Hint: `systemctl --user restart amoeboid.service`.
     HandshakeRejected {
         runtime: ProtocolVersion,
         client: ProtocolVersion,

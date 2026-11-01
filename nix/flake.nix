@@ -5,8 +5,8 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     microvm.url = "github:microvm-nix/microvm.nix";
     microvm.inputs.nixpkgs.follows = "nixpkgs";
-    # Overridden by the launcher (--override-input) with the guest account it renders
-    # from run_config.kdl on every start (<data dir>/amoeboid/<vm>/host.nix).
+    # Overridden by the runtime (--override-input) with the guest account it renders on
+    # every start (<data dir>/amoeboid/<vm>/host.nix).
     host = {
       url = "path:./host-default.nix";
       flake = false;
@@ -44,7 +44,7 @@
           default = pkgs.linkFarm "amoeboid-vm" {
             runner = config.microvm.declaredRunner;
             virtiofsd = pkgs.virtiofsd;
-            # What the launcher relies on, read back and checked after every build.
+            # What the runtime relies on; published for a check after the build (not read yet).
             contract = pkgs.writeText "amoeboid-contract.json" (builtins.toJSON {
               version = config.amoeboid.contract;
               home = "share";

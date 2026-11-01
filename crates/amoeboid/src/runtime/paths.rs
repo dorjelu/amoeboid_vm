@@ -403,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn vm_paths_follow_the_python_layout() {
+    fn vm_paths_keep_the_established_layout() {
         let paths = RuntimePaths::under(absolute("/d/amoeboid"), absolute("/r/amoeboid")).unwrap();
         let vm = paths.vm(&VmName::parse("work".into()).unwrap()).unwrap();
         assert_eq!(vm.guest(), absolute("/d/amoeboid/work/guest"));

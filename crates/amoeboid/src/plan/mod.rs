@@ -10,7 +10,7 @@ pub mod share;
 mod tests;
 pub mod units;
 
-/// The guest NIC's MAC address; `nix/base.nix` matches on it.
+/// The guest NIC's MAC address: fixed, so the guest's interface is the same on every start.
 pub const GUEST_MAC: &str = "02:00:00:a0:0b:01";
 
 /// The guest sshd's port, forwarded from a loopback port on the host.

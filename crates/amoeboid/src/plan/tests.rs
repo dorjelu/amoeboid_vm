@@ -1,4 +1,4 @@
-//! Byte-exact output against the goldens carried over from the Python launcher.
+//! Byte-exact output against the goldens in `tests/golden`.
 
 #![allow(
     clippy::disallowed_types,

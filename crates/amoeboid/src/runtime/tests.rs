@@ -587,7 +587,7 @@ async fn vacuuming_a_quarantined_vm_ends_its_processes_removes_its_files_and_ret
     plant_unreplayable(&fixture.paths, "broken").await;
     let vm = fixture.paths.vm(&vm_name("broken")).unwrap();
     std::fs::create_dir_all(vm.guest().as_path()).unwrap();
-    // A directory of a VM the runtime doesn't know (the Python launcher's, say): untouched.
+    // A directory of a VM the runtime doesn't know (left by another tool, say): untouched.
     let stranger = fixture.paths.data().as_path().join("stranger");
     std::fs::create_dir_all(&stranger).unwrap();
     let runtime = start_with(
